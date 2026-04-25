@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm install *)",
+      "Bash(npx tsc *)",
+      "Bash(PORT=3099 timeout 6 npx tsx src/index.ts)",
+      "Bash(PORT=3099 npx tsx src/index.ts)",
+      "Bash(echo \"PID=$!\" sleep 4 echo \"--- log ---\" cat /tmp/srv.log echo \"--- probe ---\" curl -sS -m 3 http://127.0.0.1:3099/health echo echo \"--- killing ---\")",
+      "Bash(awk '{print $2}')",
+      "Bash(xargs -r kill -9 sleep 1 echo done)",
+      "Bash(python3 -c ' *)",
+      "Bash(mkdir -p \"/c/Users/Phantom Deluxe/Desktop/Pennywise/tracking-frontend/src\")",
+      "Read(//c/Users/Phantom Deluxe/Desktop/Pennywise/tracking-frontend/**)",
+      "Bash(npx vite *)",
+      "Bash(gcloud --version)",
+      "Bash(npx tsx *)",
+      "Bash(echo \"exit=$?\")",
+      "Bash(xargs -0 sed -i 's/dark:\\\\\\([a-z]*\\\\\\)-slate-/dark:\\\\1-neutral-/g')",
+      "Bash(xargs -0 sed -i -E 's/\\(dark:[^[:space:]\"'\\\\'']*-\\)slate-/\\\\1neutral-/g')"
+    ]
+  }
+}
