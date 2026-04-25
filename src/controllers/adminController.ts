@@ -13,13 +13,11 @@ function publicTrackingBase(): string {
   return (process.env.PUBLIC_TRACKING_BASE_URL ?? 'http://localhost:3000').replace(/\/$/, '');
 }
 
-// The placeholder is shown so admins immediately see what affiliates must
-// substitute. aff_id is required by /click/:offer_id, and including the
-// placeholder makes the URL safe to paste into docs without further editing.
-const AFF_ID_PLACEHOLDER = 'YOUR_AFFILIATE_ID';
-
+// Base tracking URL. The frontend's offer detail page builds a ready-to-use
+// link by appending the admin's chosen aff_id; we no longer bake a placeholder
+// into the URL because that produces broken-looking links in the list view.
 function trackingUrl(offer_id: string): string {
-  return `${publicTrackingBase()}/click/${encodeURIComponent(offer_id)}?aff_id=${AFF_ID_PLACEHOLDER}`;
+  return `${publicTrackingBase()}/click/${encodeURIComponent(offer_id)}`;
 }
 
 function postbackUrl(network_id: string): string {
@@ -137,6 +135,14 @@ export const adminController = {
     }
   },
 
+  async deleteOffer(c: Context) {
+    const id = c.req.param('id');
+    if (!id || !isValidId(id)) return c.json({ error: 'invalid_id' }, 400);
+    const ok = await offerRepository.delete(id);
+    if (!ok) return c.json({ error: 'not_found' }, 404);
+    return c.json({ ok: true });
+  },
+
   async updateOffer(c: Context) {
     const id = c.req.param('id');
     if (!id || !isValidId(id)) return c.json({ error: 'invalid_id' }, 400);
@@ -210,6 +216,14 @@ export const adminController = {
       logger.error('create_network_failed', { error: err instanceof Error ? err.message : String(err) });
       return c.json({ error: 'internal' }, 500);
     }
+  },
+
+  async deleteNetwork(c: Context) {
+    const id = c.req.param('id');
+    if (!id || !isValidId(id)) return c.json({ error: 'invalid_id' }, 400);
+    const ok = await networkRepository.delete(id);
+    if (!ok) return c.json({ error: 'not_found' }, 404);
+    return c.json({ ok: true });
   },
 
   async updateNetwork(c: Context) {

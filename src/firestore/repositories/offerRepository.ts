@@ -117,6 +117,15 @@ export const offerRepository = {
     return { offer_id, ...(snap.data() as Omit<Offer, 'offer_id'>) };
   },
 
+  async delete(offer_id: string): Promise<boolean> {
+    const ref = db().collection(COLLECTIONS.OFFERS).doc(offer_id);
+    const exists = (await ref.get()).exists;
+    if (!exists) return false;
+    await ref.delete();
+    cache.delete(offer_id);
+    return true;
+  },
+
   invalidate(offer_id?: string): void {
     if (offer_id) cache.delete(offer_id);
     else cache.clear();

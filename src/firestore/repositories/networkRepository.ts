@@ -112,6 +112,15 @@ export const networkRepository = {
     return { network_id, ...(snap.data() as Omit<Network, 'network_id'>) };
   },
 
+  async delete(network_id: string): Promise<boolean> {
+    const ref = db().collection(COLLECTIONS.NETWORKS).doc(network_id);
+    const exists = (await ref.get()).exists;
+    if (!exists) return false;
+    await ref.delete();
+    cache.delete(network_id);
+    return true;
+  },
+
   invalidate(network_id?: string): void {
     if (network_id) cache.delete(network_id);
     else cache.clear();
