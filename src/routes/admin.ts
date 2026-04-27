@@ -39,3 +39,6 @@ adminRoutes.get('/api/clicks', (c) => adminController.listClicks(c));
 // Reports
 adminRoutes.get('/api/reports/summary', (c) => adminController.reportSummary(c));
 adminRoutes.get('/api/reports/timeseries', (c) => adminController.reportTimeseries(c));
+
+// Settings → destructive ops
+adminRoutes.post('/api/settings/reset-data', (c) => adminController.resetData(c));

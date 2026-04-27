@@ -10,6 +10,8 @@ structured JSON lines.
 | `/health`                      | GET       | Liveness probe.                                        |
 | `/click/:offer_id`             | GET       | Register a click and 302-redirect to affiliate.        |
 | `/postback/:network_id`        | GET, POST | Receive a conversion from a specific affiliate network.|
+| `/api/integrations/google-ads/...` | various | Google Ads OAuth / connections / accounts / routes / uploads. See **Google Ads integration** below. |
+| `/api/settings/reset-data`     | POST      | Wipe clicks + conversions + Google Ads upload audit (keeps offers/networks/connections/routes). Body must include `{ "confirm": "RESET" }`. |
 
 ---
 
@@ -373,6 +375,123 @@ use the Firestore console):
   `(network_id ASC, verified ASC, created_at DESC)` is provisioned for this.
 - **All conversions for an offer** — `(offer_id ASC, created_at DESC)`.
 - **Pending-status queue** — `(status ASC, created_at DESC)`.
+
+---
+
+## Google Ads integration
+
+All endpoints sit under `/api/integrations/google-ads` and require the same
+admin Bearer token as the other `/api/*` endpoints.
+
+### Three-step connect
+
+```
+POST /api/integrations/google-ads/oauth/start
+  body:  { "type": "mcc" | "child" }
+  reply: { "auth_url": "<google consent URL>", "state": "<signed JWT>" }
+```
+
+Browser is sent to `auth_url`. Google calls back the dashboard at
+`/oauth/google-ads/callback?code=...&state=...`, which POSTs:
+
+```
+POST /api/integrations/google-ads/oauth/exchange
+  body:  { "code": "<auth code>", "state": "<state JWT>" }
+  reply: {
+    "grant_token": "<short-lived signed JWT carrying the encrypted refresh token>",
+    "type":        "mcc" | "child",
+    "google_user_email": "user@example.com",
+    "candidates": [
+      { "customer_id": "1234567890", "descriptive_name": "Acme MCC", "currency_code": "USD", "time_zone": "America/New_York", "is_manager": true,  "level": 0 },
+      { "customer_id": "9876543210", "manager_customer_id": "1234567890", "descriptive_name": "Acme EU", "currency_code": "EUR", "time_zone": "Europe/Madrid", "is_manager": false, "level": 1 },
+      ...
+    ]
+  }
+```
+
+Nothing is persisted yet. The user picks accounts from the candidate list and
+finalizes:
+
+```
+POST /api/integrations/google-ads/finalize
+  body: {
+    "grant_token": "...",
+    "picks": [ { "customer_id": "...", "manager_customer_id": "...", "descriptive_name": "...", "currency_code": "...", "time_zone": "...", "is_manager": false } ],
+    "mcc_children": [ { "customer_id": "...", "descriptive_name": "...", "currency_code": "...", "time_zone": "..." } ]   // only for type='mcc'
+  }
+  reply: { "items": [ GoogleAdsConnection ] }
+```
+
+For `type='mcc'`: typically picks the manager itself (1 connection); the
+`mcc_children` array is a display-only snapshot of the children covered by
+cross-account tracking.
+
+For `type='child'`: each pick becomes its own `child` connection (so picking
+3 children → 3 connection rows). The MCC's CID lands on each child row as
+`manager_customer_id` so we can pass it as the login-customer-id header.
+
+### Connections
+
+```
+GET    /api/integrations/google-ads/connections                            → { items: GoogleAdsConnection[] }
+GET    /api/integrations/google-ads/connections/:id                        → { connection, mcc_children? }
+PATCH  /api/integrations/google-ads/connections/:id                        → updated connection
+       body: { sale_conversion_action_resource?, sale_conversion_action_name?, click_conversion_action_resource?, click_conversion_action_name? }
+DELETE /api/integrations/google-ads/connections/:id                        → { ok: true }
+GET    /api/integrations/google-ads/connections/:id/conversion-actions[?refresh=true]
+       → { items: [ { resource_name, id, name, status, type } ] }
+```
+
+### Routes (per-offer / per-network mapping for **child** connections only)
+
+```
+GET    /api/integrations/google-ads/routes?scope_type=offer&scope_id=summer_deal  → { route | null }
+GET    /api/integrations/google-ads/routes/all                                    → { items: GoogleAdsRoute[] }
+POST   /api/integrations/google-ads/routes                                        → GoogleAdsRoute
+       body: {
+         "scope_type": "offer"|"network", "scope_id": "...",
+         "target_connection_id": "<child connection_id>",
+         "sale_conversion_action_resource":  "customers/.../conversionActions/...",
+         "sale_conversion_action_name":      "Lead",
+         "click_conversion_action_resource": "customers/.../conversionActions/...",
+         "click_conversion_action_name":     "Outbound click",
+         "enabled": true
+       }
+       (No `status_filter`. The conversion's `verified` flag — true iff the
+       postback's click_id resolves to one of our tracked clicks — is the only
+       gate. The network's own status string is ignored as a filter.)
+DELETE /api/integrations/google-ads/routes/:route_id
+```
+
+### Upload audit
+
+```
+GET    /api/integrations/google-ads/uploads?source_id=<conversion_id|click_id>   → { items: GoogleAdsUpload[] }
+POST   /api/integrations/google-ads/uploads/:conversion_id/retry                 → { ok: true }
+```
+
+### Forwarding behaviour
+
+#### On every accepted postback (conversion):
+1. If `verified === false` or no `gclid`/`gbraid`/`wbraid` on the click → record one `skipped` upload and stop.
+2. **Fan out to every active MCC connection** that has `sale_conversion_action_resource` set. Each fires `uploadClickConversions` with `customer_id = MCC.customer_id` (Google attributes back to the right child via the gclid).
+3. **Resolve the child route** for the (offer, network) pair (offer overrides network). If a route exists with a sale action set, fire to the route's `target_connection_id`. The `verified` check at step 1 is the only gate — there is no separate status filter.
+4. Each attempt persists one row in `google_ads_uploads`.
+
+#### On every `/click/:offer_id` redirect:
+1. Persist the click as today.
+2. **Only if** the click carries `gclid`/`gbraid`/`wbraid`:
+   - Fan out to every active MCC connection with `click_conversion_action_resource` set.
+   - Resolve the offer-level route — if it has `click_conversion_action_resource` set, fire to that child too.
+3. Non-Google clicks are completely ignored — no DB write, no log line.
+
+Authentication failures (`UNAUTHENTICATED`, `invalid_grant`, `PERMISSION_DENIED`)
+mark the connection `status='error'` so subsequent dispatches short-circuit
+until the user reconnects.
+
+`order_id` on every uploaded ClickConversion equals the source's id
+(`conversion_id` for sales, `click_<click_id>` for clicks) so retries are
+idempotent against Google.
 
 ---
 

@@ -7,6 +7,7 @@ import {
 } from '../firestore';
 import { authService } from '../services/authService';
 import { reportsService } from '../services/reportsService';
+import { dataResetService } from '../services/dataResetService';
 import { logger } from '../utils/logger';
 
 function publicTrackingBase(): string {
@@ -345,6 +346,24 @@ export const adminController = {
       return c.json({ points });
     } catch (err) {
       logger.error('report_timeseries_failed', { error: err instanceof Error ? err.message : String(err) });
+      return c.json({ error: 'internal' }, 500);
+    }
+  },
+
+  // ── settings / data reset ─────────────────────────────────────────
+  async resetData(c: Context) {
+    const body = await c.req.json().catch(() => ({})) as { confirm?: string };
+    // Server-side confirmation token: the client must echo "RESET" so a
+    // misclick won't wipe the database.
+    if (body.confirm !== 'RESET') {
+      return c.json({ error: 'confirmation_required' }, 400);
+    }
+    const actor = (c.get('admin_email' as never) as string | undefined) ?? 'unknown';
+    try {
+      const result = await dataResetService.resetIncomingData(actor);
+      return c.json({ ok: true, ...result });
+    } catch (err) {
+      logger.error('data_reset_failed', { error: err instanceof Error ? err.message : String(err) });
       return c.json({ error: 'internal' }, 500);
     }
   },

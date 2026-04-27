@@ -2,6 +2,7 @@ import { generateConversionId } from '../utils/idGenerator';
 import { logger } from '../utils/logger';
 import { clickRepository, conversionRepository } from '../firestore';
 import { networkService } from './networkService';
+import { googleAdsForwardingService } from './googleAdsForwardingService';
 import type { ConversionRecord, Network, VerificationReason } from '../types';
 
 export interface PostbackInput {
@@ -114,6 +115,12 @@ export const postbackService = {
       });
       return { ok: false, reason: 'persist_failed' };
     }
+
+    // Fan out to Google Ads in the background. Never block or fail the
+    // postback response on outbound forwarding — the conversion is already
+    // persisted; the forwarder writes its own audit doc and surfaces
+    // sent/skipped/failed status separately.
+    googleAdsForwardingService.forgetConversion({ conversion: conv, click });
 
     return { ok: true, conversion_id: conv.conversion_id, verified, verification_reason };
   },

@@ -2,6 +2,7 @@ import { generateClickId } from '../utils/idGenerator';
 import { renderTemplate } from '../utils/templateEngine';
 import { logger } from '../utils/logger';
 import { clickRepository } from '../firestore';
+import { googleAdsForwardingService } from './googleAdsForwardingService';
 import type { AdIds, ClickRecord, Offer } from '../types';
 
 export interface BuildClickInput {
@@ -57,5 +58,11 @@ export const clickService = {
         error: err instanceof Error ? err.message : String(err),
       });
     });
+
+    // Fan out to Google Ads only when the click came from Google (gclid/gbraid/wbraid).
+    // Non-Google clicks short-circuit inside the service with no DB write.
+    if (click.ad_ids?.gclid || click.ad_ids?.gbraid || click.ad_ids?.wbraid) {
+      googleAdsForwardingService.forgetClick({ click });
+    }
   },
 };

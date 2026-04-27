@@ -5,6 +5,7 @@ import { trackRoutes } from './routes/track';
 import { postbackRoutes } from './routes/postback';
 import { healthRoutes } from './routes/health';
 import { adminRoutes } from './routes/admin';
+import { integrationsRoutes } from './routes/integrations';
 import { initFirestore } from './firestore';
 import { logger } from './utils/logger';
 
@@ -45,6 +46,7 @@ app.route('/', healthRoutes);
 app.route('/', trackRoutes);
 app.route('/', postbackRoutes);
 app.route('/', adminRoutes);
+app.route('/', integrationsRoutes);
 
 app.notFound((c) => c.json({ error: 'not_found' }, 404));
 
