@@ -9,3 +9,7 @@ export { googleAdsConnectionRepository } from './repositories/googleAdsConnectio
 export { googleAdsMccChildrenRepository, buildMccChildId } from './repositories/googleAdsMccChildrenRepository';
 export { googleAdsRouteRepository, buildRouteId } from './repositories/googleAdsRouteRepository';
 export { googleAdsUploadRepository } from './repositories/googleAdsUploadRepository';
+export {
+  affiliateApiRepository,
+  affiliateApiRunRepository,
+} from './repositories/affiliateApiRepository';

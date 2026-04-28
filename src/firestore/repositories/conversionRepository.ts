@@ -55,6 +55,44 @@ export const conversionRepository = {
       });
   },
 
+  // Idempotent insert keyed off (aff_api_id + external_id). Doc id is
+  // deterministic so re-runs of the same window are no-ops in Firestore.
+  // Returns true on first write, false if the row already existed.
+  async insertIfAbsent(conv: ConversionRecord): Promise<boolean> {
+    const ref = db().collection(COLLECTIONS.CONVERSIONS).doc(conv.conversion_id);
+    return db().runTransaction(async (tx) => {
+      const snap = await tx.get(ref);
+      if (snap.exists) return false;
+      tx.set(ref, { ...conv, created_at: FieldValue.serverTimestamp() });
+      return true;
+    });
+  },
+
+  // Bulk variant for hot loops. Uses a BulkWriter with create() so existing
+  // docs error out and are silently dropped — deterministic-id dedupe.
+  async bulkInsertIfAbsent(records: ConversionRecord[]): Promise<{ inserted: number; duplicates: number }> {
+    if (records.length === 0) return { inserted: 0, duplicates: 0 };
+    const writer = db().bulkWriter();
+    let inserted = 0;
+    let duplicates = 0;
+    writer.onWriteError((err) => {
+      if (err.code === 6 /* ALREADY_EXISTS */) {
+        duplicates++;
+        return false;
+      }
+      // Retry transient errors a few times before surfacing.
+      return err.failedAttempts < 5;
+    });
+    for (const conv of records) {
+      const ref = db().collection(COLLECTIONS.CONVERSIONS).doc(conv.conversion_id);
+      writer.create(ref, { ...conv, created_at: FieldValue.serverTimestamp() })
+        .then(() => { inserted++; })
+        .catch(() => { /* surfaced via onWriteError */ });
+    }
+    await writer.close();
+    return { inserted, duplicates };
+  },
+
   async getById(conversion_id: string): Promise<ConversionRecord | null> {
     const snap = await db().collection(COLLECTIONS.CONVERSIONS).doc(conversion_id).get();
     if (!snap.exists) return null;

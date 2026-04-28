@@ -1,6 +1,6 @@
 import { generateConversionId } from '../utils/idGenerator';
 import { logger } from '../utils/logger';
-import { clickRepository, conversionRepository } from '../firestore';
+import { clickRepository, conversionRepository, affiliateApiRepository } from '../firestore';
 import { networkService } from './networkService';
 import { googleAdsForwardingService } from './googleAdsForwardingService';
 import type { ConversionRecord, Network, VerificationReason } from '../types';
@@ -87,6 +87,15 @@ export const postbackService = {
     const verified = click !== null;
     const verification_reason: VerificationReason = verified ? 'click_found' : 'unknown_click_id';
 
+    // If the network is mapped to an affiliate API and that API is active,
+    // the API pull is the source of truth — the postback becomes audit-only
+    // ("shadow"). We still persist + return ok so the network sees a 200.
+    let shadow = false;
+    if (network.postback_api_id) {
+      const api = await affiliateApiRepository.getById(network.postback_api_id).catch(() => null);
+      if (api && api.status === 'active' && api.schedule.enabled) shadow = true;
+    }
+
     const conv: ConversionRecord = {
       conversion_id: generateConversionId(),
       network_id: network.network_id,
@@ -102,6 +111,8 @@ export const postbackService = {
       method: input.method,
       verified,
       verification_reason,
+      source: 'postback',
+      shadow,
       created_at: new Date().toISOString(),
     };
 
@@ -119,8 +130,11 @@ export const postbackService = {
     // Fan out to Google Ads in the background. Never block or fail the
     // postback response on outbound forwarding — the conversion is already
     // persisted; the forwarder writes its own audit doc and surfaces
-    // sent/skipped/failed status separately.
-    googleAdsForwardingService.forgetConversion({ conversion: conv, click });
+    // sent/skipped/failed status separately. Skip when shadow — the API
+    // run will trigger the forward instead so we don't double-upload.
+    if (!shadow) {
+      googleAdsForwardingService.forgetConversion({ conversion: conv, click });
+    }
 
     return { ok: true, conversion_id: conv.conversion_id, verified, verification_reason };
   },

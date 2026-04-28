@@ -128,6 +128,8 @@ export const COLLECTIONS = {
   GOOGLE_ADS_MCC_CHILDREN: 'google_ads_mcc_children',
   GOOGLE_ADS_ROUTES: 'google_ads_routes',
   GOOGLE_ADS_UPLOADS: 'google_ads_uploads',
+  AFFILIATE_APIS: 'affiliate_apis',
+  AFFILIATE_API_RUNS: 'affiliate_api_runs',
 } as const;
 
 export type CollectionName = (typeof COLLECTIONS)[keyof typeof COLLECTIONS];

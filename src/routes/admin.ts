@@ -1,5 +1,6 @@
 import { Hono } from 'hono';
 import { adminController } from '../controllers/adminController';
+import { affiliateApiController } from '../controllers/affiliateApiController';
 import { requireAuth } from '../middleware/auth';
 
 export const adminRoutes = new Hono();
@@ -39,6 +40,16 @@ adminRoutes.get('/api/clicks', (c) => adminController.listClicks(c));
 // Reports
 adminRoutes.get('/api/reports/summary', (c) => adminController.reportSummary(c));
 adminRoutes.get('/api/reports/timeseries', (c) => adminController.reportTimeseries(c));
+
+// Affiliate APIs (pull-based conversion ingestion)
+adminRoutes.get('/api/affiliate-apis', (c) => affiliateApiController.list(c));
+adminRoutes.post('/api/affiliate-apis', (c) => affiliateApiController.create(c));
+adminRoutes.get('/api/affiliate-apis/:id', (c) => affiliateApiController.get(c));
+adminRoutes.patch('/api/affiliate-apis/:id', (c) => affiliateApiController.update(c));
+adminRoutes.delete('/api/affiliate-apis/:id', (c) => affiliateApiController.delete(c));
+adminRoutes.post('/api/affiliate-apis/:id/run', (c) => affiliateApiController.runNow(c));
+adminRoutes.post('/api/affiliate-apis/:id/test', (c) => affiliateApiController.testRun(c));
+adminRoutes.get('/api/affiliate-apis/:id/runs', (c) => affiliateApiController.runs(c));
 
 // Settings → destructive ops
 adminRoutes.post('/api/settings/reset-data', (c) => adminController.resetData(c));

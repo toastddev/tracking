@@ -205,6 +205,7 @@ export const adminController = {
       mapping_timestamp: body.mapping_timestamp ? String(body.mapping_timestamp).trim() : undefined,
       extra_mappings: extras.value,
       default_status: body.default_status ? String(body.default_status).trim() : undefined,
+      postback_api_id: body.postback_api_id ? String(body.postback_api_id).trim() : undefined,
     };
 
     try {
@@ -235,9 +236,10 @@ export const adminController = {
     const fields = [
       'name', 'mapping_click_id', 'mapping_payout', 'mapping_currency',
       'mapping_status', 'mapping_txn_id', 'mapping_timestamp', 'default_status',
+      'postback_api_id',
     ] as const;
     for (const f of fields) {
-      if (typeof body[f] === 'string') patch[f] = (body[f] as string).trim();
+      if (typeof body[f] === 'string') patch[f] = (body[f] as string).trim() || undefined;
     }
     if (body.status === 'active' || body.status === 'paused') patch.status = body.status;
 

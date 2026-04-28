@@ -44,6 +44,12 @@ export const INDEXES = [
   { collection: 'conversions', fields: ['network_id ASC', 'created_at DESC'] },
   { collection: 'conversions', fields: ['verified ASC', 'created_at DESC'] },
   { collection: 'conversions', fields: ['network_id ASC', 'verified ASC', 'created_at DESC'] },
+  // Aff API source filtering — keep reports clean by excluding shadow rows.
+  { collection: 'conversions', fields: ['shadow ASC', 'created_at DESC'] },
+  { collection: 'conversions', fields: ['aff_api_id ASC', 'created_at DESC'] },
   { collection: 'networks',    fields: ['status ASC', 'updated_at DESC'] },
   { collection: 'offers',      fields: ['status ASC', 'updated_at DESC'] },
+  // Scheduler reads: due-now lookup and per-status listing.
+  { collection: 'affiliate_apis',     fields: ['status ASC', 'schedule.next_run_at ASC'] },
+  { collection: 'affiliate_api_runs', fields: ['api_id ASC', 'started_at DESC'] },
 ] as const;
