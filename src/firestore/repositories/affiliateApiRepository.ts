@@ -229,6 +229,16 @@ export const affiliateApiRepository = {
     cache.delete(api_id);
   },
 
+  // Unconditionally clears the lock regardless of who holds it. Used when
+  // runNow detects a stale lock (no active run in-flight) or from the admin
+  // force-unlock endpoint. Safe: the caller has already verified no run is
+  // actually running before calling this.
+  async forceReleaseLock(api_id: string): Promise<void> {
+    const ref = db().collection(COLLECTIONS.AFFILIATE_APIS).doc(api_id);
+    await ref.update({ lock_holder: FieldValue.delete(), lock_until: FieldValue.delete() });
+    cache.delete(api_id);
+  },
+
   async recordRunOutcome(
     api_id: string,
     nextRunAt: Date,

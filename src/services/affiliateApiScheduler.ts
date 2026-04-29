@@ -142,12 +142,41 @@ export const affiliateApiScheduler = {
   // the next tick. Shares the same in-memory running set as the scheduler
   // so a manual click can't collide with an in-flight scheduled run on the
   // same node — and the Firestore lock guards across nodes.
+  //
+  // If the Firestore lock is held but no run is actually in-flight (i.e.
+  // no run doc at 'running' status), the lock is stale from a crashed
+  // instance. In that case we force-release it and retry so the user
+  // doesn't have to wait up to 1 hour for the lease to expire.
   async runNow(api_id: string, opts: { triggered_by: 'manual' }): Promise<{ ok: true; run_id: string } | { ok: false; reason: string }> {
     const api = await affiliateApiRepository.getById(api_id);
     if (!api) return { ok: false, reason: 'not_found' };
     if (running.has(api_id)) return { ok: false, reason: 'locked' };
-    const acquired = await affiliateApiRepository.tryAcquireLock(api_id, HOLDER, LEASE_MS);
-    if (!acquired) return { ok: false, reason: 'locked' };
+
+    let acquired = await affiliateApiRepository.tryAcquireLock(api_id, HOLDER, LEASE_MS);
+
+    // Lock held — but is a run actually in-flight? If not, the lock is
+    // stale (instance crashed / was replaced by Cloud Run). Force-release
+    // and retry once.
+    if (!acquired) {
+      const recentRuns = await affiliateApiRunRepository.listByApi(api_id, 1);
+      const latestRun = recentRuns[0];
+      const hasActiveRun = latestRun?.status === 'running';
+
+      if (!hasActiveRun) {
+        logger.info('aff_api_stale_lock_detected', { api_id, latest_status: latestRun?.status ?? 'none' });
+        // Clean up any orphaned 'running' run docs (belt-and-suspenders)
+        if (latestRun?.status === 'running') {
+          await affiliateApiRunRepository
+            .markLatestRunningAsError(api_id, 'stale_lock_force_released')
+            .catch(() => undefined);
+        }
+        await affiliateApiRepository.forceReleaseLock(api_id).catch(() => undefined);
+        acquired = await affiliateApiRepository.tryAcquireLock(api_id, HOLDER, LEASE_MS);
+      }
+
+      if (!acquired) return { ok: false, reason: 'locked' };
+    }
+
     running.add(api_id);
     try {
       const run = await runAffiliateApi(api, { triggered_by: opts.triggered_by, holder: HOLDER });
@@ -162,6 +191,21 @@ export const affiliateApiScheduler = {
       await affiliateApiRepository.releaseLock(api_id, HOLDER).catch(() => undefined);
       running.delete(api_id);
     }
+  },
+
+  // Admin force-unlock: clears the Firestore lock + any orphaned run docs.
+  // Exposed as a separate method so the controller can call it directly.
+  async forceUnlock(api_id: string): Promise<{ ok: true } | { ok: false; reason: string }> {
+    const api = await affiliateApiRepository.getById(api_id);
+    if (!api) return { ok: false, reason: 'not_found' };
+    // Don't force-unlock if this instance is actively running this API.
+    if (running.has(api_id)) return { ok: false, reason: 'locked' };
+    await affiliateApiRepository.forceReleaseLock(api_id).catch(() => undefined);
+    await affiliateApiRunRepository
+      .markLatestRunningAsError(api_id, 'admin_force_unlocked')
+      .catch(() => undefined);
+    logger.info('aff_api_force_unlocked', { api_id });
+    return { ok: true };
   },
 };
 

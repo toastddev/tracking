@@ -334,6 +334,17 @@ export const affiliateApiController = {
     return c.json({ ok: true, run_id: result.run_id });
   },
 
+  async forceUnlock(c: Context) {
+    const id = c.req.param('id');
+    if (!id || !isValidId(id)) return c.json({ error: 'invalid_id' }, 400);
+    const result = await affiliateApiScheduler.forceUnlock(id);
+    if (!result.ok) {
+      const status = result.reason === 'not_found' ? 404 : result.reason === 'locked' ? 409 : 500;
+      return c.json({ error: result.reason }, status);
+    }
+    return c.json({ ok: true });
+  },
+
   async testRun(c: Context) {
     const id = c.req.param('id');
     if (!id || !isValidId(id)) return c.json({ error: 'invalid_id' }, 400);

@@ -49,6 +49,7 @@ adminRoutes.get('/api/affiliate-apis/:id', (c) => affiliateApiController.get(c))
 adminRoutes.patch('/api/affiliate-apis/:id', (c) => affiliateApiController.update(c));
 adminRoutes.delete('/api/affiliate-apis/:id', (c) => affiliateApiController.delete(c));
 adminRoutes.post('/api/affiliate-apis/:id/run', (c) => affiliateApiController.runNow(c));
+adminRoutes.post('/api/affiliate-apis/:id/unlock', (c) => affiliateApiController.forceUnlock(c));
 adminRoutes.post('/api/affiliate-apis/:id/test', (c) => affiliateApiController.testRun(c));
 adminRoutes.get('/api/affiliate-apis/:id/runs', (c) => affiliateApiController.runs(c));
 
