@@ -126,10 +126,11 @@ function parseIncremental(raw: unknown): AffiliateApiIncremental {
 function parseMapping(raw: unknown): { ok: true; value: AffiliateApiMapping } | { ok: false; error: string } {
   if (!raw || typeof raw !== 'object') return { ok: false, error: 'mapping_required' };
   const m = raw as Record<string, unknown>;
-  const items_path = asString(m.items_path);
+  // items_path may be empty string — that means the response IS the array (root-level).
+  const items_path = typeof m.items_path === 'string' ? m.items_path.trim() : '';
   const external_id_path = asString(m.external_id_path);
   const click_id_path = asString(m.click_id_path);
-  if (!items_path || !external_id_path || !click_id_path) {
+  if (!external_id_path || !click_id_path) {
     return { ok: false, error: 'mapping_required_fields' };
   }
   const status_map_raw = m.status_map;
