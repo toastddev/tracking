@@ -178,8 +178,18 @@ export const affiliateApiRepository = {
   },
 
   // Cooperative lock via Firestore transaction. Holder writes its id + lease
-  // expiry; concurrent claimants see the live lease and back off. The lease
-  // is short (default 10 min) so a crashed runner unblocks itself.
+  // expiry; concurrent claimants see the live lease and back off. Crashed
+  // runners unblock themselves once the lease expires.
+  //
+  // Two non-obvious behaviours:
+  //   1. We refuse re-acquisition while the lease is still valid, even from
+  //      the same holder. This prevents the within-process race where a
+  //      manual "Run now" can collide with an in-flight scheduled run on the
+  //      same node (the in-memory `running` set is a separate guard).
+  //   2. We push schedule.next_run_at forward by one interval AS PART OF the
+  //      same transaction. If the run later crashes, the API is no longer
+  //      perpetually "due" — it gets a fresh interval before being retried.
+  //      recordRunOutcome overwrites this with the precise value on success.
   async tryAcquireLock(api_id: string, holder: string, leaseMs: number): Promise<boolean> {
     const ref = db().collection(COLLECTIONS.AFFILIATE_APIS).doc(api_id);
     const ok = await db().runTransaction(async (tx) => {
@@ -188,10 +198,19 @@ export const affiliateApiRepository = {
       const data = snap.data() as Record<string, unknown>;
       const until = data.lock_until as Timestamp | undefined;
       const stillHeld = until && until.toMillis() > Date.now();
-      if (stillHeld && data.lock_holder !== holder) return false;
+      if (stillHeld) return false;
+
+      const sched = (data.schedule ?? {}) as Record<string, unknown>;
+      const runsPerDay =
+        typeof sched.runs_per_day === 'number' && sched.runs_per_day > 0
+          ? Math.min(1440, sched.runs_per_day)
+          : 4;
+      const intervalMs = Math.max(60_000, Math.floor((24 * 60 * 60_000) / runsPerDay));
+
       tx.update(ref, {
         lock_holder: holder,
         lock_until: Timestamp.fromMillis(Date.now() + leaseMs),
+        'schedule.next_run_at': Timestamp.fromMillis(Date.now() + intervalMs),
       });
       return true;
     });
@@ -267,5 +286,36 @@ export const affiliateApiRunRepository = {
         finished_at: tsToIso(raw.finished_at),
       };
     });
+  },
+
+  // Marks any run still in 'running' state older than `thresholdMs` as
+  // 'error' / 'aborted_on_restart'. Called on scheduler boot to clean up
+  // orphans left by process restarts (--watch reload, SIGKILL, OOM).
+  // Returns the number of rows updated. Filtered in-memory by age so we
+  // don't need a (status, started_at) composite index.
+  async markStaleRunningAsAborted(thresholdMs: number): Promise<number> {
+    const cutoff = Date.now() - thresholdMs;
+    const snap = await db()
+      .collection(COLLECTIONS.AFFILIATE_API_RUNS)
+      .where('status', '==', 'running')
+      .limit(500)
+      .get();
+    if (snap.empty) return 0;
+    const stale = snap.docs.filter((d) => {
+      const ts = (d.data().started_at as Timestamp | undefined)?.toMillis?.();
+      return typeof ts === 'number' && ts <= cutoff;
+    });
+    if (stale.length === 0) return 0;
+    const finished = Timestamp.now();
+    const batch = db().batch();
+    for (const doc of stale) {
+      batch.update(doc.ref, {
+        status: 'error',
+        error: 'aborted_on_restart',
+        finished_at: finished,
+      });
+    }
+    await batch.commit();
+    return stale.length;
   },
 };

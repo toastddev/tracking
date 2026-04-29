@@ -15,6 +15,7 @@ import type {
   AffiliateApiAuthConfig,
   AffiliateApiPagination,
   AffiliateApiRunRecord,
+  ClickRecord,
   ConversionRecord,
 } from '../types';
 
@@ -328,25 +329,27 @@ export async function runAffiliateApi(api: AffiliateApi, opts: RunOptions): Prom
   const pg: AffiliateApiPagination = api.pagination;
 
   const seenExternalIds = new Set<string>();
-  const buffer: ConversionRecord[] = [];
+  // Buffer carries the click alongside the conversion so flush() can hand
+  // it directly to the forwarder without a second Firestore read. Halves
+  // per-item read cost vs. looking the click up twice.
+  const buffer: Array<{ conv: ConversionRecord; click: ClickRecord }> = [];
 
   async function flush(): Promise<void> {
     if (buffer.length === 0) return;
     if (opts.dryRun) { buffer.length = 0; return; }
     const batch = buffer.splice(0, buffer.length);
     try {
-      const { inserted, duplicates } = await conversionRepository.bulkInsertIfAbsent(batch);
+      const convs = batch.map((b) => b.conv);
+      const { inserted, duplicates } = await conversionRepository.bulkInsertIfAbsent(convs);
       run.records_inserted = (run.records_inserted ?? 0) + inserted;
       run.records_skipped_duplicate = (run.records_skipped_duplicate ?? 0) + duplicates;
 
-      // Hand newly-written rows to Google Ads forwarder (verified ones only —
-      // forwarder will skip if there is no click). We do this AFTER persistence
-      // so a failed forward never blocks the API run.
-      for (const conv of batch) {
-        if (conv.verified && conv.click_id) {
-          // Hydrate click for ad-id pickup. Cached read.
-          const click = await clickRepository.getById(conv.click_id);
-          if (click) googleAdsForwardingService.forgetConversion({ conversion: conv, click });
+      // Hand rows to Google Ads forwarder. Done AFTER persistence so a
+      // failed forward never blocks the API run; forwarder writes its own
+      // audit doc and surfaces sent/skipped/failed status separately.
+      for (const { conv, click } of batch) {
+        if (conv.verified) {
+          googleAdsForwardingService.forgetConversion({ conversion: conv, click });
         }
       }
     } catch (err) {
@@ -395,9 +398,10 @@ export async function runAffiliateApi(api: AffiliateApi, opts: RunOptions): Prom
 
         // Click verification. Skip the row entirely if we don't recognise the
         // click — keeps reports clean. Counted separately for visibility.
+        // The repository's getById is cached so repeat lookups within a run
+        // (same click hit twice) are free.
         const click = await clickRepository.getById(mapped.click_id);
-        const verified = click !== null;
-        if (!verified) {
+        if (!click) {
           run.records_skipped_unknown_click = (run.records_skipped_unknown_click ?? 0) + 1;
           continue;
         }
@@ -406,7 +410,7 @@ export async function runAffiliateApi(api: AffiliateApi, opts: RunOptions): Prom
           conversion_id,
           network_id: api.network_id ?? api.api_id,
           click_id: mapped.click_id,
-          offer_id: click?.offer_id,
+          offer_id: click.offer_id,
           payout: mapped.payout,
           currency: mapped.currency,
           status: mapped.status ?? api.mapping.default_status ?? 'approved',
@@ -422,7 +426,7 @@ export async function runAffiliateApi(api: AffiliateApi, opts: RunOptions): Prom
           external_id: mapped.external_id,
           created_at: new Date().toISOString(),
         };
-        buffer.push(conv);
+        buffer.push({ conv, click });
         if (buffer.length >= DEDUPE_BATCH) await flush();
         if ((run.records_seen ?? 0) >= maxRecords) {
           await flush();
