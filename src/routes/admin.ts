@@ -34,8 +34,9 @@ adminRoutes.get('/api/conversions', (c) => adminController.listAllConversions(c)
 // Conversion detail (with hydrated click for verified conversions)
 adminRoutes.get('/api/conversions/:id', (c) => adminController.getConversion(c));
 
-// Clicks list (reports)
+// Clicks list + detail (reports)
 adminRoutes.get('/api/clicks', (c) => adminController.listClicks(c));
+adminRoutes.get('/api/clicks/:id', (c) => adminController.getClick(c));
 
 // Reports
 adminRoutes.get('/api/reports/summary', (c) => adminController.reportSummary(c));

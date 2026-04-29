@@ -1,6 +1,53 @@
+import { brotliDecompress, gunzip, inflate, inflateRaw } from 'node:zlib';
+import { promisify } from 'node:util';
 import { XMLParser } from 'fast-xml-parser';
 
 export type ResponseFormat = 'json' | 'xml' | 'auto';
+
+const gunzipAsync = promisify(gunzip);
+const inflateAsync = promisify(inflate);
+const inflateRawAsync = promisify(inflateRaw);
+const brotliAsync = promisify(brotliDecompress);
+
+// gzip RFC 1952 magic.
+function isGzip(buf: Uint8Array): boolean {
+  return buf.length >= 2 && buf[0] === 0x1f && buf[1] === 0x8b;
+}
+
+// zlib RFC 1950 header. CMF byte = 0x78 (deflate, 32K window) is the only
+// realistic value for HTTP. FLG check byte combos rotate by compression
+// level: 0x01 (low), 0x5e, 0x9c (default), 0xda (best). Matching just the
+// CMF would over-trigger on plain text starting with 'x'; pairing it with
+// a known FLG keeps the false-positive rate ~zero.
+function isZlib(buf: Uint8Array): boolean {
+  if (buf.length < 2 || buf[0] !== 0x78) return false;
+  return buf[1] === 0x01 || buf[1] === 0x5e || buf[1] === 0x9c || buf[1] === 0xda;
+}
+
+// Decompresses if Content-Encoding (or magic bytes) say so. Supports gzip,
+// deflate (zlib + raw fallback), and brotli. Returns plain bytes otherwise.
+//
+// undici fetch usually decompresses transparently (and strips the header)
+// — this layer exists for misbehaving upstreams (e.g. some Kelkoo
+// endpoints) that emit gzipped bodies without a Content-Encoding header.
+export async function decompressBody(
+  bytes: Uint8Array,
+  encoding?: string | null,
+): Promise<Buffer> {
+  const enc = encoding?.toLowerCase().trim() ?? '';
+  if (enc === 'gzip' || enc === 'x-gzip') return Buffer.from(await gunzipAsync(bytes));
+  if (enc === 'deflate') {
+    // HTTP "deflate" can be either zlib-wrapped (RFC 1950) or raw deflate
+    // (RFC 1951). Try zlib first, then raw — many older servers send raw.
+    try { return Buffer.from(await inflateAsync(bytes)); }
+    catch { return Buffer.from(await inflateRawAsync(bytes)); }
+  }
+  if (enc === 'br') return Buffer.from(await brotliAsync(bytes));
+  // No header / "identity" — sniff for gzipped bodies missing the header.
+  if (isGzip(bytes)) return Buffer.from(await gunzipAsync(bytes));
+  if (isZlib(bytes)) return Buffer.from(await inflateAsync(bytes));
+  return Buffer.from(bytes);
+}
 
 // Configured once and reused. The two non-default options matter for our
 // mapping engine:

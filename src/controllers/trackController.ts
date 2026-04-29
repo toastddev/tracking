@@ -1,5 +1,5 @@
 import type { Context } from 'hono';
-import { extractAdIds, extractSubParams } from '../utils/paramExtractor';
+import { extractAdIds, extractExtraParams, extractSubParams } from '../utils/paramExtractor';
 import { requireParams } from '../utils/validator';
 import { offerService } from '../services/offerService';
 import { clickService } from '../services/clickService';
@@ -38,6 +38,7 @@ export const trackController = {
       aff_id: query.aff_id!,
       sub_params: extractSubParams(query),
       ad_ids: extractAdIds(query),
+      extra_params: extractExtraParams(query),
       ip: clientIp(c),
       user_agent: c.req.header('user-agent'),
       referrer: c.req.header('referer'),

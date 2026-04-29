@@ -315,6 +315,17 @@ export const adminController = {
   },
 
   // ── clicks ────────────────────────────────────────────────────────
+  async getClick(c: Context) {
+    const id = c.req.param('id');
+    if (!id) return c.json({ error: 'invalid_id' }, 400);
+    const click = await clickRepository.getById(id);
+    if (!click) return c.json({ error: 'not_found' }, 404);
+    // Hydrate any conversions that fired against this click so the UI shows
+    // the full attribution chain in one place.
+    const conversions = await conversionRepository.listByClickId(id, 50).catch(() => []);
+    return c.json({ click, conversions });
+  },
+
   async listClicks(c: Context) {
     const result = await clickRepository.list({
       offer_id: c.req.query('offer_id'),

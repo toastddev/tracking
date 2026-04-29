@@ -39,7 +39,16 @@ export const clickRepository = {
 
   async getById(click_id: string): Promise<ClickRecord | null> {
     const snap = await db().collection(COLLECTIONS.CLICKS).doc(click_id).get();
-    return snap.exists ? (snap.data() as ClickRecord) : null;
+    if (!snap.exists) return null;
+    const raw = snap.data() as Record<string, unknown>;
+    return {
+      ...(raw as unknown as ClickRecord),
+      click_id,
+      created_at:
+        (raw.created_at as { toDate?: () => Date } | undefined)?.toDate?.()?.toISOString?.() ??
+        (raw.created_at as string | undefined) ??
+        '',
+    };
   },
 
   // Cursor-paginated click list for reporting. Uses the composite indexes

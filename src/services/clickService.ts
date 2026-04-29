@@ -10,6 +10,7 @@ export interface BuildClickInput {
   aff_id: string;
   sub_params: Record<string, string>;
   ad_ids: AdIds;
+  extra_params: Record<string, string>;
   ip?: string;
   user_agent?: string;
   referrer?: string;
@@ -19,13 +20,18 @@ export interface BuildClickInput {
 export const clickService = {
   build(input: BuildClickInput): ClickRecord {
     const click_id = generateClickId();
-    const { offer, aff_id, sub_params, ad_ids } = input;
+    const { offer, aff_id, sub_params, ad_ids, extra_params } = input;
 
+    // Order matters: extras come first so a structured key (sub_params,
+    // ad_ids) wins on collision. Defaults fill blanks last via the spread
+    // order. Extras then become available to the URL template — useful for
+    // forwarding utm_* into the offer link.
     const context: Record<string, string | undefined> = {
       click_id,
       offer_id: offer.offer_id,
       aff_id,
       ...offer.default_params,
+      ...extra_params,
       ...sub_params,
       ...ad_ids,
     };
@@ -38,6 +44,7 @@ export const clickService = {
       aff_id,
       sub_params,
       ad_ids,
+      extra_params,
       ip: input.ip,
       user_agent: input.user_agent,
       referrer: input.referrer,

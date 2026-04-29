@@ -93,6 +93,28 @@ export const conversionRepository = {
     return { inserted, duplicates };
   },
 
+  // All conversions tied to one click_id, newest first. Backed by the
+  // (click_id ASC, created_at DESC) composite index declared in INDEXES.
+  async listByClickId(click_id: string, limit = 25): Promise<ConversionRecord[]> {
+    const snap = await db()
+      .collection(COLLECTIONS.CONVERSIONS)
+      .where('click_id', '==', click_id)
+      .orderBy('created_at', 'desc')
+      .limit(Math.min(Math.max(limit, 1), 200))
+      .get();
+    return snap.docs.map((d) => {
+      const raw = d.data() as Record<string, unknown>;
+      return {
+        ...(raw as unknown as ConversionRecord),
+        conversion_id: d.id,
+        created_at:
+          (raw.created_at as { toDate?: () => Date } | undefined)?.toDate?.()?.toISOString?.() ??
+          (raw.created_at as string | undefined) ??
+          '',
+      };
+    });
+  },
+
   async getById(conversion_id: string): Promise<ConversionRecord | null> {
     const snap = await db().collection(COLLECTIONS.CONVERSIONS).doc(conversion_id).get();
     if (!snap.exists) return null;

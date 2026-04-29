@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { decryptSecret } from '../utils/crypto';
 import { logger } from '../utils/logger';
-import { parseResponseBody } from '../utils/responseParser';
+import { decompressBody, parseResponseBody } from '../utils/responseParser';
 import {
   affiliateApiRepository,
   affiliateApiRunRepository,
@@ -128,6 +128,17 @@ interface FetchOnceResult {
   rawSize: number;
 }
 
+// Reads a fetch response body as a UTF-8 string, transparently decompressing
+// gzip / deflate / brotli when needed. undici fetch already handles
+// spec-compliant Content-Encoding; decompressBody is the fallback for
+// upstreams (e.g. some Kelkoo endpoints) that emit gzip without the header.
+async function readBodyAsText(res: Response): Promise<string> {
+  const buf = new Uint8Array(await res.arrayBuffer());
+  const enc = res.headers.get('content-encoding');
+  const decoded = await decompressBody(buf, enc);
+  return decoded.toString('utf8');
+}
+
 async function fetchOnce(opts: {
   api: AffiliateApi;
   url: string;
@@ -144,15 +155,15 @@ async function fetchOnce(opts: {
     signal,
   });
   if (!res.ok) {
-    const text = await res.text().catch(() => '');
-    throw new Error(`http_${res.status}: ${text.slice(0, 200)}`);
+    const errBody = await readBodyAsText(res).catch(() => '');
+    throw new Error(`http_${res.status}: ${errBody.slice(0, 200)}`);
   }
 
-  // Always read the body as text and hand it to the response parser. The
-  // parser normalises XML and JSON into the same JS-object shape so the
-  // mapping engine downstream is format-agnostic. GraphQL responses are
-  // always JSON regardless of the api.response_format setting.
-  const text = await res.text();
+  // Read the body as bytes so we can decompress upstreams (Kelkoo, others)
+  // that emit gzipped responses with or without a proper Content-Encoding
+  // header. undici handles spec-compliant compression transparently —
+  // decompressBody is the safety net for the rest.
+  const text = await readBodyAsText(res);
   const ct = res.headers.get('content-type') ?? '';
   const data = parseResponseBody({
     body: text,
@@ -229,7 +240,13 @@ function buildHeaders(api: AffiliateApi): Record<string, string> {
       : api.response_format === 'xml'
         ? 'application/xml, text/xml;q=0.9'
         : 'application/json, application/xml;q=0.9, text/xml;q=0.8';
-  const headers: Record<string, string> = { Accept: accept };
+  const headers: Record<string, string> = {
+    Accept: accept,
+    // Some upstreams (Kelkoo, others) only gzip when the client asks for it
+    // explicitly. undici sets this by default but spelling it out also makes
+    // the configured payload self-documenting in logs / debug captures.
+    'Accept-Encoding': 'gzip, deflate, br',
+  };
   if (api.kind === 'graphql' || api.request.body_template) {
     headers['Content-Type'] = 'application/json';
   }

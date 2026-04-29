@@ -24,6 +24,10 @@ export interface ClickRecord {
   aff_id: string;
   sub_params: Record<string, string>;
   ad_ids: AdIds;
+  // Anything else passed on the click URL — utm_*, partner-specific keys,
+  // custom campaign tags. Captured so reports are complete and so offer URL
+  // templates can reference them via {{utm_source}}-style placeholders.
+  extra_params?: Record<string, string>;
   ip?: string;
   user_agent?: string;
   referrer?: string;
