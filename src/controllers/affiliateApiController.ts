@@ -328,7 +328,7 @@ export const affiliateApiController = {
     if (!id || !isValidId(id)) return c.json({ error: 'invalid_id' }, 400);
     const result = await affiliateApiScheduler.runNow(id, { triggered_by: 'manual' });
     if (!result.ok) {
-      const status = result.reason === 'not_found' ? 404 : result.reason === 'locked' ? 409 : 500;
+      const status = result.reason === 'not_found' ? 404 : result.reason === 'locked' ? 409 : result.reason === 'run_failed' ? 500 : 500;
       return c.json({ error: result.reason }, status);
     }
     return c.json({ ok: true, run_id: result.run_id });

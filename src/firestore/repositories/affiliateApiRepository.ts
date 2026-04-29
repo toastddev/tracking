@@ -293,13 +293,18 @@ export const affiliateApiRunRepository = {
   // orphans left by process restarts (--watch reload, SIGKILL, OOM).
   // Returns the number of rows updated. Filtered in-memory by age so we
   // don't need a (status, started_at) composite index.
-  async markStaleRunningAsAborted(thresholdMs: number): Promise<number> {
+  //
+  // When `holder` is provided, only runs tagged with that instance are
+  // cleaned — prevents one Cloud Run instance from aborting another's
+  // legitimately in-flight run. A second "global" pass with no holder and
+  // a much longer threshold catches truly dead instances.
+  async markStaleRunningAsAborted(thresholdMs: number, holder?: string): Promise<number> {
     const cutoff = Date.now() - thresholdMs;
-    const snap = await db()
+    let q: FirebaseFirestore.Query = db()
       .collection(COLLECTIONS.AFFILIATE_API_RUNS)
-      .where('status', '==', 'running')
-      .limit(500)
-      .get();
+      .where('status', '==', 'running');
+    if (holder) q = q.where('holder', '==', holder);
+    const snap = await q.limit(500).get();
     if (snap.empty) return 0;
     const stale = snap.docs.filter((d) => {
       const ts = (d.data().started_at as Timestamp | undefined)?.toMillis?.();
@@ -311,11 +316,31 @@ export const affiliateApiRunRepository = {
     for (const doc of stale) {
       batch.update(doc.ref, {
         status: 'error',
-        error: 'aborted_on_restart',
+        error: holder ? 'aborted_on_restart' : 'aborted_stale_global',
         finished_at: finished,
       });
     }
     await batch.commit();
     return stale.length;
+  },
+
+  // Best-effort: find the most recent 'running' run for an api_id and mark
+  // it as error. Called from the scheduler's catch block when runAffiliateApi
+  // throws before it can update its own run document — prevents ghost rows
+  // that block subsequent "Run now" requests.
+  async markLatestRunningAsError(api_id: string, error: string): Promise<void> {
+    const snap = await db()
+      .collection(COLLECTIONS.AFFILIATE_API_RUNS)
+      .where('api_id', '==', api_id)
+      .where('status', '==', 'running')
+      .orderBy('started_at', 'desc')
+      .limit(1)
+      .get();
+    if (snap.empty) return;
+    await snap.docs[0]!.ref.update({
+      status: 'error' as const,
+      error,
+      finished_at: Timestamp.now(),
+    });
   },
 };

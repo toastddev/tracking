@@ -275,6 +275,9 @@ function mapItem(api: AffiliateApi, item: unknown): {
 
 export interface RunOptions {
   triggered_by: 'schedule' | 'manual';
+  // Cloud Run instance tag (hostname#pid). Stored in the run doc so boot
+  // cleanup can be scoped to only this instance's orphans.
+  holder?: string;
   windowFrom?: Date;
   windowTo?: Date;
   // Don't actually persist — used by the "test" endpoint to dry-run mappings.
@@ -302,6 +305,7 @@ export async function runAffiliateApi(api: AffiliateApi, opts: RunOptions): Prom
   const run: AffiliateApiRunRecord = {
     run_id,
     api_id: api.api_id,
+    holder: opts.holder,
     status: 'running',
     started_at: started.toISOString(),
     pages_fetched: 0,

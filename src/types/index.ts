@@ -230,4 +230,7 @@ export interface AffiliateApiRunRecord {
   window_from?: string;
   window_to?: string;
   triggered_by?: 'schedule' | 'manual';
+  // Cloud Run instance identifier (hostname#pid). Used for instance-scoped
+  // boot cleanup so one instance doesn't accidentally abort another's run.
+  holder?: string;
 }

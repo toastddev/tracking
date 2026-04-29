@@ -1,4 +1,5 @@
 import { hostname } from 'node:os';
+import { randomBytes } from 'node:crypto';
 import { affiliateApiRepository, affiliateApiRunRepository } from '../firestore';
 import { runAffiliateApi } from './affiliateApiSyncService';
 import { logger } from '../utils/logger';
@@ -10,11 +11,17 @@ const CONCURRENCY = Number(process.env.AFF_API_CONCURRENCY ?? 4);
 // Defaults: 50 pages × 30s = 25 min worst case, so 1 hour gives breathing
 // room. Crashed runners auto-unblock once the lease expires.
 const LEASE_MS = Number(process.env.AFF_API_LEASE_MS ?? 60 * 60_000);     // 1 hour
-// On boot, mark any run still in 'running' state older than this as aborted.
-// 5 min by default — anything legitimately older is unrecoverable.
+// On boot, mark any run from *this instance* still in 'running' state
+// older than this as aborted. 5 min by default.
 const STALE_RUN_MS = Number(process.env.AFF_API_STALE_RUN_MS ?? 5 * 60_000);
+// Global fallback: any run (regardless of holder) stuck at 'running' for
+// longer than this is almost certainly dead. Catches orphans from instances
+// that crashed permanently and never rebooted with the same holder id.
+const GLOBAL_STALE_RUN_MS = Number(process.env.AFF_API_GLOBAL_STALE_RUN_MS ?? 60 * 60_000); // 1 hour
 
-const HOLDER = `${hostname()}#${process.pid}`;
+// Cloud Run can recycle hostnames across cold starts, so we include a
+// random nonce to keep each incarnation's holder unique.
+const HOLDER = `${hostname()}#${process.pid}#${randomBytes(3).toString('hex')}`;
 
 let timer: NodeJS.Timeout | null = null;
 let inFlight = 0;
@@ -47,7 +54,7 @@ async function tick(): Promise<void> {
     running.add(api.api_id);
     void (async () => {
       try {
-        const run = await runAffiliateApi(api, { triggered_by: 'schedule' });
+        const run = await runAffiliateApi(api, { triggered_by: 'schedule', holder: HOLDER });
         logger.info('aff_api_run_done', {
           api_id: api.api_id,
           run_id: run.run_id,
@@ -63,6 +70,11 @@ async function tick(): Promise<void> {
           api_id: api.api_id,
           error: err instanceof Error ? err.message : String(err),
         });
+        // Best-effort: mark the orphaned run doc so it doesn't stay stuck
+        // at 'running' forever and block future "Run now" requests.
+        await affiliateApiRunRepository
+          .markLatestRunningAsError(api.api_id, err instanceof Error ? err.message : String(err))
+          .catch(() => undefined);
       } finally {
         await affiliateApiRepository.releaseLock(api.api_id, HOLDER).catch(() => undefined);
         running.delete(api.api_id);
@@ -85,19 +97,36 @@ export const affiliateApiScheduler = {
       lease_ms: LEASE_MS,
       holder: HOLDER,
     });
-    // Boot-time orphan cleanup: --watch reloads / SIGKILL / OOM leave run
-    // docs stuck at 'running' forever. Mark them aborted before starting
-    // fresh ticks so the run history doesn't accumulate ghost rows.
-    void affiliateApiRunRepository
-      .markStaleRunningAsAborted(STALE_RUN_MS)
-      .then((n) => {
-        if (n > 0) logger.info('aff_api_orphan_runs_aborted', { count: n });
-      })
-      .catch((err) => {
-        logger.warn('aff_api_orphan_cleanup_failed', {
-          error: err instanceof Error ? err.message : String(err),
-        });
+    // ── Boot-time orphan cleanup (two-tier) ──────────────────────────
+    //
+    // Tier 1 — Instance-scoped (fast, safe):
+    //   Mark runs tagged with THIS holder that are still 'running' and
+    //   older than STALE_RUN_MS. These are orphans from a previous
+    //   incarnation of this exact process (--watch reload, SIGKILL, OOM).
+    //   Safe: we own them, nobody else is working on them.
+    //
+    // Tier 2 — Global fallback (slow, conservative):
+    //   Mark ANY 'running' run older than GLOBAL_STALE_RUN_MS (default
+    //   1 hour). Catches orphans from instances that crashed permanently
+    //   and will never reboot with the same holder. The 1-hour threshold
+    //   is deliberately generous — worst-case run (50 pages × 30s) is
+    //   ~25 min, so 1 hour means the run is very certainly dead.
+    void Promise.allSettled([
+      affiliateApiRunRepository
+        .markStaleRunningAsAborted(STALE_RUN_MS, HOLDER)
+        .then((n) => {
+          if (n > 0) logger.info('aff_api_orphan_runs_aborted', { scope: 'holder', count: n });
+        }),
+      affiliateApiRunRepository
+        .markStaleRunningAsAborted(GLOBAL_STALE_RUN_MS)
+        .then((n) => {
+          if (n > 0) logger.info('aff_api_orphan_runs_aborted', { scope: 'global', count: n });
+        }),
+    ]).catch((err) => {
+      logger.warn('aff_api_orphan_cleanup_failed', {
+        error: err instanceof Error ? err.message : String(err),
       });
+    });
     // Fire once on boot so freshly-due APIs don't wait a full tick.
     void tick();
     timer = setInterval(() => void tick(), TICK_MS);
@@ -121,11 +150,18 @@ export const affiliateApiScheduler = {
     if (!acquired) return { ok: false, reason: 'locked' };
     running.add(api_id);
     try {
-      const run = await runAffiliateApi(api, { triggered_by: opts.triggered_by });
+      const run = await runAffiliateApi(api, { triggered_by: opts.triggered_by, holder: HOLDER });
       return { ok: true, run_id: run.run_id };
+    } catch (err) {
+      // Mark the orphaned run doc as error so it doesn't block the next attempt.
+      await affiliateApiRunRepository
+        .markLatestRunningAsError(api_id, err instanceof Error ? err.message : String(err))
+        .catch(() => undefined);
+      return { ok: false, reason: 'run_failed' };
     } finally {
       await affiliateApiRepository.releaseLock(api_id, HOLDER).catch(() => undefined);
       running.delete(api_id);
     }
   },
 };
+
