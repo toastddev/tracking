@@ -7,6 +7,7 @@ import {
   affiliateApiRunRepository,
   conversionRepository,
   clickRepository,
+  offerReportRepository,
 } from '../firestore';
 import { generateConversionId } from '../utils/idGenerator';
 import { googleAdsForwardingService } from './googleAdsForwardingService';
@@ -347,6 +348,30 @@ export async function runAffiliateApi(api: AffiliateApi, opts: RunOptions): Prom
       const { inserted, duplicates } = await conversionRepository.bulkInsertIfAbsent(convs);
       run.records_inserted = (run.records_inserted ?? 0) + inserted;
       run.records_skipped_duplicate = (run.records_skipped_duplicate ?? 0) + duplicates;
+
+      // Roll-up into offer_reports. We can't easily separate which rows in
+      // the batch were duplicates vs new (BulkWriter resolves async), so we
+      // increment based on the full batch — for an idempotent re-run of the
+      // same window this would double-count. Mitigate by only rolling up
+      // when the inserted/duplicates ratio shows mostly fresh inserts:
+      // duplicate-heavy batches are skipped to avoid corrupting the rollup.
+      if (inserted > 0 && inserted >= duplicates) {
+        const rollupRows = batch
+          .filter((b) => b.conv.offer_id && b.conv.verified)
+          .map((b) => ({
+            offer_id: b.conv.offer_id as string,
+            at: new Date(b.conv.created_at),
+            verified: true,
+            status: b.conv.status,
+            payout: b.conv.payout,
+          }));
+        offerReportRepository.incrementConversionsBulk(rollupRows).catch((err: unknown) => {
+          logger.warn('offer_report_aff_api_rollup_failed', {
+            api_id: api.api_id,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        });
+      }
 
       // Hand rows to Google Ads forwarder. Done AFTER persistence so a
       // failed forward never blocks the API run; forwarder writes its own

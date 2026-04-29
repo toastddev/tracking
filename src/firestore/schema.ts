@@ -130,6 +130,11 @@ export const COLLECTIONS = {
   GOOGLE_ADS_UPLOADS: 'google_ads_uploads',
   AFFILIATE_APIS: 'affiliate_apis',
   AFFILIATE_API_RUNS: 'affiliate_api_runs',
+  // Pre-aggregated daily metrics per offer. Survives the 90-day TTL on
+  // clicks/conversions so historical reports keep working after source rows
+  // expire. Doc id = `{offer_id}__{YYYY-MM-DD}` (UTC). Writes are atomic
+  // FieldValue.increment from the click/postback hot paths.
+  OFFER_REPORTS: 'offer_reports',
 } as const;
 
 export type CollectionName = (typeof COLLECTIONS)[keyof typeof COLLECTIONS];

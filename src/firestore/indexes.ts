@@ -52,4 +52,7 @@ export const INDEXES = [
   // Scheduler reads: due-now lookup and per-status listing.
   { collection: 'affiliate_apis',     fields: ['status ASC', 'schedule.next_run_at ASC'] },
   { collection: 'affiliate_api_runs', fields: ['api_id ASC', 'started_at DESC'] },
+  // Pre-aggregated offer metrics — per-offer date scans + range scan.
+  { collection: 'offer_reports', fields: ['offer_id ASC', 'date ASC'] },
+  { collection: 'offer_reports', fields: ['date ASC'] },
 ] as const;

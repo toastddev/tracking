@@ -26,6 +26,7 @@ export interface ResetDataResult {
   clicks: number;
   conversions: number;
   google_ads_uploads: number;
+  offer_reports: number;
 }
 
 export const dataResetService = {
@@ -34,15 +35,17 @@ export const dataResetService = {
   // google_ads_mcc_children) are deliberately untouched.
   async resetIncomingData(actor: string): Promise<ResetDataResult> {
     logger.warn('data_reset_started', { actor });
-    const [clicks, conversions, uploads] = await Promise.all([
+    const [clicks, conversions, uploads, offerReports] = await Promise.all([
       wipeCollection(COLLECTIONS.CLICKS),
       wipeCollection(COLLECTIONS.CONVERSIONS),
       wipeCollection(COLLECTIONS.GOOGLE_ADS_UPLOADS),
+      wipeCollection(COLLECTIONS.OFFER_REPORTS),
     ]);
     const result: ResetDataResult = {
       clicks,
       conversions,
       google_ads_uploads: uploads,
+      offer_reports: offerReports,
     };
     logger.warn('data_reset_completed', { actor, ...result });
     return result;

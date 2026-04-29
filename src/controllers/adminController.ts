@@ -7,6 +7,8 @@ import {
 } from '../firestore';
 import { authService } from '../services/authService';
 import { reportsService } from '../services/reportsService';
+import { offerReportsService } from '../services/offerReportsService';
+import { offerReportsBackfillService } from '../services/offerReportsBackfillService';
 import { dataResetService } from '../services/dataResetService';
 import { logger } from '../utils/logger';
 
@@ -359,6 +361,56 @@ export const adminController = {
       return c.json({ points });
     } catch (err) {
       logger.error('report_timeseries_failed', { error: err instanceof Error ? err.message : String(err) });
+      return c.json({ error: 'internal' }, 500);
+    }
+  },
+
+  // Per-offer aggregated reports drawn from the offer_reports rollup
+  // collection (TTL-safe). Accepts an optional offer_ids list (comma-
+  // separated) so the UI can persist a multi-select locally and only ask
+  // the backend for what it intends to show.
+  async reportOffers(c: Context) {
+    const parsed = parseReportFilters(c);
+    if (!parsed.ok) return c.json({ error: parsed.error }, 400);
+    const idsRaw = c.req.query('offer_ids');
+    let offer_ids: string[] | undefined;
+    if (idsRaw) {
+      const list = idsRaw.split(',').map((s) => s.trim()).filter(Boolean);
+      for (const id of list) {
+        if (!isValidId(id)) return c.json({ error: 'invalid_offer_id' }, 400);
+      }
+      // Cap the list — Firestore parallel queries are cheap but not free.
+      if (list.length > 50) return c.json({ error: 'too_many_offer_ids' }, 400);
+      offer_ids = list;
+    }
+    try {
+      const result = await offerReportsService.perOfferSummary({
+        from: parsed.filters.from,
+        to: parsed.filters.to,
+        offer_ids,
+      });
+      return c.json(result);
+    } catch (err) {
+      logger.error('report_offers_failed', { error: err instanceof Error ? err.message : String(err) });
+      return c.json({ error: 'internal' }, 500);
+    }
+  },
+
+  // Rebuild the offer_reports rollup from the source clicks + conversions.
+  // Idempotent — safe to re-run. Accepts optional `from`/`to` ISO strings to
+  // narrow the rebuild window; defaults to the last 120 days.
+  async backfillOfferReports(c: Context) {
+    const body = await c.req.json().catch(() => ({})) as { from?: string; to?: string };
+    const from = parseDate(body.from);
+    const to = parseDate(body.to);
+    if (from && to && from.getTime() > to.getTime()) {
+      return c.json({ error: 'from_after_to' }, 400);
+    }
+    try {
+      const result = await offerReportsBackfillService.rebuild({ from, to });
+      return c.json({ ok: true, ...result });
+    } catch (err) {
+      logger.error('offer_reports_backfill_failed', { error: err instanceof Error ? err.message : String(err) });
       return c.json({ error: 'internal' }, 500);
     }
   },
