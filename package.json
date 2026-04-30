@@ -10,7 +10,8 @@
     "dev": "node --env-file=.env --import tsx --watch src/index.ts",
     "start": "node --env-file=.env --import tsx src/index.ts",
     "seed": "node --env-file=.env --import tsx seed.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "build": "tsup src/index.ts --format esm --clean"
   },
   "dependencies": {
     "@hono/node-server": "^1.13.7",
@@ -25,6 +26,7 @@
   },
   "devDependencies": {
     "@types/node": "^22.10.1",
+    "tsup": "^8.5.1",
     "typescript": "^5.6.3"
   }
 }
