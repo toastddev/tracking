@@ -43,6 +43,7 @@ adminRoutes.get('/api/reports/summary', (c) => adminController.reportSummary(c))
 adminRoutes.get('/api/reports/timeseries', (c) => adminController.reportTimeseries(c));
 adminRoutes.get('/api/reports/offers', (c) => adminController.reportOffers(c));
 adminRoutes.post('/api/reports/offers/backfill', (c) => adminController.backfillOfferReports(c));
+adminRoutes.get('/api/reports/offers/:id/detail', (c) => adminController.reportOfferDetail(c));
 
 // Affiliate APIs (pull-based conversion ingestion)
 adminRoutes.get('/api/affiliate-apis', (c) => affiliateApiController.list(c));

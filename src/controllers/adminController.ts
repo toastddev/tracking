@@ -8,6 +8,7 @@ import {
 import { authService } from '../services/authService';
 import { reportsService } from '../services/reportsService';
 import { offerReportsService } from '../services/offerReportsService';
+import { offerReportDetailService } from '../services/offerReportDetailService';
 import { offerReportsBackfillService } from '../services/offerReportsBackfillService';
 import { dataResetService } from '../services/dataResetService';
 import { logger } from '../utils/logger';
@@ -392,6 +393,33 @@ export const adminController = {
       return c.json(result);
     } catch (err) {
       logger.error('report_offers_failed', { error: err instanceof Error ? err.message : String(err) });
+      return c.json({ error: 'internal' }, 500);
+    }
+  },
+
+  // Single-offer drill-down. Returns summary + period-over-period deltas,
+  // dense daily series, and on-the-fly breakdowns (top affiliates, countries,
+  // sub-IDs, networks, ad platforms, hour heatmap, payout histogram, flags)
+  // computed by materialising raw clicks & conversions for the offer in the
+  // window. The breakdowns are capped at the most recent 20k clicks / 10k
+  // conversions; the response surfaces a truncated flag when the cap is hit.
+  async reportOfferDetail(c: Context) {
+    const id = c.req.param('id');
+    if (!id || !isValidId(id)) return c.json({ error: 'invalid_id' }, 400);
+    const parsed = parseReportFilters(c);
+    if (!parsed.ok) return c.json({ error: parsed.error }, 400);
+    try {
+      const detail = await offerReportDetailService.getDetail({
+        offer_id: id,
+        from: parsed.filters.from,
+        to: parsed.filters.to,
+      });
+      return c.json(detail);
+    } catch (err) {
+      logger.error('report_offer_detail_failed', {
+        offer_id: id,
+        error: err instanceof Error ? err.message : String(err),
+      });
       return c.json({ error: 'internal' }, 500);
     }
   },

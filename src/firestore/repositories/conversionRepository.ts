@@ -226,7 +226,7 @@ export const conversionRepository = {
 
   // Materialise a time range of conversions for bucketing/aggregation.
   async fetchRange(opts: ConversionRangeOptions & { max: number }): Promise<
-    Array<Pick<ConversionRecord, 'conversion_id' | 'network_id' | 'offer_id' | 'payout' | 'currency' | 'verified' | 'status' | 'created_at'>>
+    Array<Pick<ConversionRecord, 'conversion_id' | 'network_id' | 'offer_id' | 'click_id' | 'payout' | 'currency' | 'verified' | 'status' | 'created_at'> & { shadow?: boolean }>
   > {
     let query: FirebaseFirestore.Query = db().collection(COLLECTIONS.CONVERSIONS);
     if (opts.network_id) query = query.where('network_id', '==', opts.network_id);
@@ -245,10 +245,12 @@ export const conversionRepository = {
         conversion_id: d.id,
         network_id: String(raw.network_id ?? ''),
         offer_id: raw.offer_id as string | undefined,
+        click_id: String(raw.click_id ?? ''),
         payout: typeof raw.payout === 'number' ? raw.payout : undefined,
         currency: raw.currency as string | undefined,
         verified: Boolean(raw.verified),
         status: raw.status as string | undefined,
+        shadow: Boolean(raw.shadow),
         created_at:
           (raw.created_at as { toDate?: () => Date } | undefined)?.toDate?.()?.toISOString?.() ??
           (raw.created_at as string | undefined) ??

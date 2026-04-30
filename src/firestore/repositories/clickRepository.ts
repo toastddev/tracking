@@ -130,6 +130,44 @@ export const clickRepository = {
     });
   },
 
+  // Heavier-weight scan used by the per-offer detail page. Returns the
+  // dimensional fields (sub_params, ad_ids, extra_params) needed for
+  // breakdowns; keep the cap tight because each doc is several KB.
+  async fetchRangeForBreakdown(opts: {
+    from: Date;
+    to: Date;
+    offer_id?: string;
+    aff_id?: string;
+    max: number;
+  }): Promise<Array<Pick<ClickRecord, 'click_id' | 'offer_id' | 'aff_id' | 'created_at' | 'country' | 'sub_params' | 'ad_ids' | 'extra_params'>>> {
+    let query: FirebaseFirestore.Query = db().collection(COLLECTIONS.CLICKS);
+    if (opts.offer_id) query = query.where('offer_id', '==', opts.offer_id);
+    if (opts.aff_id) query = query.where('aff_id', '==', opts.aff_id);
+    query = query
+      .where('created_at', '>=', opts.from)
+      .where('created_at', '<=', opts.to)
+      .orderBy('created_at', 'desc')
+      .limit(opts.max);
+
+    const snap = await query.get();
+    return snap.docs.map((d) => {
+      const raw = d.data() as Record<string, unknown>;
+      return {
+        click_id: d.id,
+        offer_id: String(raw.offer_id ?? ''),
+        aff_id: String(raw.aff_id ?? ''),
+        country: raw.country as string | undefined,
+        sub_params: (raw.sub_params as Record<string, string> | undefined) ?? {},
+        ad_ids: (raw.ad_ids as Record<string, string | undefined> | undefined) ?? {},
+        extra_params: (raw.extra_params as Record<string, string> | undefined) ?? {},
+        created_at:
+          (raw.created_at as { toDate?: () => Date } | undefined)?.toDate?.()?.toISOString?.() ??
+          (raw.created_at as string | undefined) ??
+          '',
+      };
+    });
+  },
+
   async countRange(opts: { from: Date; to: Date; offer_id?: string; aff_id?: string }): Promise<number> {
     let query: FirebaseFirestore.Query = db().collection(COLLECTIONS.CLICKS);
     if (opts.offer_id) query = query.where('offer_id', '==', opts.offer_id);

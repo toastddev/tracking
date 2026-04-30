@@ -1,0 +1,692 @@
+import {
+  offerReportRepository,
+  offerRepository,
+  clickRepository,
+  conversionRepository,
+} from '../firestore';
+import type { OfferReportDoc } from '../firestore';
+
+// Hard caps on raw doc materialisation. Each click ~1–4 KB, each conversion
+// ~1–6 KB. 20k clicks ≈ 30–80 MB transferred from Firestore — the upper edge
+// of "snappy" for a single request. Above this we truncate and surface the
+// fact in the response so the UI can warn the operator.
+const CLICK_FETCH_CAP = 20_000;
+const CONVERSION_FETCH_CAP = 10_000;
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+export interface OfferDetailFilters {
+  offer_id: string;
+  from: Date;
+  to: Date;
+}
+
+export interface DetailDailyPoint {
+  date: string;
+  clicks: number;
+  postbacks: number;
+  conversions: number;
+  unverified: number;
+  approved: number;
+  pending: number;
+  rejected: number;
+  revenue: number;
+}
+
+export interface DetailSummary {
+  clicks: number;
+  postbacks: number;
+  conversions: number;
+  unverified: number;
+  approved: number;
+  pending: number;
+  rejected: number;
+  revenue: number;
+  cvr: number;
+  epc: number;
+  rpm: number;
+  avg_payout: number;
+  approval_rate: number;
+}
+
+export interface DetailDeltas {
+  // null when the previous period had zero in the denominator.
+  revenue_pct: number | null;
+  clicks_pct: number | null;
+  conversions_pct: number | null;
+  cvr_abs: number | null;            // absolute change in CVR (current - prev)
+  epc_pct: number | null;
+  approval_rate_abs: number | null;
+}
+
+export interface AffiliateBreakdown {
+  aff_id: string;
+  clicks: number;
+  conversions: number;
+  revenue: number;
+  cvr: number;
+  epc: number;
+}
+
+export interface CountryBreakdown {
+  country: string;
+  clicks: number;
+  conversions: number;
+  revenue: number;
+  cvr: number;
+}
+
+export interface SubIdBreakdown {
+  value: string;
+  clicks: number;
+  conversions: number;
+  revenue: number;
+  cvr: number;
+}
+
+export interface NetworkBreakdown {
+  network_id: string;
+  conversions: number;
+  unverified: number;
+  approved: number;
+  pending: number;
+  rejected: number;
+  revenue: number;
+  approval_rate: number;
+}
+
+export interface AdPlatformBreakdown {
+  platform: 'google' | 'facebook' | 'tiktok' | 'microsoft' | 'organic';
+  clicks: number;
+  conversions: number;
+  revenue: number;
+  cvr: number;
+}
+
+// 7×24 grid: heatmap[dayOfWeek 0=Sun][hour 0-23] = click count
+export type HourHeatmap = number[][];
+
+export interface PayoutBucket {
+  label: string;     // "$0–10", "$10–25", …
+  count: number;
+  revenue: number;
+}
+
+export type FlagSeverity = 'info' | 'warn' | 'critical';
+export interface DetailFlag {
+  severity: FlagSeverity;
+  title: string;
+  detail: string;
+}
+
+export interface DetailSamples {
+  clicks_sampled: number;
+  conversions_sampled: number;
+  clicks_truncated: boolean;       // true when we hit CLICK_FETCH_CAP
+  conversions_truncated: boolean;  // true when we hit CONVERSION_FETCH_CAP
+}
+
+export interface RecentConversion {
+  conversion_id: string;
+  network_id: string;
+  status?: string;
+  payout?: number;
+  currency?: string;
+  verified: boolean;
+  created_at: string;
+  click_id: string;
+}
+
+export interface OfferDetailResponse {
+  offer: {
+    offer_id: string;
+    name?: string;
+    status?: 'active' | 'paused';
+    base_url?: string;
+    created_at?: string;
+    updated_at?: string;
+  };
+  range: { from: string; to: string; days: number };
+  // The previous period is the same length as the requested window, ending
+  // at `from`. Used to compute deltas.
+  previous_range: { from: string; to: string };
+
+  summary: DetailSummary;
+  previous: DetailSummary;
+  deltas: DetailDeltas;
+
+  series: DetailDailyPoint[];
+  funnel: { clicks: number; postbacks: number; verified: number; approved: number };
+
+  breakdowns: {
+    affiliates: AffiliateBreakdown[];
+    countries: CountryBreakdown[];
+    sub_ids: { s1: SubIdBreakdown[]; s2: SubIdBreakdown[] };
+    networks: NetworkBreakdown[];
+    ad_platforms: AdPlatformBreakdown[];
+    hour_heatmap: HourHeatmap;
+  };
+
+  payout_histogram: PayoutBucket[];
+  flags: DetailFlag[];
+  samples: DetailSamples;
+
+  recent: {
+    rejected: RecentConversion[];
+    unverified: RecentConversion[];
+  };
+}
+
+function dayKeyUTC(d: Date): string {
+  return d.toISOString().slice(0, 10);
+}
+
+function eachDayKeyUTC(from: Date, to: Date): string[] {
+  const start = Date.UTC(from.getUTCFullYear(), from.getUTCMonth(), from.getUTCDate());
+  const end = Date.UTC(to.getUTCFullYear(), to.getUTCMonth(), to.getUTCDate());
+  const out: string[] = [];
+  for (let t = start; t <= end; t += DAY_MS) out.push(new Date(t).toISOString().slice(0, 10));
+  return out;
+}
+
+// status string → canonical bucket. Mirrors offerReportRepository's coercion
+// so totals from the rollup line up with status mix in this view.
+function statusBucket(s: string | undefined): 'approved' | 'pending' | 'rejected' {
+  const v = (s ?? '').toLowerCase();
+  if (v === 'pending') return 'pending';
+  if (v === 'rejected' || v === 'declined' || v === 'reversed') return 'rejected';
+  return 'approved';
+}
+
+function rollupToSummary(rows: OfferReportDoc[]): DetailSummary {
+  let clicks = 0, postbacks = 0, conversions = 0, unverified = 0;
+  let approved = 0, pending = 0, rejected = 0, revenue = 0;
+  for (const r of rows) {
+    clicks += r.clicks;
+    postbacks += r.postbacks;
+    conversions += r.conversions;
+    unverified += r.unverified;
+    approved += r.approved;
+    pending += r.pending;
+    rejected += r.rejected;
+    revenue += r.revenue;
+  }
+  return {
+    clicks, postbacks, conversions, unverified, approved, pending, rejected, revenue,
+    cvr: clicks > 0 ? conversions / clicks : 0,
+    epc: clicks > 0 ? revenue / clicks : 0,
+    rpm: clicks > 0 ? (revenue * 1000) / clicks : 0,
+    avg_payout: conversions > 0 ? revenue / conversions : 0,
+    // Approval rate = approved verified conversions / all verified conversions.
+    approval_rate: conversions > 0 ? approved / conversions : 0,
+  };
+}
+
+function pctDelta(curr: number, prev: number): number | null {
+  if (prev === 0) return null;
+  return (curr - prev) / prev;
+}
+
+function absDelta(curr: number, prev: number): number | null {
+  // Return null when neither period has any signal — the delta is meaningless.
+  if (curr === 0 && prev === 0) return null;
+  return curr - prev;
+}
+
+function buildSeries(rows: OfferReportDoc[], from: Date, to: Date): DetailDailyPoint[] {
+  const days = eachDayKeyUTC(from, to);
+  const bucket = new Map<string, DetailDailyPoint>();
+  for (const day of days) {
+    bucket.set(day, {
+      date: day, clicks: 0, postbacks: 0, conversions: 0,
+      unverified: 0, approved: 0, pending: 0, rejected: 0, revenue: 0,
+    });
+  }
+  for (const r of rows) {
+    const p = bucket.get(r.date);
+    if (!p) continue;
+    p.clicks += r.clicks;
+    p.postbacks += r.postbacks;
+    p.conversions += r.conversions;
+    p.unverified += r.unverified;
+    p.approved += r.approved;
+    p.pending += r.pending;
+    p.rejected += r.rejected;
+    p.revenue += r.revenue;
+  }
+  return Array.from(bucket.values()).sort((a, b) => a.date.localeCompare(b.date));
+}
+
+function detectAdPlatform(ad_ids: Record<string, string | undefined>): AdPlatformBreakdown['platform'] {
+  // gbraid/wbraid/gclid all originate from Google (Web/App/Ads) — bucketed
+  // together so the operator sees one Google number rather than three thin slices.
+  if (ad_ids.gclid || ad_ids.gbraid || ad_ids.wbraid) return 'google';
+  if (ad_ids.fbclid) return 'facebook';
+  if (ad_ids.ttclid) return 'tiktok';
+  if (ad_ids.msclkid) return 'microsoft';
+  return 'organic';
+}
+
+const PAYOUT_EDGES = [0, 1, 5, 10, 25, 50, 100, 250, 500, 1000, Infinity];
+function payoutBucketLabel(value: number): { idx: number; label: string } {
+  for (let i = 0; i < PAYOUT_EDGES.length - 1; i++) {
+    const lo = PAYOUT_EDGES[i]!;
+    const hi = PAYOUT_EDGES[i + 1]!;
+    if (value >= lo && value < hi) {
+      const label = hi === Infinity ? `$${lo}+` : `$${lo}–${hi}`;
+      return { idx: i, label };
+    }
+  }
+  return { idx: PAYOUT_EDGES.length - 2, label: '$1000+' };
+}
+
+export const offerReportDetailService = {
+  async getDetail(f: OfferDetailFilters): Promise<OfferDetailResponse> {
+    const { offer_id, from, to } = f;
+    const periodMs = to.getTime() - from.getTime();
+    // Previous-period bounds — same length, ending at `from`.
+    const prevTo = new Date(from.getTime() - 1);
+    const prevFrom = new Date(prevTo.getTime() - periodMs);
+
+    // Pull rollup, prev-period rollup, offer meta, raw clicks, raw conversions
+    // in parallel — Firestore reads are independent.
+    const [offer, rollupRows, prevRollupRows, clicks, conversions] = await Promise.all([
+      offerRepository.getById(offer_id),
+      offerReportRepository.fetchRange({ from, to, offer_ids: [offer_id] }),
+      offerReportRepository.fetchRange({ from: prevFrom, to: prevTo, offer_ids: [offer_id] }),
+      clickRepository.fetchRangeForBreakdown({
+        offer_id,
+        from,
+        to,
+        max: CLICK_FETCH_CAP,
+      }),
+      conversionRepository.fetchRange({
+        offer_id,
+        from,
+        to,
+        max: CONVERSION_FETCH_CAP,
+      }),
+    ]);
+
+    const summary = rollupToSummary(rollupRows);
+    const previous = rollupToSummary(prevRollupRows);
+    const deltas: DetailDeltas = {
+      revenue_pct: pctDelta(summary.revenue, previous.revenue),
+      clicks_pct: pctDelta(summary.clicks, previous.clicks),
+      conversions_pct: pctDelta(summary.conversions, previous.conversions),
+      cvr_abs: absDelta(summary.cvr, previous.cvr),
+      epc_pct: pctDelta(summary.epc, previous.epc),
+      approval_rate_abs: absDelta(summary.approval_rate, previous.approval_rate),
+    };
+
+    const series = buildSeries(rollupRows, from, to);
+
+    // Build click_id → aff_id / country lookup so we can credit conversions
+    // back to the originating affiliate / geo. Conversions whose click was
+    // before the window won't match — those go in an "older traffic" bucket.
+    const clickById = new Map<string, typeof clicks[number]>();
+    for (const c of clicks) clickById.set(c.click_id, c);
+
+    // ── Click-side aggregations (aff/country/sub_ids/ad_platform/hour heatmap)
+    const affAgg = new Map<string, AffiliateBreakdown>();
+    const countryAgg = new Map<string, CountryBreakdown>();
+    const s1Agg = new Map<string, SubIdBreakdown>();
+    const s2Agg = new Map<string, SubIdBreakdown>();
+    const platformAgg = new Map<AdPlatformBreakdown['platform'], AdPlatformBreakdown>();
+    const heatmap: HourHeatmap = Array.from({ length: 7 }, () => Array(24).fill(0));
+
+    function bumpAff(id: string, delta: Partial<AffiliateBreakdown>) {
+      let row = affAgg.get(id);
+      if (!row) {
+        row = { aff_id: id, clicks: 0, conversions: 0, revenue: 0, cvr: 0, epc: 0 };
+        affAgg.set(id, row);
+      }
+      row.clicks += delta.clicks ?? 0;
+      row.conversions += delta.conversions ?? 0;
+      row.revenue += delta.revenue ?? 0;
+    }
+    function bumpCountry(id: string, delta: Partial<CountryBreakdown>) {
+      let row = countryAgg.get(id);
+      if (!row) {
+        row = { country: id, clicks: 0, conversions: 0, revenue: 0, cvr: 0 };
+        countryAgg.set(id, row);
+      }
+      row.clicks += delta.clicks ?? 0;
+      row.conversions += delta.conversions ?? 0;
+      row.revenue += delta.revenue ?? 0;
+    }
+    function bumpSub(map: Map<string, SubIdBreakdown>, val: string, delta: Partial<SubIdBreakdown>) {
+      let row = map.get(val);
+      if (!row) {
+        row = { value: val, clicks: 0, conversions: 0, revenue: 0, cvr: 0 };
+        map.set(val, row);
+      }
+      row.clicks += delta.clicks ?? 0;
+      row.conversions += delta.conversions ?? 0;
+      row.revenue += delta.revenue ?? 0;
+    }
+    function bumpPlatform(p: AdPlatformBreakdown['platform'], delta: Partial<AdPlatformBreakdown>) {
+      let row = platformAgg.get(p);
+      if (!row) {
+        row = { platform: p, clicks: 0, conversions: 0, revenue: 0, cvr: 0 };
+        platformAgg.set(p, row);
+      }
+      row.clicks += delta.clicks ?? 0;
+      row.conversions += delta.conversions ?? 0;
+      row.revenue += delta.revenue ?? 0;
+    }
+
+    for (const c of clicks) {
+      bumpAff(c.aff_id || '(none)', { clicks: 1 });
+      bumpCountry(c.country || 'unknown', { clicks: 1 });
+      const s1 = c.sub_params?.s1;
+      if (s1) bumpSub(s1Agg, s1, { clicks: 1 });
+      const s2 = c.sub_params?.s2;
+      if (s2) bumpSub(s2Agg, s2, { clicks: 1 });
+      bumpPlatform(detectAdPlatform(c.ad_ids ?? {}), { clicks: 1 });
+
+      // Hour heatmap. Click times are second-resolution UTC; bucket by UTC
+      // day-of-week + hour so the operator can spot weekday/weekend patterns.
+      const t = new Date(c.created_at);
+      if (!Number.isNaN(t.getTime())) {
+        const dow = t.getUTCDay();
+        const hour = t.getUTCHours();
+        heatmap[dow]![hour]! += 1;
+      }
+    }
+
+    // ── Conversion-side aggregation (network breakdown + per-affiliate
+    // conversion/revenue credit via click_id lookup).
+    const networkAgg = new Map<string, NetworkBreakdown>();
+    function bumpNetwork(id: string, delta: Partial<NetworkBreakdown>) {
+      let row = networkAgg.get(id);
+      if (!row) {
+        row = {
+          network_id: id, conversions: 0, unverified: 0,
+          approved: 0, pending: 0, rejected: 0, revenue: 0, approval_rate: 0,
+        };
+        networkAgg.set(id, row);
+      }
+      row.conversions += delta.conversions ?? 0;
+      row.unverified += delta.unverified ?? 0;
+      row.approved += delta.approved ?? 0;
+      row.pending += delta.pending ?? 0;
+      row.rejected += delta.rejected ?? 0;
+      row.revenue += delta.revenue ?? 0;
+    }
+
+    const payoutHistogramRaw = new Map<number, { label: string; count: number; revenue: number }>();
+    let pendingAgingRevenue = 0;
+    let pendingAgingCount = 0;
+    const NOW = Date.now();
+    const FOURTEEN_DAYS = 14 * DAY_MS;
+
+    // Track conversions per aff using the click lookup. Unmatched conversions
+    // don't bump the affiliate breakdown — but we still count them in summary.
+    for (const conv of conversions) {
+      // Skip shadow/audit-only rows (already excluded from rollup; conversions
+      // table contains them but they shouldn't double-count here either).
+      if (conv.shadow) continue;
+
+      const verified = !!conv.verified;
+      const payout = typeof conv.payout === 'number' ? conv.payout : 0;
+      const status = conv.status;
+      const network_id = conv.network_id || '(unknown)';
+
+      if (verified) {
+        const bucket = statusBucket(status);
+        bumpNetwork(network_id, { conversions: 1, [bucket]: 1, revenue: payout });
+
+        // Per-affiliate / per-country conversion attribution via click_id.
+        const click = clickById.get(conv.click_id);
+        if (click) {
+          bumpAff(click.aff_id || '(none)', { conversions: 1, revenue: payout });
+          bumpCountry(click.country || 'unknown', { conversions: 1, revenue: payout });
+          const s1 = click.sub_params?.s1;
+          if (s1) bumpSub(s1Agg, s1, { conversions: 1, revenue: payout });
+          const s2 = click.sub_params?.s2;
+          if (s2) bumpSub(s2Agg, s2, { conversions: 1, revenue: payout });
+          bumpPlatform(detectAdPlatform(click.ad_ids ?? {}), { conversions: 1, revenue: payout });
+        }
+
+        // Pending aging — money owed but unconfirmed > 14 days.
+        if (bucket === 'pending') {
+          const t = new Date(conv.created_at).getTime();
+          if (!Number.isNaN(t) && (NOW - t) > FOURTEEN_DAYS) {
+            pendingAgingCount += 1;
+            pendingAgingRevenue += payout;
+          }
+        }
+
+        // Payout histogram — only count verified rows with a payout.
+        if (payout > 0) {
+          const { idx, label } = payoutBucketLabel(payout);
+          const cur = payoutHistogramRaw.get(idx) ?? { label, count: 0, revenue: 0 };
+          cur.count += 1;
+          cur.revenue += payout;
+          payoutHistogramRaw.set(idx, cur);
+        }
+      } else {
+        bumpNetwork(network_id, { unverified: 1 });
+      }
+    }
+
+    // Finalise computed metrics on each breakdown.
+    for (const r of affAgg.values()) {
+      r.cvr = r.clicks > 0 ? r.conversions / r.clicks : 0;
+      r.epc = r.clicks > 0 ? r.revenue / r.clicks : 0;
+    }
+    for (const r of countryAgg.values()) {
+      r.cvr = r.clicks > 0 ? r.conversions / r.clicks : 0;
+    }
+    for (const r of s1Agg.values()) {
+      r.cvr = r.clicks > 0 ? r.conversions / r.clicks : 0;
+    }
+    for (const r of s2Agg.values()) {
+      r.cvr = r.clicks > 0 ? r.conversions / r.clicks : 0;
+    }
+    for (const r of platformAgg.values()) {
+      r.cvr = r.clicks > 0 ? r.conversions / r.clicks : 0;
+    }
+    for (const r of networkAgg.values()) {
+      r.approval_rate = r.conversions > 0 ? r.approved / r.conversions : 0;
+    }
+
+    const TOP = 10;
+    const topAffiliates = Array.from(affAgg.values())
+      .sort((a, b) => b.revenue - a.revenue || b.clicks - a.clicks)
+      .slice(0, TOP);
+    const topCountries = Array.from(countryAgg.values())
+      .sort((a, b) => b.clicks - a.clicks)
+      .slice(0, TOP);
+    const topS1 = Array.from(s1Agg.values()).sort((a, b) => b.clicks - a.clicks).slice(0, TOP);
+    const topS2 = Array.from(s2Agg.values()).sort((a, b) => b.clicks - a.clicks).slice(0, TOP);
+    const networks = Array.from(networkAgg.values()).sort((a, b) => b.revenue - a.revenue);
+    const adPlatforms = Array.from(platformAgg.values()).sort((a, b) => b.clicks - a.clicks);
+
+    const payoutHistogram: PayoutBucket[] = [];
+    for (let i = 0; i < PAYOUT_EDGES.length - 1; i++) {
+      const entry = payoutHistogramRaw.get(i);
+      if (entry) {
+        payoutHistogram.push(entry);
+      } else {
+        const lo = PAYOUT_EDGES[i]!;
+        const hi = PAYOUT_EDGES[i + 1]!;
+        const label = hi === Infinity ? `$${lo}+` : `$${lo}–${hi}`;
+        payoutHistogram.push({ label, count: 0, revenue: 0 });
+      }
+    }
+
+    // ── Diagnostic flags
+    const flags: DetailFlag[] = [];
+
+    // Zero-conversion affiliates with meaningful click volume — fraud or bad
+    // creative signal. Threshold scales with the offer's overall traffic.
+    const zeroConvAffs = topAffiliates.filter((a) => a.clicks >= 50 && a.conversions === 0);
+    if (zeroConvAffs.length > 0) {
+      flags.push({
+        severity: 'warn',
+        title: `${zeroConvAffs.length} affiliate${zeroConvAffs.length === 1 ? '' : 's'} sending traffic with zero conversions`,
+        detail: zeroConvAffs.slice(0, 3)
+          .map((a) => `${a.aff_id} (${a.clicks} clicks)`).join(', ') +
+          (zeroConvAffs.length > 3 ? ' …' : ''),
+      });
+    }
+
+    // Abnormally high CVR per aff — possible fraud (test postbacks) or hand-tuned
+    // outlier. Compare against the offer's own CVR, not portfolio.
+    const baseCvr = summary.cvr;
+    if (baseCvr > 0) {
+      const suspect = Array.from(affAgg.values()).filter(
+        (a) => a.clicks >= 5 && a.cvr > baseCvr * 3
+      );
+      if (suspect.length > 0) {
+        flags.push({
+          severity: 'warn',
+          title: `${suspect.length} affiliate${suspect.length === 1 ? '' : 's'} with suspiciously high CVR`,
+          detail: suspect.slice(0, 3)
+            .map((a) => `${a.aff_id} (${(a.cvr * 100).toFixed(1)}% vs offer avg ${(baseCvr * 100).toFixed(1)}%)`).join(', ') +
+            (suspect.length > 3 ? ' …' : ''),
+        });
+      }
+    }
+
+    // Pending aging — cash flow risk.
+    if (pendingAgingCount > 0) {
+      flags.push({
+        severity: 'info',
+        title: `${pendingAgingCount} pending conversion${pendingAgingCount === 1 ? '' : 's'} older than 14 days`,
+        detail: `$${pendingAgingRevenue.toFixed(2)} unconfirmed — chase the network for status updates.`,
+      });
+    }
+
+    // Rejection trend — split window in halves and compare rejection rates.
+    if (rollupRows.length >= 4) {
+      const sortedDates = rollupRows.slice().sort((a, b) => a.date.localeCompare(b.date));
+      const mid = Math.floor(sortedDates.length / 2);
+      const first = sortedDates.slice(0, mid);
+      const second = sortedDates.slice(mid);
+      const firstRej = first.reduce((s, r) => s + r.rejected, 0);
+      const firstTot = first.reduce((s, r) => s + r.conversions, 0);
+      const secondRej = second.reduce((s, r) => s + r.rejected, 0);
+      const secondTot = second.reduce((s, r) => s + r.conversions, 0);
+      const r1 = firstTot > 0 ? firstRej / firstTot : 0;
+      const r2 = secondTot > 0 ? secondRej / secondTot : 0;
+      // Need ≥10 conversions in each half to call a trend.
+      if (firstTot >= 10 && secondTot >= 10 && r2 > r1 + 0.05 && r2 > 0.1) {
+        flags.push({
+          severity: 'critical',
+          title: 'Rejection rate trending up',
+          detail: `${(r1 * 100).toFixed(1)}% → ${(r2 * 100).toFixed(1)}% across the window. Network may be tightening approval criteria.`,
+        });
+      }
+    }
+
+    // Unverified spike — any day with unverified > 2× the median.
+    const unverifiedSeries = series.map((p) => p.unverified).slice().sort((a, b) => a - b);
+    if (unverifiedSeries.length >= 3) {
+      const median = unverifiedSeries[Math.floor(unverifiedSeries.length / 2)] ?? 0;
+      if (median > 0) {
+        const spikes = series.filter((p) => p.unverified > median * 2 && p.unverified >= 5);
+        if (spikes.length > 0) {
+          flags.push({
+            severity: 'warn',
+            title: `${spikes.length} day${spikes.length === 1 ? '' : 's'} with unusually high unverified postbacks`,
+            detail: `Tracking may have broken on: ${spikes.map((p) => p.date).slice(0, 3).join(', ')}${spikes.length > 3 ? ' …' : ''}`,
+          });
+        }
+      }
+    }
+
+    // Sample truncation banner — operator should know the breakdowns are partial.
+    if (clicks.length >= CLICK_FETCH_CAP) {
+      flags.push({
+        severity: 'info',
+        title: `Showing breakdowns from the most recent ${CLICK_FETCH_CAP.toLocaleString()} clicks`,
+        detail: 'Older clicks in this range are not included in the breakdown tables. Totals and the daily chart are exact.',
+      });
+    }
+
+    // ── Recent activity samples — grab last few rejected & unverified for quick
+    // diagnosis. Conversions are already sorted desc by created_at.
+    const recentRejected: RecentConversion[] = [];
+    const recentUnverified: RecentConversion[] = [];
+    for (const c of conversions) {
+      if (c.verified && statusBucket(c.status) === 'rejected' && recentRejected.length < 5) {
+        recentRejected.push({
+          conversion_id: c.conversion_id,
+          network_id: c.network_id,
+          status: c.status,
+          payout: c.payout,
+          currency: c.currency,
+          verified: true,
+          created_at: c.created_at,
+          click_id: c.click_id,
+        });
+      }
+      if (!c.verified && recentUnverified.length < 5) {
+        recentUnverified.push({
+          conversion_id: c.conversion_id,
+          network_id: c.network_id,
+          status: c.status,
+          payout: c.payout,
+          currency: c.currency,
+          verified: false,
+          created_at: c.created_at,
+          click_id: c.click_id,
+        });
+      }
+      if (recentRejected.length >= 5 && recentUnverified.length >= 5) break;
+    }
+
+    return {
+      offer: {
+        offer_id: offer?.offer_id ?? offer_id,
+        name: offer?.name,
+        status: offer?.status,
+        base_url: offer?.base_url,
+        created_at: offer?.created_at,
+        updated_at: offer?.updated_at,
+      },
+      range: {
+        from: from.toISOString(),
+        to: to.toISOString(),
+        days: Math.max(1, Math.round(periodMs / DAY_MS)),
+      },
+      previous_range: {
+        from: prevFrom.toISOString(),
+        to: prevTo.toISOString(),
+      },
+      summary,
+      previous,
+      deltas,
+      series,
+      funnel: {
+        clicks: summary.clicks,
+        postbacks: summary.postbacks,
+        verified: summary.conversions,
+        approved: summary.approved,
+      },
+      breakdowns: {
+        affiliates: topAffiliates,
+        countries: topCountries,
+        sub_ids: { s1: topS1, s2: topS2 },
+        networks,
+        ad_platforms: adPlatforms,
+        hour_heatmap: heatmap,
+      },
+      payout_histogram: payoutHistogram,
+      flags,
+      samples: {
+        clicks_sampled: clicks.length,
+        conversions_sampled: conversions.length,
+        clicks_truncated: clicks.length >= CLICK_FETCH_CAP,
+        conversions_truncated: conversions.length >= CONVERSION_FETCH_CAP,
+      },
+      recent: {
+        rejected: recentRejected,
+        unverified: recentUnverified,
+      },
+    };
+  },
+};
