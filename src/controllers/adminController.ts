@@ -10,6 +10,8 @@ import { reportsService } from '../services/reportsService';
 import { offerReportsService } from '../services/offerReportsService';
 import { offerReportDetailService } from '../services/offerReportDetailService';
 import { offerReportsBackfillService } from '../services/offerReportsBackfillService';
+import { postbackReportsService } from '../services/postbackReportsService';
+import { postbackReportDetailService } from '../services/postbackReportDetailService';
 import { dataResetService } from '../services/dataResetService';
 import { logger } from '../utils/logger';
 
@@ -418,6 +420,61 @@ export const adminController = {
     } catch (err) {
       logger.error('report_offer_detail_failed', {
         offer_id: id,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return c.json({ error: 'internal' }, 500);
+    }
+  },
+
+  // Per-network postback summary. Distinct from offer reports: the operator
+  // is asking "is the network's S2S delivery healthy and matching our clicks?"
+  // not "is this offer making me money?". Match-rate, not CVR, is the
+  // headline metric. Backed by a single capped conversion range scan.
+  async reportPostbacks(c: Context) {
+    const parsed = parseReportFilters(c);
+    if (!parsed.ok) return c.json({ error: parsed.error }, 400);
+    const idsRaw = c.req.query('network_ids');
+    let network_ids: string[] | undefined;
+    if (idsRaw) {
+      const list = idsRaw.split(',').map((s) => s.trim()).filter(Boolean);
+      for (const id of list) {
+        if (!isValidId(id)) return c.json({ error: 'invalid_network_id' }, 400);
+      }
+      if (list.length > 50) return c.json({ error: 'too_many_network_ids' }, 400);
+      network_ids = list;
+    }
+    try {
+      const result = await postbackReportsService.perNetworkSummary({
+        from: parsed.filters.from,
+        to: parsed.filters.to,
+        network_ids,
+      });
+      return c.json(result);
+    } catch (err) {
+      logger.error('report_postbacks_failed', { error: err instanceof Error ? err.message : String(err) });
+      return c.json({ error: 'internal' }, 500);
+    }
+  },
+
+  // Single-network postback drill-down. Surfaces match-rate, status grading,
+  // mapping coverage, latency between event and ingest, source/method splits,
+  // and unmatched-fire samples — the tools an operator needs to debug a sick
+  // S2S integration.
+  async reportPostbackDetail(c: Context) {
+    const id = c.req.param('id');
+    if (!id || !isValidId(id)) return c.json({ error: 'invalid_id' }, 400);
+    const parsed = parseReportFilters(c);
+    if (!parsed.ok) return c.json({ error: parsed.error }, 400);
+    try {
+      const detail = await postbackReportDetailService.getDetail({
+        network_id: id,
+        from: parsed.filters.from,
+        to: parsed.filters.to,
+      });
+      return c.json(detail);
+    } catch (err) {
+      logger.error('report_postback_detail_failed', {
+        network_id: id,
         error: err instanceof Error ? err.message : String(err),
       });
       return c.json({ error: 'internal' }, 500);

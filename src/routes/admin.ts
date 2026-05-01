@@ -44,6 +44,8 @@ adminRoutes.get('/api/reports/timeseries', (c) => adminController.reportTimeseri
 adminRoutes.get('/api/reports/offers', (c) => adminController.reportOffers(c));
 adminRoutes.post('/api/reports/offers/backfill', (c) => adminController.backfillOfferReports(c));
 adminRoutes.get('/api/reports/offers/:id/detail', (c) => adminController.reportOfferDetail(c));
+adminRoutes.get('/api/reports/postbacks', (c) => adminController.reportPostbacks(c));
+adminRoutes.get('/api/reports/postbacks/:id/detail', (c) => adminController.reportPostbackDetail(c));
 
 // Affiliate APIs (pull-based conversion ingestion)
 adminRoutes.get('/api/affiliate-apis', (c) => affiliateApiController.list(c));
