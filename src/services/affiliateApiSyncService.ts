@@ -360,6 +360,7 @@ export async function runAffiliateApi(api: AffiliateApi, opts: RunOptions): Prom
           .filter((b) => b.conv.offer_id && b.conv.verified)
           .map((b) => ({
             offer_id: b.conv.offer_id as string,
+            network_id: b.conv.network_id,
             at: new Date(b.conv.created_at),
             verified: true,
             status: b.conv.status,

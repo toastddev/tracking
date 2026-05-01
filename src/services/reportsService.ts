@@ -1,4 +1,4 @@
-import { clickRepository, conversionRepository } from '../firestore';
+import { clickRepository, conversionRepository, offerReportRepository } from '../firestore';
 
 export interface ReportFilters {
   from: Date;
@@ -90,43 +90,32 @@ export const reportsService = {
   },
 
   async timeseries(f: ReportFilters): Promise<TimeseriesPoint[]> {
-    const [clickDocs, convDocs] = await Promise.all([
-      clickRepository.fetchRange({
-        from: f.from,
-        to: f.to,
-        offer_id: f.offer_id,
-        max: MAX_FETCH,
-      }),
-      conversionRepository.fetchRange({
-        from: f.from,
-        to: f.to,
-        offer_id: f.offer_id,
-        network_id: f.network_id,
-        max: MAX_FETCH,
-      }),
-    ]);
-
     const buckets = new Map<string, TimeseriesPoint>();
     for (const day of eachDayUTC(f.from, f.to)) {
       buckets.set(day, { date: day, clicks: 0, postbacks: 0, conversions: 0, revenue: 0 });
     }
 
-    for (const c of clickDocs) {
-      if (!c.created_at) continue;
-      const key = dayKey(new Date(c.created_at));
-      const b = buckets.get(key);
-      if (b) b.clicks += 1;
-    }
+    const rollupDocs = await offerReportRepository.fetchRange({
+      from: f.from,
+      to: f.to,
+      offer_ids: f.offer_id ? [f.offer_id] : undefined,
+    });
 
-    for (const c of convDocs) {
-      if (!c.created_at) continue;
-      const key = dayKey(new Date(c.created_at));
-      const b = buckets.get(key);
+    for (const r of rollupDocs) {
+      const b = buckets.get(r.date);
       if (!b) continue;
-      b.postbacks += 1;
-      if (c.verified) {
-        b.conversions += 1;
-        if (typeof c.payout === 'number') b.revenue += c.payout;
+
+      // Clicks are stored under network_id = 'none'. They apply regardless of network filter.
+      if (r.network_id === 'none') {
+        b.clicks += r.clicks;
+      }
+
+      // For conversions/revenue, if there's no network filter, include all networks.
+      // If there IS a filter, only include if network matches.
+      if (!f.network_id || r.network_id === f.network_id) {
+        b.postbacks += r.postbacks;
+        b.conversions += r.conversions;
+        b.revenue += r.revenue;
       }
     }
 

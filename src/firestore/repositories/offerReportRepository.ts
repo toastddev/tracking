@@ -2,7 +2,7 @@ import { FieldValue, Timestamp } from 'firebase-admin/firestore';
 import { db } from '../config';
 import { COLLECTIONS } from '../schema';
 
-// Offer-level pre-aggregated daily metrics. Doc id = `{offer_id}__{YYYY-MM-DD}`
+// Offer-level pre-aggregated daily metrics. Doc id = `{offer_id}__{network_id}__{YYYY-MM-DD}`
 // (UTC day). This collection survives the 90-day TTL on clicks/conversions —
 // the source rows can be deleted after 90 days but reports stay queryable.
 //
@@ -10,6 +10,7 @@ import { COLLECTIONS } from '../schema';
 // and postback hot paths. Reads use a single (offer_id, date) range scan.
 export interface OfferReportDoc {
   offer_id: string;
+  network_id: string;    // 'none' for clicks
   date: string;          // ISO date YYYY-MM-DD (UTC)
   clicks: number;
   postbacks: number;     // verified + unverified, excluding shadow rows
@@ -23,8 +24,8 @@ export interface OfferReportDoc {
   updated_at?: string;
 }
 
-function docId(offer_id: string, date: string): string {
-  return `${offer_id}__${date}`;
+function docId(offer_id: string, network_id: string, date: string): string {
+  return `${offer_id}__${network_id}__${date}`;
 }
 
 // Coerce status string → bucket key. Anything not in the canonical list rolls
@@ -48,6 +49,7 @@ export interface IncrementClickInput {
 
 export interface IncrementConversionInput {
   offer_id: string;
+  network_id?: string;
   at: Date;
   verified: boolean;
   status?: string;
@@ -66,10 +68,12 @@ export const offerReportRepository = {
   // case; FieldValue.increment is associative across concurrent writers.
   async incrementClick(input: IncrementClickInput): Promise<void> {
     const date = dayKeyUTC(input.at);
-    const ref = db().collection(COLLECTIONS.OFFER_REPORTS).doc(docId(input.offer_id, date));
+    const network_id = 'none';
+    const ref = db().collection(COLLECTIONS.OFFER_REPORTS).doc(docId(input.offer_id, network_id, date));
     await ref.set(
       {
         offer_id: input.offer_id,
+        network_id,
         date,
         clicks: FieldValue.increment(1),
         updated_at: FieldValue.serverTimestamp(),
@@ -80,9 +84,11 @@ export const offerReportRepository = {
 
   async incrementConversion(input: IncrementConversionInput): Promise<void> {
     const date = dayKeyUTC(input.at);
-    const ref = db().collection(COLLECTIONS.OFFER_REPORTS).doc(docId(input.offer_id, date));
+    const network_id = input.network_id || 'none';
+    const ref = db().collection(COLLECTIONS.OFFER_REPORTS).doc(docId(input.offer_id, network_id, date));
     const patch: Record<string, unknown> = {
       offer_id: input.offer_id,
+      network_id,
       date,
       postbacks: FieldValue.increment(1),
       updated_at: FieldValue.serverTimestamp(),
@@ -101,12 +107,13 @@ export const offerReportRepository = {
   },
 
   // Bulk variant for the affiliate API sync flush. One BulkWriter pass, one
-  // increment per offer/day. Saves a Firestore RTT per record on big runs.
+  // increment per offer/network/day. Saves a Firestore RTT per record on big runs.
   async incrementConversionsBulk(rows: IncrementConversionInput[]): Promise<void> {
     if (rows.length === 0) return;
-    // Aggregate increments per (offer_id, date) so we issue one write per bucket.
+    // Aggregate increments per (offer_id, network_id, date) so we issue one write per bucket.
     type Bucket = {
       offer_id: string;
+      network_id: string;
       date: string;
       postbacks: number;
       conversions: number;
@@ -119,11 +126,13 @@ export const offerReportRepository = {
     const buckets = new Map<string, Bucket>();
     for (const r of rows) {
       const date = dayKeyUTC(r.at);
-      const key = `${r.offer_id}|${date}`;
+      const network_id = r.network_id || 'none';
+      const key = `${r.offer_id}|${network_id}|${date}`;
       let b = buckets.get(key);
       if (!b) {
         b = {
           offer_id: r.offer_id,
+          network_id,
           date,
           postbacks: 0,
           conversions: 0,
@@ -148,9 +157,10 @@ export const offerReportRepository = {
 
     const writer = db().bulkWriter();
     for (const b of buckets.values()) {
-      const ref = db().collection(COLLECTIONS.OFFER_REPORTS).doc(docId(b.offer_id, b.date));
+      const ref = db().collection(COLLECTIONS.OFFER_REPORTS).doc(docId(b.offer_id, b.network_id, b.date));
       const patch: Record<string, unknown> = {
         offer_id: b.offer_id,
+        network_id: b.network_id,
         date: b.date,
         postbacks: FieldValue.increment(b.postbacks),
         updated_at: FieldValue.serverTimestamp(),
@@ -208,6 +218,7 @@ export const offerReportRepository = {
 function hydrate(raw: Record<string, unknown>): OfferReportDoc {
   return {
     offer_id: String(raw.offer_id ?? ''),
+    network_id: String(raw.network_id ?? 'none'),
     date: String(raw.date ?? ''),
     clicks: numOr0(raw.clicks),
     postbacks: numOr0(raw.postbacks),

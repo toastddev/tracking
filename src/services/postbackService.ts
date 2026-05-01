@@ -137,24 +137,23 @@ export const postbackService = {
     // increments). Unverified rows still increment postbacks/unverified so
     // the offer report mirrors the postback log.
     if (!shadow) {
-      const offerForReport = click?.offer_id;
-      if (offerForReport) {
-        offerReportRepository
-          .incrementConversion({
+      const offerForReport = click?.offer_id || 'unknown';
+      offerReportRepository
+        .incrementConversion({
+          offer_id: offerForReport,
+          network_id: conv.network_id,
+          at: new Date(conv.created_at),
+          verified: conv.verified,
+          status: conv.status,
+          payout: conv.payout,
+        })
+        .catch((err: unknown) => {
+          logger.warn('offer_report_conversion_increment_failed', {
+            network_id: conv.network_id,
             offer_id: offerForReport,
-            at: new Date(conv.created_at),
-            verified: conv.verified,
-            status: conv.status,
-            payout: conv.payout,
-          })
-          .catch((err: unknown) => {
-            logger.warn('offer_report_conversion_increment_failed', {
-              network_id: conv.network_id,
-              offer_id: offerForReport,
-              error: err instanceof Error ? err.message : String(err),
-            });
+            error: err instanceof Error ? err.message : String(err),
           });
-      }
+        });
     }
 
     // Fan out to Google Ads in the background. Never block or fail the

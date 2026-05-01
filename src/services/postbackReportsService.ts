@@ -1,17 +1,15 @@
-import { conversionRepository, networkRepository } from '../firestore';
+import { networkRepository, offerReportRepository } from '../firestore';
 
 // Per-network postback summary for the requested window.
 //
-// Unlike offer reports, postbacks have no pre-aggregated rollup keyed by
-// network — the offer_reports collection is keyed by offer_id only. This
-// service therefore pulls a capped slice of raw conversions and buckets
-// them in-memory.
+// Now backed by the `offer_reports` collection which is grouped by 
+// both `offer_id` and `network_id`. This eliminates the need to fetch 
+// raw conversions.
 //
 // Cost characteristics:
-//   - One indexed Firestore range scan over conversions in the window.
-//   - O(n) in-memory pass to bucket by network_id + day.
+//   - One indexed Firestore range scan over offer_reports in the window.
+//   - O(Rollups) in-memory pass to bucket by network_id + day.
 //   - No per-network range query (would be O(N_networks) round-trips).
-const FETCH_CAP = 30_000;
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 export interface PostbackReportsFilters {
@@ -59,7 +57,7 @@ export interface PostbackReportsResponse {
     revenue: number;
     networks: number;
   };
-  truncated: boolean;       // true when raw fetch hit FETCH_CAP
+  truncated: boolean;       // always false now as we use rollups
   conversions_scanned: number;
 }
 
@@ -71,17 +69,10 @@ function eachDayKeyUTC(from: Date, to: Date): string[] {
   return out;
 }
 
-function statusBucket(s: string | undefined): 'approved' | 'pending' | 'rejected' {
-  const v = (s ?? '').toLowerCase();
-  if (v === 'pending') return 'pending';
-  if (v === 'rejected' || v === 'declined' || v === 'reversed') return 'rejected';
-  return 'approved';
-}
-
 export const postbackReportsService = {
   async perNetworkSummary(f: PostbackReportsFilters): Promise<PostbackReportsResponse> {
     const [rows, networks] = await Promise.all([
-      conversionRepository.fetchRange({ from: f.from, to: f.to, max: FETCH_CAP }),
+      offerReportRepository.fetchRange({ from: f.from, to: f.to }),
       // Pull network metadata for names/status. Few hundred at most.
       networkRepository.list({ limit: 100 }),
     ]);
@@ -127,40 +118,39 @@ export const postbackReportsService = {
     const filterSet = f.network_ids && f.network_ids.length > 0 ? new Set(f.network_ids) : null;
 
     for (const r of rows) {
-      if (r.shadow) continue;
-      const network_id = r.network_id || '(unknown)';
+      // If it's purely a click rollup (no postbacks/conversions), skip it
+      if (r.network_id === 'none' && r.postbacks === 0 && r.conversions === 0 && r.unverified === 0) continue;
+
+      // Legacy rows (recorded before the network_id schema change) will have network_id = 'none' 
+      // but will contain postback/conversion data. Group them under '(unknown)'.
+      const network_id = r.network_id === 'none' ? '(unknown)' : r.network_id;
       if (filterSet && !filterSet.has(network_id)) continue;
       const b = bucketFor(network_id);
 
-      b.summary.postbacks += 1;
-      totalPostbacks += 1;
+      b.summary.postbacks += r.postbacks;
+      totalPostbacks += r.postbacks;
 
-      const day = (r.created_at || '').slice(0, 10);
-      const point = b.seriesMap.get(day);
+      b.summary.verified += r.conversions;
+      totalVerified += r.conversions;
 
-      if (r.verified) {
-        b.summary.verified += 1;
-        totalVerified += 1;
-        const bucket = statusBucket(r.status);
-        if (bucket === 'approved') b.summary.approved += 1;
-        else if (bucket === 'pending') b.summary.pending += 1;
-        else b.summary.rejected += 1;
-        const payout = r.payout ?? 0;
-        b.summary.revenue += payout;
-        totalRevenue += payout;
-        if (r.offer_id) b.offers.add(r.offer_id);
-        if (point) {
-          point.postbacks += 1;
-          point.verified += 1;
-          point.revenue += payout;
-        }
-      } else {
-        b.summary.unverified += 1;
-        totalUnverified += 1;
-        if (point) {
-          point.postbacks += 1;
-          point.unverified += 1;
-        }
+      b.summary.approved += r.approved;
+      b.summary.pending += r.pending;
+      b.summary.rejected += r.rejected;
+      
+      b.summary.revenue += r.revenue;
+      totalRevenue += r.revenue;
+
+      if (r.conversions > 0 && r.offer_id) b.offers.add(r.offer_id);
+
+      b.summary.unverified += r.unverified;
+      totalUnverified += r.unverified;
+
+      const point = b.seriesMap.get(r.date);
+      if (point) {
+        point.postbacks += r.postbacks;
+        point.verified += r.conversions;
+        point.unverified += r.unverified;
+        point.revenue += r.revenue;
       }
     }
 
@@ -197,7 +187,7 @@ export const postbackReportsService = {
         revenue: totalRevenue,
         networks: summaries.length,
       },
-      truncated: rows.length >= FETCH_CAP,
+      truncated: false,
       conversions_scanned: rows.length,
     };
   },

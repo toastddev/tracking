@@ -22,6 +22,7 @@ type StatusBucket = (typeof STATUS_BUCKETS)[number];
 
 interface Bucket {
   offer_id: string;
+  network_id: string;
   date: string;
   clicks: number;
   postbacks: number;
@@ -33,9 +34,10 @@ interface Bucket {
   rejected: number;
 }
 
-function emptyBucket(offer_id: string, date: string): Bucket {
+function emptyBucket(offer_id: string, network_id: string, date: string): Bucket {
   return {
     offer_id,
+    network_id,
     date,
     clicks: 0,
     postbacks: 0,
@@ -94,10 +96,10 @@ export const offerReportsBackfillService = {
     logger.info('offer_reports_backfill_started', { from: from.toISOString(), to: to.toISOString() });
 
     const buckets = new Map<string, Bucket>();
-    const bucketFor = (offer_id: string, date: string): Bucket => {
-      const key = `${offer_id}__${date}`;
+    const bucketFor = (offer_id: string, network_id: string, date: string): Bucket => {
+      const key = `${offer_id}__${network_id}__${date}`;
       let b = buckets.get(key);
-      if (!b) { b = emptyBucket(offer_id, date); buckets.set(key, b); }
+      if (!b) { b = emptyBucket(offer_id, network_id, date); buckets.set(key, b); }
       return b;
     };
 
@@ -121,7 +123,7 @@ export const offerReportsBackfillService = {
           const at = tsToDate(raw.created_at);
           const offer_id = String(raw.offer_id ?? '');
           if (!at || !offer_id) continue;
-          bucketFor(offer_id, dayKeyUTC(at)).clicks += 1;
+          bucketFor(offer_id, 'none', dayKeyUTC(at)).clicks += 1;
           clicks_scanned += 1;
         }
         const last = snap.docs[snap.docs.length - 1]!;
@@ -150,14 +152,15 @@ export const offerReportsBackfillService = {
           // Skip shadow rows — those are audit-only postbacks for API-backed
           // networks and should not double-count against the API source.
           if (raw.shadow === true) continue;
-          const offer_id = (raw.offer_id as string | undefined) ?? '';
-          if (!offer_id) continue;     // unverified rows without an offer can't be attributed
+          const offer_id = (raw.offer_id as string | undefined) || 'unknown';
           const at = tsToDate(raw.created_at);
           if (!at) continue;
           const verified = Boolean(raw.verified);
           const payout = typeof raw.payout === 'number' ? (raw.payout as number) : 0;
           const status = raw.status as string | undefined;
-          const b = bucketFor(offer_id, dayKeyUTC(at));
+          const network_id = (raw.network_id as string | undefined) || 'none';
+          
+          const b = bucketFor(offer_id, network_id, dayKeyUTC(at));
           b.postbacks += 1;
           if (verified) {
             b.conversions += 1;
@@ -183,9 +186,10 @@ export const offerReportsBackfillService = {
       const writer = db().bulkWriter();
       writer.onWriteError((err) => err.failedAttempts < 5);
       for (const b of buckets.values()) {
-        const ref = db().collection(COLLECTIONS.OFFER_REPORTS).doc(`${b.offer_id}__${b.date}`);
+        const ref = db().collection(COLLECTIONS.OFFER_REPORTS).doc(`${b.offer_id}__${b.network_id}__${b.date}`);
         writer.set(ref, {
           offer_id: b.offer_id,
+          network_id: b.network_id,
           date: b.date,
           clicks: b.clicks,
           postbacks: b.postbacks,
