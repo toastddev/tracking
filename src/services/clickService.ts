@@ -1,7 +1,7 @@
 import { generateClickId } from '../utils/idGenerator';
 import { renderTemplate } from '../utils/templateEngine';
 import { logger } from '../utils/logger';
-import { clickRepository, offerReportRepository } from '../firestore';
+import { clickRepository, offerReportRepository, drilldownRepository } from '../firestore';
 import { googleAdsForwardingService } from './googleAdsForwardingService';
 import type { AdIds, ClickRecord, Offer } from '../types';
 
@@ -78,6 +78,13 @@ export const clickService = {
           error: err instanceof Error ? err.message : String(err),
         });
       });
+
+    drilldownRepository.incrementOfferClick(click).catch((err: unknown) => {
+      logger.warn('drilldown_offer_click_increment_failed', {
+        click_id: click.click_id,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    });
 
     // Fan out to Google Ads only when the click came from Google (gclid/gbraid/wbraid).
     // Non-Google clicks short-circuit inside the service with no DB write.

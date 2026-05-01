@@ -135,6 +135,8 @@ export const COLLECTIONS = {
   // expire. Doc id = `{offer_id}__{YYYY-MM-DD}` (UTC). Writes are atomic
   // FieldValue.increment from the click/postback hot paths.
   OFFER_REPORTS: 'offer_reports',
+  OFFER_DRILLDOWNS: 'offer_drilldowns',
+  POSTBACK_DRILLDOWNS: 'postback_drilldowns',
 } as const;
 
 export type CollectionName = (typeof COLLECTIONS)[keyof typeof COLLECTIONS];

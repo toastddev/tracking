@@ -8,6 +8,7 @@ import {
   conversionRepository,
   clickRepository,
   offerReportRepository,
+  drilldownRepository,
 } from '../firestore';
 import { generateConversionId } from '../utils/idGenerator';
 import { googleAdsForwardingService } from './googleAdsForwardingService';
@@ -372,6 +373,21 @@ export async function runAffiliateApi(api: AffiliateApi, opts: RunOptions): Prom
             error: err instanceof Error ? err.message : String(err),
           });
         });
+
+        for (const { conv, click } of batch) {
+          drilldownRepository.incrementOfferConversion(conv, click).catch((err: unknown) => {
+            logger.warn('drilldown_offer_conversion_aff_api_failed', {
+              api_id: api.api_id,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          });
+          drilldownRepository.incrementPostback(conv).catch((err: unknown) => {
+            logger.warn('drilldown_postback_aff_api_failed', {
+              api_id: api.api_id,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          });
+        }
       }
 
       // Hand rows to Google Ads forwarder. Done AFTER persistence so a

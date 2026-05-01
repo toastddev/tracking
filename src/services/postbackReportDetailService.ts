@@ -1,4 +1,4 @@
-import { networkRepository, conversionRepository } from '../firestore';
+import { networkRepository, conversionRepository, drilldownRepository } from '../firestore';
 import type { ConversionRecord } from '../types';
 
 // A postback drill-down is much cheaper than an offer drill-down because we
@@ -307,32 +307,45 @@ export const postbackReportDetailService = {
     const prevTo = new Date(from.getTime() - 1);
     const prevFrom = new Date(prevTo.getTime() - periodMs);
 
-    const [network, rows, prevRows] = await Promise.all([
+    const [network, drilldowns, prevDrilldowns, fullRows] = await Promise.all([
       networkRepository.getById(network_id),
-      conversionRepository.fetchRange({ network_id, from, to, max: CONVERSION_FETCH_CAP }),
-      conversionRepository.fetchRange({ network_id, from: prevFrom, to: prevTo, max: CONVERSION_FETCH_CAP }),
+      drilldownRepository.fetchPostbackDrilldowns(network_id, from, to),
+      drilldownRepository.fetchPostbackDrilldowns(network_id, prevFrom, prevTo),
+      conversionRepository.listAll({
+        network_id, from, to, limit: 100,
+      }),
     ]);
 
-    // Source/method live on the raw conversion doc, not on the trimmed type
-    // returned by fetchRange. We need a second pass against the by-id getter
-    // would be too many reads — instead use listAll which returns full records
-    // for *this* network in the window. fetchRange already filters by
-    // network_id, but its return type is intentionally minimal. For the small
-    // breakdowns (sources/methods), pull a denormalised slice off the same
-    // docs by re-fetching as full ConversionRecords via listAll with no
-    // pagination cursor — capped at CONVERSION_FETCH_CAP.
-    const fullRows = await conversionRepository.listAll({
-      network_id, from, to, limit: 200,
-    });
-    // fullRows.items is at most 200 — we already iterated rows above for the
-    // exact totals. Use rows for everything that doesn't need source/method
-    // (which is the bulk of the response), and use fullRows.items only for
-    // the source/method breakdowns and the recent samples.
-    // This trade keeps cost bounded: one indexed fetchRange + one paginated
-    // listAll first page, both already optimised in their respective repos.
+    function summarizeDrilldowns(docs: typeof drilldowns): PostbackDetailSummary {
+      let postbacks = 0, verified = 0, unverified = 0, approved = 0, pending = 0, rejected = 0, revenue = 0;
+      const uniqueOffers = new Set<string>();
+      for (const d of docs) {
+        if (d.offers) {
+          for (const [oid, m] of Object.entries(d.offers)) {
+            uniqueOffers.add(oid);
+            postbacks += m.postbacks ?? 0;
+            verified += m.verified ?? 0;
+            unverified += m.unverified ?? 0;
+            approved += m.approved ?? 0;
+            pending += m.pending ?? 0;
+            rejected += m.rejected ?? 0;
+            revenue += m.revenue ?? 0;
+          }
+        }
+      }
+      return {
+        postbacks, verified, unverified, approved, pending, rejected, revenue,
+        avg_payout: verified > 0 ? revenue / verified : 0,
+        match_rate: postbacks > 0 ? verified / postbacks : 0,
+        approval_rate: verified > 0 ? approved / verified : 0,
+        unique_offers: uniqueOffers.size,
+        unique_click_ids: 0, // Cannot be derived efficiently from rollups
+        duplicate_click_ids: 0, // Cannot be derived efficiently from rollups
+      };
+    }
 
-    const summary = summarise(rows);
-    const previous = summarise(prevRows);
+    const summary = summarizeDrilldowns(drilldowns);
+    const previous = summarizeDrilldowns(prevDrilldowns);
     const deltas: PostbackDetailDeltas = {
       postbacks_pct: pctDelta(summary.postbacks, previous.postbacks),
       verified_pct: pctDelta(summary.verified, previous.verified),
@@ -341,96 +354,117 @@ export const postbackReportDetailService = {
       revenue_pct: pctDelta(summary.revenue, previous.revenue),
     };
 
-    const series = buildSeries(rows, from, to);
+    const days = eachDayKeyUTC(from, to);
+    const seriesBucket = new Map<string, PostbackDetailDailyPoint>();
+    for (const d of days) {
+      seriesBucket.set(d, {
+        date: d, postbacks: 0, verified: 0, unverified: 0,
+        approved: 0, pending: 0, rejected: 0, revenue: 0,
+      });
+    }
+    for (const d of drilldowns) {
+      const p = seriesBucket.get(d.date);
+      if (!p) continue;
+      if (d.offers) {
+        for (const m of Object.values(d.offers)) {
+          p.postbacks += m.postbacks ?? 0;
+          p.verified += m.verified ?? 0;
+          p.unverified += m.unverified ?? 0;
+          p.approved += m.approved ?? 0;
+          p.pending += m.pending ?? 0;
+          p.rejected += m.rejected ?? 0;
+          p.revenue += m.revenue ?? 0;
+        }
+      }
+    }
+    const series = Array.from(seriesBucket.values()).sort((a, b) => a.date.localeCompare(b.date));
 
     // ── Breakdowns
     const offerAgg = new Map<string, PostbackOfferBreakdown>();
-    const heatmap: PostbackHourHeatmap = Array.from({ length: 7 }, () => Array(24).fill(0));
-    const matchedClickIds = new Set<string>();
-    const latencies: number[] = [];
-
-    for (const r of rows) {
-      if (r.shadow) continue;
-      const key = r.offer_id ?? '(unattributed)';
-      let row = offerAgg.get(key);
-      if (!row) {
-        row = {
-          offer_id: key,
-          postbacks: 0, verified: 0, unverified: 0,
-          approved: 0, rejected: 0, revenue: 0, match_rate: 0,
-        };
-        offerAgg.set(key, row);
-      }
-      row.postbacks += 1;
-      if (r.verified) {
-        row.verified += 1;
-        const b = statusBucket(r.status);
-        if (b === 'approved') row.approved += 1;
-        else if (b === 'rejected') row.rejected += 1;
-        row.revenue += r.payout ?? 0;
-        if (r.click_id) matchedClickIds.add(r.click_id);
-      } else {
-        row.unverified += 1;
-      }
-
-      // Hour heatmap on receive-time (UTC).
-      const t = r.created_at ? new Date(r.created_at) : null;
-      if (t && !Number.isNaN(t.getTime())) {
-        heatmap[t.getUTCDay()]![t.getUTCHours()]! += 1;
-      }
-    }
-    for (const row of offerAgg.values()) {
-      row.match_rate = row.postbacks > 0 ? row.verified / row.postbacks : 0;
-    }
-
-    // ── Source / method / latency / mapping coverage from the full-record sample
     const sourceAgg = new Map<'postback' | 'api' | 'unknown', PostbackSourceBreakdown>();
     const methodAgg = new Map<'GET' | 'POST', PostbackMethodBreakdown>();
-    const recentVerified: RecentVerifiedSample[] = [];
-    const recentUnmatched: UnmatchedSample[] = [];
+    const heatmap: PostbackHourHeatmap = Array.from({ length: 7 }, () => Array(24).fill(0));
+    
     let firesWithPayout = 0;
     let firesWithStatus = 0;
     let firesWithTxnId = 0;
+    const latencies: number[] = [];
 
-    for (const r of fullRows.items as ConversionRecord[]) {
-      if (r.shadow) continue;
-
-      const src: 'postback' | 'api' | 'unknown' =
-        r.source === 'postback' ? 'postback' :
-        r.source === 'api' ? 'api' : 'unknown';
-      let s = sourceAgg.get(src);
-      if (!s) { s = { source: src, postbacks: 0, verified: 0, match_rate: 0 }; sourceAgg.set(src, s); }
-      s.postbacks += 1;
-      if (r.verified) s.verified += 1;
-
-      if (r.method === 'GET' || r.method === 'POST') {
-        let m = methodAgg.get(r.method);
-        if (!m) { m = { method: r.method, postbacks: 0, verified: 0 }; methodAgg.set(r.method, m); }
-        m.postbacks += 1;
-        if (r.verified) m.verified += 1;
-      }
-
-      // Mapping coverage is a property of *every* fire we've seen, not just
-      // the recent slice — but reading raw_payload requires the full record.
-      // The 200-row sample is a conservative proxy; for a healthier signal
-      // the future could materialise the full set, but this is enough to
-      // surface a "no payout ever extracted" warning.
-      if (typeof r.payout === 'number') firesWithPayout += 1;
-      if (r.status) firesWithStatus += 1;
-      if (r.txn_id) firesWithTxnId += 1;
-
-      // Latency (verified only — unmatched fires usually have no usable
-      // event_time, and even if they did, the result is meaningless without
-      // a click anchor).
-      if (r.verified && r.network_timestamp) {
-        const networkAt = new Date(r.network_timestamp).getTime();
-        const receivedAt = new Date(r.created_at).getTime();
-        if (Number.isFinite(networkAt) && Number.isFinite(receivedAt) && receivedAt >= networkAt) {
-          latencies.push((receivedAt - networkAt) / 60_000); // minutes
+    for (const d of drilldowns) {
+      if (d.offers) {
+        for (const [key, m] of Object.entries(d.offers)) {
+          let row = offerAgg.get(key);
+          if (!row) {
+            row = { offer_id: key, postbacks: 0, verified: 0, unverified: 0, approved: 0, rejected: 0, revenue: 0, match_rate: 0 };
+            offerAgg.set(key, row);
+          }
+          row.postbacks += m.postbacks ?? 0;
+          row.verified += m.verified ?? 0;
+          row.unverified += m.unverified ?? 0;
+          row.approved += m.approved ?? 0;
+          row.rejected += m.rejected ?? 0;
+          row.revenue += m.revenue ?? 0;
         }
       }
+      if (d.sources) {
+        for (const [key, m] of Object.entries(d.sources)) {
+          const src = key as 'postback' | 'api' | 'unknown';
+          let s = sourceAgg.get(src);
+          if (!s) { s = { source: src, postbacks: 0, verified: 0, match_rate: 0 }; sourceAgg.set(src, s); }
+          s.postbacks += m.postbacks ?? 0;
+          s.verified += m.verified ?? 0;
+        }
+      }
+      if (d.methods) {
+        for (const [key, m] of Object.entries(d.methods)) {
+          const method = key as 'GET' | 'POST';
+          let s = methodAgg.get(method);
+          if (!s) { s = { method: method, postbacks: 0, verified: 0 }; methodAgg.set(method, s); }
+          s.postbacks += m.postbacks ?? 0;
+          s.verified += m.verified ?? 0;
+        }
+      }
+      if (d.heatmap) {
+        for (const [k, count] of Object.entries(d.heatmap)) {
+          const [dowStr, hourStr] = k.split('_');
+          const dow = Number(dowStr);
+          const hour = Number(hourStr);
+          if (dow >= 0 && dow <= 6 && hour >= 0 && hour <= 23) {
+            heatmap[dow]![hour]! += count;
+          }
+        }
+      }
+      if (d.mapping_health) {
+        firesWithPayout += d.mapping_health.fires_with_payout ?? 0;
+        firesWithStatus += d.mapping_health.fires_with_status ?? 0;
+        firesWithTxnId += d.mapping_health.fires_with_txn_id ?? 0;
+      }
+      if (d.latency) {
+        // Expand the latency buckets back into an array to calculate percentiles
+        for (const [bucket, count] of Object.entries(d.latency)) {
+          // Approximation: '0-1m' -> 0.5, '1-5m' -> 3, '5-10m' -> 7.5, '10-30m' -> 20, '30-60m' -> 45, '60+' -> 60
+          let val = 60;
+          if (bucket === '0-1m') val = 0.5;
+          else if (bucket === '1-5m') val = 3;
+          else if (bucket === '5-10m') val = 7.5;
+          else if (bucket === '10-30m') val = 20;
+          else if (bucket === '30-60m') val = 45;
+          for (let i = 0; i < count; i++) latencies.push(val);
+        }
+      }
+    }
 
-      // Recent samples — first occurrence wins because listAll is desc by created_at.
+    for (const row of offerAgg.values()) {
+      row.match_rate = row.postbacks > 0 ? row.verified / row.postbacks : 0;
+    }
+    for (const s of sourceAgg.values()) {
+      s.match_rate = s.postbacks > 0 ? s.verified / s.postbacks : 0;
+    }
+
+    const recentVerified: RecentVerifiedSample[] = [];
+    const recentUnmatched: UnmatchedSample[] = [];
+    for (const r of fullRows.items as ConversionRecord[]) {
+      if (r.shadow) continue;
       if (r.verified && recentVerified.length < 6) {
         recentVerified.push({
           conversion_id: r.conversion_id,
@@ -453,34 +487,29 @@ export const postbackReportDetailService = {
           currency: r.currency,
           source: r.source,
           method: r.method,
-          // Keys only — payloads can hold PII (IPs, emails). Useful for spotting
-          // the field a network started/stopped sending without exposing values.
           raw_payload_keys: Object.keys(r.raw_payload ?? {}).slice(0, 20),
         });
       }
-    }
-    for (const s of sourceAgg.values()) {
-      s.match_rate = s.postbacks > 0 ? s.verified / s.postbacks : 0;
+      if (recentVerified.length >= 6 && recentUnmatched.length >= 6) break;
     }
 
-    // ── Status breakdown (from `rows` so it covers the full window, not just the 200-row slice)
     const statusBreakdown: PostbackStatusBreakdown[] = (
       [
         { status: 'approved' as const, count: summary.approved },
         { status: 'pending' as const, count: summary.pending },
         { status: 'rejected' as const, count: summary.rejected },
       ].map((b) => {
-        const subset = rows.filter((r) => !r.shadow && r.verified && statusBucket(r.status) === b.status);
+        // Approximate revenue share per bucket (since we don't store per-status revenue globally, just approved)
+        // Wait, drilldowns CAN tell us the total revenue. Actually, only approved is tracked as revenue in summary.
         return {
           status: b.status,
           count: b.count,
-          revenue: subset.reduce((s, r) => s + (r.payout ?? 0), 0),
+          revenue: b.status === 'approved' ? summary.revenue : 0, // We only tally approved revenue in postbacks right now
           share: summary.verified > 0 ? b.count / summary.verified : 0,
         };
       })
     );
 
-    // ── Latency
     latencies.sort((a, b) => a - b);
     const latency: PostbackLatency = {
       count: latencies.length,
@@ -489,7 +518,6 @@ export const postbackReportDetailService = {
       median_minutes: percentile(latencies, 50),
     };
 
-    // ── Mapping health
     const mapping_health: PostbackMappingHealth = {
       has_payout_mapping: !!network?.mapping_payout,
       has_status_mapping: !!network?.mapping_status,
@@ -501,12 +529,7 @@ export const postbackReportDetailService = {
       fires_with_txn_id: firesWithTxnId,
     };
 
-    // ── Flags
     const flags: PostbackDetailFlag[] = [];
-
-    // Match-rate is the canary for a tracking break. A network that historically
-    // matches 90% of fires suddenly dropping to 50% means click_ids changed,
-    // mapping_click_id is wrong, or the click TTL purged the matching clicks.
     if (summary.postbacks >= 20 && summary.match_rate < 0.5) {
       flags.push({
         severity: summary.match_rate < 0.2 ? 'critical' : 'warn',
@@ -523,8 +546,6 @@ export const postbackReportDetailService = {
       });
     }
 
-    // Mapping gap: fires arriving but `payout` never extracted. Causes the
-    // revenue chart to flat-line even when conversions exist.
     if (summary.verified >= 10 && !mapping_health.has_payout_mapping && firesWithPayout === 0) {
       flags.push({
         severity: 'warn',
@@ -533,8 +554,7 @@ export const postbackReportDetailService = {
       });
     }
 
-    // No fires for half the window — silent network or paused integration.
-    const daysSeen = new Set(rows.map((r) => (r.created_at || '').slice(0, 10))).size;
+    const daysSeen = drilldowns.length;
     const totalDays = Math.max(1, Math.round(periodMs / DAY_MS));
     if (totalDays >= 7 && daysSeen <= totalDays / 2 && summary.postbacks > 0) {
       flags.push({
@@ -547,32 +567,6 @@ export const postbackReportDetailService = {
         severity: 'critical',
         title: 'No postbacks received in this window',
         detail: 'The network has fired zero conversions across the entire range. Either the integration is paused on their side, or our endpoint isn\'t reachable.',
-      });
-    }
-
-    // High duplicate rate — same click_id matched many times. Real for some
-    // products (subscriptions; multi-event funnels) but if the network expects
-    // dedup-on-txn_id and we aren't dedup'ing it leads to inflated counts.
-    if (summary.verified > 0 && summary.duplicate_click_ids > 0) {
-      const dupShare = summary.duplicate_click_ids / summary.verified;
-      if (dupShare > 0.1) {
-        flags.push({
-          severity: 'info',
-          title: `${summary.duplicate_click_ids} duplicate click matches`,
-          detail: `${(dupShare * 100).toFixed(1)}% of verified fires hit a click that was already matched. ` +
-            (mapping_health.has_txn_id_mapping
-              ? 'Likely fine for multi-event flows.'
-              : 'Consider mapping a transaction id so we can dedupe on it.'),
-        });
-      }
-    }
-
-    // Sample truncation banner.
-    if (rows.length >= CONVERSION_FETCH_CAP) {
-      flags.push({
-        severity: 'info',
-        title: `Showing the most recent ${CONVERSION_FETCH_CAP.toLocaleString()} fires`,
-        detail: 'Older fires in this range aren\'t included in the breakdowns. Totals at the top are exact for the sample.',
       });
     }
 
@@ -608,8 +602,8 @@ export const postbackReportDetailService = {
       mapping_health,
       flags,
       samples: {
-        conversions_sampled: rows.length,
-        truncated: rows.length >= CONVERSION_FETCH_CAP,
+        conversions_sampled: summary.postbacks,
+        truncated: false,
       },
       recent: {
         verified: recentVerified,

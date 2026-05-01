@@ -15,3 +15,5 @@ export {
   affiliateApiRepository,
   affiliateApiRunRepository,
 } from './repositories/affiliateApiRepository';
+export { drilldownRepository } from './repositories/drilldownRepository';
+export type { OfferDrilldownDoc, PostbackDrilldownDoc } from './repositories/drilldownRepository';

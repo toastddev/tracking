@@ -5,6 +5,7 @@ import {
   conversionRepository,
   affiliateApiRepository,
   offerReportRepository,
+  drilldownRepository,
 } from '../firestore';
 import { networkService } from './networkService';
 import { googleAdsForwardingService } from './googleAdsForwardingService';
@@ -154,6 +155,20 @@ export const postbackService = {
             error: err instanceof Error ? err.message : String(err),
           });
         });
+
+      drilldownRepository.incrementOfferConversion(conv, click || null).catch((err: unknown) => {
+        logger.warn('drilldown_offer_conversion_increment_failed', {
+          conversion_id: conv.conversion_id,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
+
+      drilldownRepository.incrementPostback(conv).catch((err: unknown) => {
+        logger.warn('drilldown_postback_increment_failed', {
+          conversion_id: conv.conversion_id,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
     }
 
     // Fan out to Google Ads in the background. Never block or fail the
