@@ -50,31 +50,27 @@ function eachDayUTC(from: Date, to: Date): string[] {
 
 export const reportsService = {
   async summary(f: ReportFilters): Promise<ReportSummary> {
-    // Parallelise the four aggregates — Firestore bills by doc read, not by
-    // query count, so the cost is the same as fetching once.
-    const [clicks, postbacks, conversions, revenue] = await Promise.all([
-      clickRepository.countRange({ from: f.from, to: f.to, offer_id: f.offer_id }),
-      conversionRepository.countRange({
-        from: f.from,
-        to: f.to,
-        offer_id: f.offer_id,
-        network_id: f.network_id,
-      }),
-      conversionRepository.countRange({
-        from: f.from,
-        to: f.to,
-        offer_id: f.offer_id,
-        network_id: f.network_id,
-        verified: true,
-      }),
-      conversionRepository.sumPayout({
-        from: f.from,
-        to: f.to,
-        offer_id: f.offer_id,
-        network_id: f.network_id,
-        verified: true,
-      }),
-    ]);
+    const rollupDocs = await offerReportRepository.fetchRange({
+      from: f.from,
+      to: f.to,
+      offer_ids: f.offer_id ? [f.offer_id] : undefined,
+    });
+
+    let clicks = 0;
+    let postbacks = 0;
+    let conversions = 0;
+    let revenue = 0;
+
+    for (const r of rollupDocs) {
+      if (r.network_id === 'none') {
+        clicks += r.clicks;
+      }
+      if (!f.network_id || r.network_id === f.network_id) {
+        postbacks += r.postbacks;
+        conversions += r.conversions;
+        revenue += r.revenue;
+      }
+    }
 
     return {
       from: f.from.toISOString(),
