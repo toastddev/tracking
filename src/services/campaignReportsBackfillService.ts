@@ -1,6 +1,7 @@
 import { FieldValue } from 'firebase-admin/firestore';
 import { db } from '../firestore/config';
 import { COLLECTIONS } from '../firestore/schema';
+import { campaignReportRepository } from '../firestore';
 import { logger } from '../utils/logger';
 
 // Reconstructs the campaign_reports rollup from the source clicks +
@@ -122,6 +123,11 @@ export interface CampaignBackfillResult {
   conversions_orphan_lookups: number;
   buckets_written: number;
   duration_ms: number;
+  campaign_spends?: Array<{
+    campaign_id: string;
+    campaign_name: string;
+    total_spend: number;
+  }>;
 }
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -305,6 +311,32 @@ export const campaignReportsBackfillService = {
       await writer.close();
     }
 
+    const updatedCampaignIds = Array.from(new Set(Array.from(buckets.values()).map(b => b.campaign_id)));
+    let campaign_spends: CampaignBackfillResult['campaign_spends'];
+    if (updatedCampaignIds.length > 0) {
+      try {
+        const rows = await campaignReportRepository.fetchRange({
+          from,
+          to,
+          campaign_ids: updatedCampaignIds,
+        });
+        const byCampaign = new Map<string, { name: string; spend: number }>();
+        for (const r of rows) {
+          const entry = byCampaign.get(r.campaign_id) || { name: r.campaign_id, spend: 0 };
+          if (r.campaign_name) entry.name = r.campaign_name;
+          entry.spend += r.spend;
+          byCampaign.set(r.campaign_id, entry);
+        }
+        campaign_spends = updatedCampaignIds.map((id) => ({
+          campaign_id: id,
+          campaign_name: byCampaign.get(id)?.name || id,
+          total_spend: byCampaign.get(id)?.spend || 0,
+        }));
+      } catch (e) {
+        logger.warn('campaign_backfill_failed_to_fetch_spends', { error: String(e) });
+      }
+    }
+
     const result: CampaignBackfillResult = {
       from: from.toISOString(),
       to: to.toISOString(),
@@ -315,8 +347,9 @@ export const campaignReportsBackfillService = {
       conversions_orphan_lookups: orphan_lookups,
       buckets_written,
       duration_ms: Date.now() - started,
+      campaign_spends,
     };
-    logger.info('campaign_reports_backfill_completed', { ...result });
+    logger.info('campaign_reports_backfill_completed', { ...result, campaign_spends: undefined });
     return result;
   },
 };

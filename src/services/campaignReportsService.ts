@@ -289,12 +289,19 @@ function buildInsights(
 
   // Spend coverage — silent unless we know something is missing.
   if (totals.spend_coverage < 0.5 && totals.revenue > 0) {
+    const missingSpend = campaigns.filter((c) => c.spend === 0 && (c.revenue > 0 || c.clicks > 0));
+    const missingNames = missingSpend.slice(0, 5).map((c) => c.campaign_name ?? c.campaign_id).join(', ');
+    const moreCount = Math.max(0, missingSpend.length - 5);
+    const missingText = missingSpend.length > 0
+      ? ` Missing in: ${missingNames}${moreCount > 0 ? ` and ${moreCount} more` : ''}.`
+      : '';
+
     out.push({
       severity: 'warn',
       title: 'Spend not recorded for most campaigns',
       detail:
         `${Math.round(totals.spend_coverage * 100)}% of campaigns have spend entered.` +
-        ' Without spend, ROAS and ROI are unavailable. Add daily spend on the campaign detail page.',
+        ` Without spend, ROAS and ROI are unavailable. Add daily spend on the campaign detail page.${missingText}`,
     });
   }
 
