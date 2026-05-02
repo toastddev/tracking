@@ -73,13 +73,17 @@ export interface PostbackDrilldownDoc {
 
 export const drilldownRepository = {
   // ── Offer Drilldowns ──────────────────────────────────────────────────
+  // Nested object literals (not dot-notation keys) — `set({ merge: true })` does
+  // NOT split keys on dots; a key like `"heatmap.0_14"` becomes a literal top-
+  // level field name that the reader never looks at. Nested objects deep-merge
+  // correctly into the existing maps.
   async incrementOfferClick(click: ClickRecord): Promise<void> {
     const date = new Date(click.created_at);
     if (Number.isNaN(date.getTime())) return;
 
     const day = dayKeyUTC(date);
     const docId = `${click.offer_id}__${day}`;
-    
+
     const aff_id = truncateKey(click.aff_id, '(none)');
     const country = truncateKey(click.country, 'unknown');
     const s1 = click.sub_params?.s1 ? truncateKey(click.sub_params.s1, '') : null;
@@ -94,14 +98,14 @@ export const drilldownRepository = {
       offer_id: click.offer_id,
       date: day,
       updated_at: FieldValue.serverTimestamp(),
-      [`affiliates.${aff_id}.clicks`]: FieldValue.increment(1),
-      [`countries.${country}.clicks`]: FieldValue.increment(1),
-      [`ad_platforms.${platform}.clicks`]: FieldValue.increment(1),
-      [`heatmap.${heatmapKey}`]: FieldValue.increment(1),
+      affiliates: { [aff_id]: { clicks: FieldValue.increment(1) } },
+      countries: { [country]: { clicks: FieldValue.increment(1) } },
+      ad_platforms: { [platform]: { clicks: FieldValue.increment(1) } },
+      heatmap: { [heatmapKey]: FieldValue.increment(1) },
     };
 
-    if (s1) update[`s1.${s1}.clicks`] = FieldValue.increment(1);
-    if (s2) update[`s2.${s2}.clicks`] = FieldValue.increment(1);
+    if (s1) update.s1 = { [s1]: { clicks: FieldValue.increment(1) } };
+    if (s2) update.s2 = { [s2]: { clicks: FieldValue.increment(1) } };
 
     await db().collection(COLLECTIONS.OFFER_DRILLDOWNS).doc(docId).set(update, { merge: true });
   },
@@ -131,22 +135,34 @@ export const drilldownRepository = {
       const s2 = click.sub_params?.s2 ? truncateKey(click.sub_params.s2, '') : null;
       const platform = detectAdPlatform(click.ad_ids);
 
-      update[`affiliates.${aff_id}.conversions`] = FieldValue.increment(1);
-      update[`countries.${country}.conversions`] = FieldValue.increment(1);
-      update[`ad_platforms.${platform}.conversions`] = FieldValue.increment(1);
-      if (s1) update[`s1.${s1}.conversions`] = FieldValue.increment(1);
-      if (s2) update[`s2.${s2}.conversions`] = FieldValue.increment(1);
+      const affEntry: Record<string, unknown> = { conversions: FieldValue.increment(1) };
+      const countryEntry: Record<string, unknown> = { conversions: FieldValue.increment(1) };
+      const platformEntry: Record<string, unknown> = { conversions: FieldValue.increment(1) };
+      const s1Entry: Record<string, unknown> | null = s1 ? { conversions: FieldValue.increment(1) } : null;
+      const s2Entry: Record<string, unknown> | null = s2 ? { conversions: FieldValue.increment(1) } : null;
 
       if (payout > 0) {
-        update[`affiliates.${aff_id}.revenue`] = FieldValue.increment(payout);
-        update[`countries.${country}.revenue`] = FieldValue.increment(payout);
-        update[`ad_platforms.${platform}.revenue`] = FieldValue.increment(payout);
-        if (s1) update[`s1.${s1}.revenue`] = FieldValue.increment(payout);
-        if (s2) update[`s2.${s2}.revenue`] = FieldValue.increment(payout);
+        affEntry.revenue = FieldValue.increment(payout);
+        countryEntry.revenue = FieldValue.increment(payout);
+        platformEntry.revenue = FieldValue.increment(payout);
+        if (s1Entry) s1Entry.revenue = FieldValue.increment(payout);
+        if (s2Entry) s2Entry.revenue = FieldValue.increment(payout);
+      }
 
+      update.affiliates = { [aff_id]: affEntry };
+      update.countries = { [country]: countryEntry };
+      update.ad_platforms = { [platform]: platformEntry };
+      if (s1 && s1Entry) update.s1 = { [s1]: s1Entry };
+      if (s2 && s2Entry) update.s2 = { [s2]: s2Entry };
+
+      if (payout > 0) {
         const pIdx = payoutBucketIdx(payout);
-        update[`payout_histogram.${pIdx}.count`] = FieldValue.increment(1);
-        update[`payout_histogram.${pIdx}.revenue`] = FieldValue.increment(payout);
+        update.payout_histogram = {
+          [String(pIdx)]: {
+            count: FieldValue.increment(1),
+            revenue: FieldValue.increment(payout),
+          },
+        };
       }
     }
 
@@ -176,28 +192,37 @@ export const drilldownRepository = {
     const payout = typeof conv.payout === 'number' ? conv.payout : 0;
     const status = statusBucket(conv.status);
 
-    update[`offers.${offer_id}.postbacks`] = FieldValue.increment(1);
-    update[`sources.${src}.postbacks`] = FieldValue.increment(1);
-    if (method !== 'unknown') update[`methods.${method}.postbacks`] = FieldValue.increment(1);
-
     const dow = date.getUTCDay();
     const hour = date.getUTCHours();
     const heatmapKey = `${dow}_${hour}`;
-    update[`heatmap.${heatmapKey}`] = FieldValue.increment(1);
+
+    const offerEntry: Record<string, unknown> = { postbacks: FieldValue.increment(1) };
+    const sourceEntry: Record<string, unknown> = { postbacks: FieldValue.increment(1) };
 
     if (verified) {
-      update[`offers.${offer_id}.verified`] = FieldValue.increment(1);
-      update[`offers.${offer_id}.${status}`] = FieldValue.increment(1);
-      if (payout > 0) update[`offers.${offer_id}.revenue`] = FieldValue.increment(payout);
-      update[`sources.${src}.verified`] = FieldValue.increment(1);
-      if (method !== 'unknown') update[`methods.${method}.verified`] = FieldValue.increment(1);
+      offerEntry.verified = FieldValue.increment(1);
+      offerEntry[status] = FieldValue.increment(1);
+      if (payout > 0) offerEntry.revenue = FieldValue.increment(payout);
+      sourceEntry.verified = FieldValue.increment(1);
     } else {
-      update[`offers.${offer_id}.unverified`] = FieldValue.increment(1);
+      offerEntry.unverified = FieldValue.increment(1);
     }
 
-    if (typeof conv.payout === 'number') update[`mapping_health.fires_with_payout`] = FieldValue.increment(1);
-    if (conv.status) update[`mapping_health.fires_with_status`] = FieldValue.increment(1);
-    if (conv.txn_id) update[`mapping_health.fires_with_txn_id`] = FieldValue.increment(1);
+    update.offers = { [offer_id]: offerEntry };
+    update.sources = { [src]: sourceEntry };
+    update.heatmap = { [heatmapKey]: FieldValue.increment(1) };
+
+    if (method !== 'unknown') {
+      const methodEntry: Record<string, unknown> = { postbacks: FieldValue.increment(1) };
+      if (verified) methodEntry.verified = FieldValue.increment(1);
+      update.methods = { [method]: methodEntry };
+    }
+
+    const mappingHealth: Record<string, unknown> = {};
+    if (typeof conv.payout === 'number') mappingHealth.fires_with_payout = FieldValue.increment(1);
+    if (conv.status) mappingHealth.fires_with_status = FieldValue.increment(1);
+    if (conv.txn_id) mappingHealth.fires_with_txn_id = FieldValue.increment(1);
+    if (Object.keys(mappingHealth).length > 0) update.mapping_health = mappingHealth;
 
     if (verified && conv.network_timestamp) {
       const networkAt = new Date(conv.network_timestamp).getTime();
@@ -210,7 +235,7 @@ export const drilldownRepository = {
         else if (latencyMins <= 10) bucket = '5-10m';
         else if (latencyMins <= 30) bucket = '10-30m';
         else if (latencyMins <= 60) bucket = '30-60m';
-        update[`latency.${bucket}`] = FieldValue.increment(1);
+        update.latency = { [bucket]: FieldValue.increment(1) };
       }
     }
 

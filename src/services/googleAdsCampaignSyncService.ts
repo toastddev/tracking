@@ -3,6 +3,7 @@ import { googleAdsMccChildrenRepository } from '../firestore/repositories/google
 import { campaignReportRepository } from '../firestore/repositories/campaignReportRepository';
 import { buildCustomer } from './googleAdsClient';
 import { logger } from '../utils/logger';
+import { toUsd } from '../utils/fxRates';
 
 export interface CampaignSyncResult {
   from: string;
@@ -13,6 +14,9 @@ export interface CampaignSyncResult {
 }
 
 interface CampaignMetricsRow {
+  customer?: {
+    currency_code?: string;
+  };
   campaign?: {
     id?: string | number | { toString(): string };
     name?: string;
@@ -63,23 +67,28 @@ export const googleAdsCampaignSyncService = {
             login_customer_id: target.login_customer_id,
           });
 
-        // The query groups by campaign and date.
+        // The query groups by campaign and date. customer.currency_code is
+        // pulled per row so spend can be converted from the account's local
+        // currency to USD before persistence — Google Ads reports cost_micros
+        // in the account currency, but the dashboard standardises on USD.
         const query = `
-          SELECT campaign.id, campaign.name, segments.date, metrics.cost_micros
+          SELECT customer.currency_code, campaign.id, campaign.name, segments.date, metrics.cost_micros
           FROM campaign
           WHERE segments.date >= '${fromStr}' AND segments.date <= '${toStr}'
         `;
 
         const rows = (await customer.query(query)) as unknown as CampaignMetricsRow[];
-        
+
         const campaignNames = new Map<string, string>();
         const campaignSpends = new Map<string, { date: string; spend: number }[]>();
+        const unknownCurrenciesSeen = new Set<string>();
 
         for (const row of rows) {
           const campaignId = String(row.campaign?.id || '');
           const campaignName = String(row.campaign?.name || '');
           const date = String(row.segments?.date || '');
           const costMicros = Number(row.metrics?.cost_micros || 0);
+          const currency = (row.customer?.currency_code || '').toUpperCase();
 
           if (!campaignId || !date) continue;
 
@@ -88,11 +97,25 @@ export const googleAdsCampaignSyncService = {
           }
 
           if (costMicros > 0) {
-            const spendDollars = costMicros / 1_000_000;
+            const localAmount = costMicros / 1_000_000;
+            const usd = toUsd(localAmount, currency);
+            if (usd === null) {
+              // No FX rate configured for this currency. Skip rather than
+              // mislabel local-currency spend as USD; surface once per sync.
+              if (!unknownCurrenciesSeen.has(currency)) {
+                unknownCurrenciesSeen.add(currency);
+                logger.warn('google_ads_currency_no_fx_rate', {
+                  connection_id: conn.connection_id,
+                  customer_id: target.customer_id,
+                  currency,
+                });
+              }
+              continue;
+            }
             if (!campaignSpends.has(campaignId)) {
               campaignSpends.set(campaignId, []);
             }
-            campaignSpends.get(campaignId)!.push({ date, spend: spendDollars });
+            campaignSpends.get(campaignId)!.push({ date, spend: usd });
             totalSpendMicros += costMicros;
           }
         }
