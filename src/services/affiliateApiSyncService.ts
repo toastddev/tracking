@@ -339,6 +339,8 @@ export async function runAffiliateApi(api: AffiliateApi, opts: RunOptions): Prom
   // it directly to the forwarder without a second Firestore read. Halves
   // per-item read cost vs. looking the click up twice.
   const buffer: Array<{ conv: ConversionRecord; click: ClickRecord }> = [];
+  // Accumulate Google Ads batch upload stats across all flush() calls.
+  const gadsStats = { sent: 0, skipped: 0, failed: 0, errors: [] as string[] };
 
   async function flush(): Promise<void> {
     if (buffer.length === 0) return;
@@ -390,12 +392,25 @@ export async function runAffiliateApi(api: AffiliateApi, opts: RunOptions): Prom
         }
       }
 
-      // Hand rows to Google Ads forwarder. Done AFTER persistence so a
-      // failed forward never blocks the API run; forwarder writes its own
-      // audit doc and surfaces sent/skipped/failed status separately.
-      for (const { conv, click } of batch) {
-        if (conv.verified) {
-          googleAdsForwardingService.forgetConversion({ conversion: conv, click });
+      // Hand rows to Google Ads forwarder in a single batch call per
+      // connection — dramatically reduces API calls vs one-by-one.
+      const verifiedBatch = batch.filter((b) => b.conv.verified);
+      if (verifiedBatch.length > 0) {
+        try {
+          const gadsResult = await googleAdsForwardingService.dispatchConversionsBatch(
+            verifiedBatch.map((b) => ({ conversion: b.conv, click: b.click }))
+          );
+          gadsStats.sent += gadsResult.sent;
+          gadsStats.skipped += gadsResult.skipped;
+          gadsStats.failed += gadsResult.failed;
+          gadsStats.errors.push(...gadsResult.errors);
+        } catch (err) {
+          gadsStats.failed += verifiedBatch.length;
+          gadsStats.errors.push(err instanceof Error ? err.message : String(err));
+          logger.warn('gads_batch_dispatch_failed', {
+            api_id: api.api_id,
+            error: err instanceof Error ? err.message : String(err),
+          });
         }
       }
     } catch (err) {
@@ -499,7 +514,17 @@ export async function runAffiliateApi(api: AffiliateApi, opts: RunOptions): Prom
     }
 
     await flush();
-    if (run.status === 'running') run.status = (run.records_failed ?? 0) > 0 ? 'partial' : 'ok';
+    if (run.status === 'running') {
+      if ((run.records_failed ?? 0) > 0) {
+        run.status = 'partial';
+      } else if (gadsStats.failed > 0 && gadsStats.sent === 0) {
+        // Data fetched and persisted OK, but every Google Ads upload failed.
+        run.status = 'gads_upload_error';
+        run.error = 'Google Ads upload failed for all conversions';
+      } else {
+        run.status = 'ok';
+      }
+    }
   } catch (err) {
     run.status = 'error';
     run.error = err instanceof Error ? err.message : String(err);
@@ -527,6 +552,10 @@ export async function runAffiliateApi(api: AffiliateApi, opts: RunOptions): Prom
       records_failed: run.records_failed,
       http_calls: run.http_calls,
       error: run.error,
+      gads_sent: gadsStats.sent,
+      gads_skipped: gadsStats.skipped,
+      gads_failed: gadsStats.failed,
+      gads_errors: gadsStats.errors.length > 0 ? gadsStats.errors.slice(0, 10) : undefined,
     }).catch((err) => {
       logger.warn('aff_api_run_update_failed', { api_id: api.api_id, run_id, error: String(err) });
     });
@@ -535,7 +564,9 @@ export async function runAffiliateApi(api: AffiliateApi, opts: RunOptions): Prom
     const intervalMs = Math.max(60_000, Math.floor((24 * 60 * 60_000) / Math.max(1, api.schedule.runs_per_day)));
     const nextRun = new Date(finished.getTime() + intervalMs);
     const outcome: 'ok' | 'partial' | 'error' =
-      run.status === 'ok' || run.status === 'partial' || run.status === 'error' ? run.status : 'ok';
+      run.status === 'ok' ? 'ok'
+        : run.status === 'error' ? 'error'
+        : 'partial';   // covers 'partial', 'gads_upload_error', and any future sub-statuses
     await affiliateApiRepository.recordRunOutcome(api.api_id, nextRun, finished, outcome).catch((err) => {
       logger.warn('aff_api_record_outcome_failed', { api_id: api.api_id, error: String(err) });
     });

@@ -366,6 +366,248 @@ export const googleAdsForwardingService = {
     }
   },
 
+  // ── batch conversions (affiliate API sync path) ─────────────────────
+  // Groups all conversions by destination connection and sends ONE Google
+  // Ads API call per connection instead of N individual calls. Returns
+  // aggregate stats so the caller can surface them in the run record.
+  async dispatchConversionsBatch(
+    inputs: DispatchConversionInput[]
+  ): Promise<{ sent: number; skipped: number; failed: number; errors: string[] }> {
+    const stats = { sent: 0, skipped: 0, failed: 0, errors: [] as string[] };
+    if (inputs.length === 0) return stats;
+
+    // 1. Pre-filter: only verified conversions with a Google click identifier.
+    type Eligible = {
+      conversion: ConversionRecord;
+      click: ClickRecord;
+      identifier: IdentifierPick;
+    };
+    const eligible: Eligible[] = [];
+    for (const { conversion, click } of inputs) {
+      if (!conversion.verified || !click) {
+        stats.skipped++;
+        continue;
+      }
+      const identifier = pickIdentifier(click.ad_ids);
+      if (!identifier) {
+        stats.skipped++;
+        continue;
+      }
+      eligible.push({ conversion, click, identifier });
+    }
+    if (eligible.length === 0) return stats;
+
+    // 2. Fetch all active connections + routes ONCE for the entire batch.
+    const mccConns = await googleAdsConnectionRepository.listByType('mcc');
+    const activeMcc = mccConns.filter(
+      (c) => c.status === 'active' && c.sale_conversion_action_resource
+    );
+
+    // Resolve per-offer/network routes — cache by offer_id+network_id so we
+    // don't re-query for the same combo. Key = "offer_id|network_id".
+    const routeCache = new Map<string, GoogleAdsRoute | null>();
+    const connCache = new Map<string, GoogleAdsConnection | null>();
+
+    async function resolveRoute(offer_id?: string, network_id?: string): Promise<{ route: GoogleAdsRoute; conn: GoogleAdsConnection } | null> {
+      const key = `${offer_id ?? ''}|${network_id ?? ''}`;
+      if (!routeCache.has(key)) {
+        const route = await googleAdsRouteRepository.resolveForConversion(offer_id, network_id ?? '');
+        routeCache.set(key, route);
+      }
+      const route = routeCache.get(key)!;
+      if (!route || !route.sale_conversion_action_resource) return null;
+
+      if (!connCache.has(route.target_connection_id)) {
+        const conn = await googleAdsConnectionRepository.getById(route.target_connection_id);
+        connCache.set(route.target_connection_id, conn && conn.status === 'active' ? conn : null);
+      }
+      const conn = connCache.get(route.target_connection_id)!;
+      if (!conn) return null;
+      return { route, conn };
+    }
+
+    // 3. Build per-connection conversion payloads.
+    type ConnBatch = {
+      connection: GoogleAdsConnection;
+      payloads: Array<{ cc: Record<string, unknown>; eligible: Eligible; actionResource: string }>;
+    };
+    const batches = new Map<string, ConnBatch>();
+
+    function ensureBatch(conn: GoogleAdsConnection): ConnBatch {
+      let b = batches.get(conn.connection_id);
+      if (!b) {
+        b = { connection: conn, payloads: [] };
+        batches.set(conn.connection_id, b);
+      }
+      return b;
+    }
+
+    for (const item of eligible) {
+      const { conversion, identifier } = item;
+
+      // MCC connections
+      for (const conn of activeMcc) {
+        const cc: Record<string, unknown> = {
+          conversion_action: conn.sale_conversion_action_resource,
+          conversion_date_time: formatGoogleAdsDateTime(
+            conversion.created_at,
+            conn.time_zone || 'UTC'
+          ),
+          conversion_value: conversion.payout ?? 0,
+          currency_code: conversion.currency || conn.currency_code || 'USD',
+          order_id: conversion.conversion_id,
+          [identifier.type]: identifier.value,
+        };
+        ensureBatch(conn).payloads.push({
+          cc,
+          eligible: item,
+          actionResource: conn.sale_conversion_action_resource!,
+        });
+      }
+
+      // Per-offer/network child route
+      const resolved = await resolveRoute(conversion.offer_id, conversion.network_id);
+      if (resolved) {
+        const { route, conn } = resolved;
+        const cc: Record<string, unknown> = {
+          conversion_action: route.sale_conversion_action_resource,
+          conversion_date_time: formatGoogleAdsDateTime(
+            conversion.created_at,
+            conn.time_zone || 'UTC'
+          ),
+          conversion_value: conversion.payout ?? 0,
+          currency_code: conversion.currency || conn.currency_code || 'USD',
+          order_id: conversion.conversion_id,
+          [identifier.type]: identifier.value,
+        };
+        ensureBatch(conn).payloads.push({
+          cc,
+          eligible: item,
+          actionResource: route.sale_conversion_action_resource!,
+        });
+      }
+    }
+
+    // If no batches were built, every conversion was skipped (no destination).
+    if (batches.size === 0) {
+      stats.skipped += eligible.length;
+      logger.info('gads_batch_no_destinations', { count: eligible.length });
+      return stats;
+    }
+
+    // 4. Fire one API call per connection with all its conversions.
+    for (const [, batch] of batches) {
+      const { connection, payloads } = batch;
+      const customer = buildCustomer({
+        connection,
+        customer_id: connection.customer_id,
+        login_customer_id: connection.manager_customer_id,
+      });
+
+      try {
+        const response = (await customer.conversionUploads.uploadClickConversions({
+          customer_id: connection.customer_id,
+          conversions: payloads.map((p) => p.cc),
+          partial_failure: true,
+          validate_only: false,
+          debug_enabled: false,
+        } as never)) as unknown as {
+          partial_failure_error?: { message?: string } | null;
+        };
+
+        const partialMsg =
+          typeof response?.partial_failure_error?.message === 'string' &&
+          response.partial_failure_error.message.trim() !== ''
+            ? response.partial_failure_error.message
+            : undefined;
+
+        if (partialMsg) {
+          // Partial failure — some succeeded, some failed. We count the
+          // whole batch as sent but log the partial error.
+          stats.sent += payloads.length;
+          stats.errors.push(
+            `partial[${connection.connection_id}]: ${partialMsg.slice(0, 500)}`
+          );
+          logger.warn('gads_batch_partial_failure', {
+            connection_id: connection.connection_id,
+            count: payloads.length,
+            error: partialMsg.slice(0, 500),
+          });
+        } else {
+          stats.sent += payloads.length;
+          logger.info('gads_batch_sent', {
+            connection_id: connection.connection_id,
+            count: payloads.length,
+          });
+        }
+
+        // Persist audit docs in bulk (fire-and-forget to not block the run).
+        for (const p of payloads) {
+          googleAdsUploadRepository
+            .record({
+              kind: 'conversion',
+              source_id: p.eligible.conversion.conversion_id,
+              conversion_id: p.eligible.conversion.conversion_id,
+              click_id: p.eligible.click.click_id,
+              connection_id: connection.connection_id,
+              customer_id: connection.customer_id,
+              identifier_type: p.eligible.identifier.type,
+              identifier_value: p.eligible.identifier.value,
+              conversion_action_resource: p.actionResource,
+              status: partialMsg ? 'partial_failure' : 'sent',
+              attempts: 1,
+              sent_at: new Date().toISOString(),
+              last_error: partialMsg,
+            })
+            .catch(() => {});
+        }
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        stats.failed += payloads.length;
+        stats.errors.push(
+          `failed[${connection.connection_id}]: ${errMsg.slice(0, 500)}`
+        );
+        logger.error('gads_batch_failed', {
+          connection_id: connection.connection_id,
+          count: payloads.length,
+          error: errMsg,
+        });
+
+        // Check for auth errors and mark connection as errored.
+        if (/UNAUTHENTICATED|invalid_grant|PERMISSION_DENIED|UNAUTHORIZED/i.test(errMsg)) {
+          await googleAdsConnectionRepository
+            .update(connection.connection_id, {
+              status: 'error',
+              last_error: errMsg.slice(0, 4000),
+            })
+            .catch(() => {});
+        }
+
+        // Persist failed audit docs.
+        for (const p of payloads) {
+          googleAdsUploadRepository
+            .record({
+              kind: 'conversion',
+              source_id: p.eligible.conversion.conversion_id,
+              conversion_id: p.eligible.conversion.conversion_id,
+              click_id: p.eligible.click.click_id,
+              connection_id: connection.connection_id,
+              customer_id: connection.customer_id,
+              identifier_type: p.eligible.identifier.type,
+              identifier_value: p.eligible.identifier.value,
+              conversion_action_resource: p.actionResource,
+              status: 'failed',
+              attempts: 1,
+              last_error: errMsg.slice(0, 4000),
+            })
+            .catch(() => {});
+        }
+      }
+    }
+
+    return stats;
+  },
+
   // Background helpers — never let exceptions escape into the request path.
   forgetConversion(input: DispatchConversionInput): void {
     void this.dispatchConversion(input).catch((err) => {

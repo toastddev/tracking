@@ -210,7 +210,7 @@ export interface AffiliateApi {
   updated_at?: string;
 }
 
-export type AffiliateApiRunStatus = 'ok' | 'partial' | 'error' | 'running' | 'skipped';
+export type AffiliateApiRunStatus = 'ok' | 'partial' | 'error' | 'running' | 'skipped' | 'gads_upload_error';
 
 export interface AffiliateApiRunRecord {
   run_id: string;
@@ -233,4 +233,9 @@ export interface AffiliateApiRunRecord {
   // Cloud Run instance identifier (hostname#pid). Used for instance-scoped
   // boot cleanup so one instance doesn't accidentally abort another's run.
   holder?: string;
+  // Google Ads batch upload stats — populated after the run completes.
+  gads_sent?: number;
+  gads_skipped?: number;
+  gads_failed?: number;
+  gads_errors?: string[];
 }
