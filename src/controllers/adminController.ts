@@ -16,6 +16,9 @@ import { campaignReportsService } from '../services/campaignReportsService';
 import { campaignReportDetailService } from '../services/campaignReportDetailService';
 import { campaignReportsBackfillService } from '../services/campaignReportsBackfillService';
 import { campaignReportRepository } from '../firestore';
+import { googleAdsForwardingService } from '../services/googleAdsForwardingService';
+import { googleAdsCampaignSyncService } from '../services/googleAdsCampaignSyncService';
+
 import { dataResetService } from '../services/dataResetService';
 import { logger } from '../utils/logger';
 
@@ -178,6 +181,30 @@ export const adminController = {
     const updated = await offerRepository.update(id, patch);
     if (!updated) return c.json({ error: 'not_found' }, 404);
     return c.json({ ...updated, tracking_url: trackingUrl(updated.offer_id) });
+  },
+
+  // Pulls campaign names and ad spend directly from all connected Google Ads child accounts.
+  // Idempotent and replaces any existing operator-entered spend for the matched campaigns
+  // within the given date window.
+  async syncGoogleAdsCampaigns(c: Context) {
+    const body = await c.req.json().catch(() => ({})) as { from?: string; to?: string };
+    const from = parseDate(body.from);
+    const to = parseDate(body.to);
+    
+    // Default to the last 30 days if not provided
+    const effectiveFrom = from || new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+    const effectiveTo = to || new Date();
+
+    if (effectiveFrom.getTime() > effectiveTo.getTime()) {
+      return c.json({ error: 'from_after_to' }, 400);
+    }
+    try {
+      const result = await googleAdsCampaignSyncService.syncCampaigns({ from: effectiveFrom, to: effectiveTo });
+      return c.json({ ok: true, ...result });
+    } catch (err) {
+      logger.error('sync_google_ads_campaigns_failed', { error: err instanceof Error ? err.message : String(err) });
+      return c.json({ error: 'internal' }, 500);
+    }
   },
 
   // ── networks ──────────────────────────────────────────────────────
