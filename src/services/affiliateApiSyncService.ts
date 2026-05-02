@@ -9,7 +9,9 @@ import {
   clickRepository,
   offerReportRepository,
   drilldownRepository,
+  campaignReportRepository,
 } from '../firestore';
+import { __campaignFromExtra as extractCampaign } from './clickService';
 import { generateConversionId } from '../utils/idGenerator';
 import { googleAdsForwardingService } from './googleAdsForwardingService';
 import type {
@@ -375,6 +377,34 @@ export async function runAffiliateApi(api: AffiliateApi, opts: RunOptions): Prom
             error: err instanceof Error ? err.message : String(err),
           });
         });
+
+        // Same pattern for campaign_reports — derive campaign_id from each
+        // conversion's click extra_params. Rows without a campaign tag are
+        // dropped silently (they don't belong to any campaign).
+        const campaignRollupRows = batch
+          .filter((b) => b.conv.offer_id && b.conv.verified)
+          .map((b) => {
+            const c = extractCampaign(b.click.extra_params);
+            if (!c) return null;
+            return {
+              campaign_id: c.campaign_id,
+              source: c.source,
+              at: new Date(b.conv.created_at),
+              verified: true,
+              status: b.conv.status,
+              payout: b.conv.payout,
+              offer_id: b.conv.offer_id as string,
+            };
+          })
+          .filter((r): r is NonNullable<typeof r> => r !== null);
+        if (campaignRollupRows.length > 0) {
+          campaignReportRepository.incrementConversionsBulk(campaignRollupRows).catch((err: unknown) => {
+            logger.warn('campaign_report_aff_api_rollup_failed', {
+              api_id: api.api_id,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          });
+        }
 
         for (const { conv, click } of batch) {
           drilldownRepository.incrementOfferConversion(conv, click).catch((err: unknown) => {

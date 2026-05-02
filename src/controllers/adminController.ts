@@ -12,8 +12,24 @@ import { offerReportDetailService } from '../services/offerReportDetailService';
 import { offerReportsBackfillService } from '../services/offerReportsBackfillService';
 import { postbackReportsService } from '../services/postbackReportsService';
 import { postbackReportDetailService } from '../services/postbackReportDetailService';
+import { campaignReportsService } from '../services/campaignReportsService';
+import { campaignReportDetailService } from '../services/campaignReportDetailService';
+import { campaignReportsBackfillService } from '../services/campaignReportsBackfillService';
+import { campaignReportRepository } from '../firestore';
 import { dataResetService } from '../services/dataResetService';
 import { logger } from '../utils/logger';
+
+// Campaign IDs are external (Google Ads, UTM tags) so they can contain a
+// wider set of characters than our internal isValidId regex allows. Restrict
+// to a sensible safe set: alphanumerics, dash, underscore, dot. Length cap
+// guards against pathological URLs.
+function isValidCampaignId(id: string): boolean {
+  return /^[a-zA-Z0-9][a-zA-Z0-9_\-.]{0,127}$/.test(id);
+}
+
+function isValidDateKey(s: string): boolean {
+  return /^\d{4}-\d{2}-\d{2}$/.test(s);
+}
 
 function publicTrackingBase(): string {
   return (process.env.PUBLIC_TRACKING_BASE_URL ?? 'http://localhost:3000').replace(/\/$/, '');
@@ -496,6 +512,121 @@ export const adminController = {
       return c.json({ ok: true, ...result });
     } catch (err) {
       logger.error('offer_reports_backfill_failed', { error: err instanceof Error ? err.message : String(err) });
+      return c.json({ error: 'internal' }, 500);
+    }
+  },
+
+  // ── campaign reports ──────────────────────────────────────────────
+  // Per-campaign aggregates from the campaign_reports rollup. Campaign id
+  // comes from the gad_campaignid URL param (Google Ads) with utm_campaign
+  // as the cross-platform fallback. Same date semantics as the offer report.
+  async reportCampaigns(c: Context) {
+    const parsed = parseReportFilters(c);
+    if (!parsed.ok) return c.json({ error: parsed.error }, 400);
+    const idsRaw = c.req.query('campaign_ids');
+    let campaign_ids: string[] | undefined;
+    if (idsRaw) {
+      const list = idsRaw.split(',').map((s) => s.trim()).filter(Boolean);
+      for (const id of list) {
+        if (!isValidCampaignId(id)) return c.json({ error: 'invalid_campaign_id' }, 400);
+      }
+      if (list.length > 50) return c.json({ error: 'too_many_campaign_ids' }, 400);
+      campaign_ids = list;
+    }
+    try {
+      const result = await campaignReportsService.perCampaignSummary({
+        from: parsed.filters.from,
+        to: parsed.filters.to,
+        campaign_ids,
+      });
+      return c.json(result);
+    } catch (err) {
+      logger.error('report_campaigns_failed', { error: err instanceof Error ? err.message : String(err) });
+      return c.json({ error: 'internal' }, 500);
+    }
+  },
+
+  async reportCampaignDetail(c: Context) {
+    const id = c.req.param('id');
+    if (!id || !isValidCampaignId(id)) return c.json({ error: 'invalid_campaign_id' }, 400);
+    const parsed = parseReportFilters(c);
+    if (!parsed.ok) return c.json({ error: parsed.error }, 400);
+    try {
+      const detail = await campaignReportDetailService.getDetail({
+        campaign_id: id,
+        from: parsed.filters.from,
+        to: parsed.filters.to,
+      });
+      return c.json(detail);
+    } catch (err) {
+      logger.error('report_campaign_detail_failed', {
+        campaign_id: id,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return c.json({ error: 'internal' }, 500);
+    }
+  },
+
+  // Operator-entered ad spend for a single campaign-day. Body: { date, spend }.
+  // `spend` is a positive dollar amount; the rollup stores it verbatim so
+  // ROAS/ROI compute on read.
+  async updateCampaignSpend(c: Context) {
+    const id = c.req.param('id');
+    if (!id || !isValidCampaignId(id)) return c.json({ error: 'invalid_campaign_id' }, 400);
+    const body = await c.req.json().catch(() => ({})) as { date?: string; spend?: number };
+    const date = String(body.date ?? '').trim();
+    if (!isValidDateKey(date)) return c.json({ error: 'invalid_date' }, 400);
+    const spend = Number(body.spend);
+    if (!Number.isFinite(spend) || spend < 0) return c.json({ error: 'invalid_spend' }, 400);
+    try {
+      await campaignReportRepository.updateSpend({ campaign_id: id, date, spend });
+      return c.json({ ok: true, campaign_id: id, date, spend });
+    } catch (err) {
+      logger.error('update_campaign_spend_failed', {
+        campaign_id: id, date, error: err instanceof Error ? err.message : String(err),
+      });
+      return c.json({ error: 'internal' }, 500);
+    }
+  },
+
+  // Rebuild the campaign_reports rollup from source clicks + conversions.
+  // Idempotent and safe to re-run. Operator-entered spend / display names
+  // survive (the backfill uses set-merge and omits those fields). Accepts
+  // optional `from`/`to` ISO strings; defaults to the last 120 days.
+  async backfillCampaignReports(c: Context) {
+    const body = await c.req.json().catch(() => ({})) as { from?: string; to?: string };
+    const from = parseDate(body.from);
+    const to = parseDate(body.to);
+    if (from && to && from.getTime() > to.getTime()) {
+      return c.json({ error: 'from_after_to' }, 400);
+    }
+    try {
+      const result = await campaignReportsBackfillService.rebuild({ from, to });
+      return c.json({ ok: true, ...result });
+    } catch (err) {
+      logger.error('campaign_reports_backfill_failed', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return c.json({ error: 'internal' }, 500);
+    }
+  },
+
+  // Optional human-readable name. Lets the operator label `gad_campaignid`
+  // numbers like "Spring sale 2026" without having to wait on a Google Ads
+  // API integration.
+  async updateCampaignName(c: Context) {
+    const id = c.req.param('id');
+    if (!id || !isValidCampaignId(id)) return c.json({ error: 'invalid_campaign_id' }, 400);
+    const body = await c.req.json().catch(() => ({})) as { campaign_name?: string };
+    const name = String(body.campaign_name ?? '').trim();
+    if (!name) return c.json({ error: 'name_required' }, 400);
+    try {
+      await campaignReportRepository.updateName({ campaign_id: id, campaign_name: name });
+      return c.json({ ok: true, campaign_id: id, campaign_name: name });
+    } catch (err) {
+      logger.error('update_campaign_name_failed', {
+        campaign_id: id, error: err instanceof Error ? err.message : String(err),
+      });
       return c.json({ error: 'internal' }, 500);
     }
   },

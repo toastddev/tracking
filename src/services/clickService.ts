@@ -1,9 +1,34 @@
 import { generateClickId } from '../utils/idGenerator';
 import { renderTemplate } from '../utils/templateEngine';
 import { logger } from '../utils/logger';
-import { clickRepository, offerReportRepository, drilldownRepository } from '../firestore';
+import {
+  clickRepository,
+  offerReportRepository,
+  drilldownRepository,
+  campaignReportRepository,
+} from '../firestore';
 import { googleAdsForwardingService } from './googleAdsForwardingService';
 import type { AdIds, ClickRecord, Offer } from '../types';
+
+// Pull a campaign id off the click's extra_params. `gad_campaignid` is the
+// canonical Google Ads tag; `utm_campaign` is the cross-platform fallback so
+// Facebook / TikTok / native / organic UTM-tagged clicks also feed the rollup.
+function extractCampaign(
+  extra_params: Record<string, string> | undefined
+): { campaign_id: string; source: 'gad_campaignid' | 'utm_campaign' } | null {
+  if (!extra_params) return null;
+  const gad = extra_params.gad_campaignid;
+  if (typeof gad === 'string' && gad.trim()) {
+    return { campaign_id: gad.trim(), source: 'gad_campaignid' };
+  }
+  const utm = extra_params.utm_campaign;
+  if (typeof utm === 'string' && utm.trim()) {
+    return { campaign_id: utm.trim(), source: 'utm_campaign' };
+  }
+  return null;
+}
+
+export const __campaignFromExtra = extractCampaign;
 
 export interface BuildClickInput {
   offer: Offer;
@@ -85,6 +110,25 @@ export const clickService = {
         error: err instanceof Error ? err.message : String(err),
       });
     });
+
+    // Campaign rollup. Fed only when the click carries a Google Ads campaign
+    // id or a utm_campaign tag — non-tagged organic traffic doesn't produce
+    // a campaign row. Same fire-and-forget contract as the offer rollup.
+    const campaign = extractCampaign(click.extra_params);
+    if (campaign) {
+      campaignReportRepository.incrementClick({
+        campaign_id: campaign.campaign_id,
+        source: campaign.source,
+        at: new Date(click.created_at),
+        offer_id: click.offer_id,
+      }).catch((err: unknown) => {
+        logger.warn('campaign_report_click_increment_failed', {
+          click_id: click.click_id,
+          campaign_id: campaign.campaign_id,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
+    }
 
     // Fan out to Google Ads only when the click came from Google (gclid/gbraid/wbraid).
     // Non-Google clicks short-circuit inside the service with no DB write.

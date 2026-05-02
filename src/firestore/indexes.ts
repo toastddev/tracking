@@ -55,4 +55,7 @@ export const INDEXES = [
   // Pre-aggregated offer metrics — per-offer date scans + range scan.
   { collection: 'offer_reports', fields: ['offer_id ASC', 'date ASC'] },
   { collection: 'offer_reports', fields: ['date ASC'] },
+  // Pre-aggregated campaign metrics — same pattern as offer_reports.
+  { collection: 'campaign_reports', fields: ['campaign_id ASC', 'date ASC'] },
+  { collection: 'campaign_reports', fields: ['date ASC'] },
 ] as const;

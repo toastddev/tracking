@@ -137,6 +137,13 @@ export const COLLECTIONS = {
   OFFER_REPORTS: 'offer_reports',
   OFFER_DRILLDOWNS: 'offer_drilldowns',
   POSTBACK_DRILLDOWNS: 'postback_drilldowns',
+  // Per-campaign daily rollup. Doc id = `{campaign_id}__{YYYY-MM-DD}` (UTC).
+  // campaign_id is sourced from the `gad_campaignid` URL param (Google Ads)
+  // with `utm_campaign` as a fallback for non-Google traffic. Stores click /
+  // postback / conversion / revenue counts plus operator-entered ad spend so
+  // ROAS = revenue/spend and ROI = (revenue-spend)/spend can be computed at
+  // read-time. Survives the 90-day TTL on raw clicks/conversions.
+  CAMPAIGN_REPORTS: 'campaign_reports',
 } as const;
 
 export type CollectionName = (typeof COLLECTIONS)[keyof typeof COLLECTIONS];

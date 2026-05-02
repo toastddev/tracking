@@ -7,6 +7,8 @@ export { clickRepository } from './repositories/clickRepository';
 export { conversionRepository } from './repositories/conversionRepository';
 export { offerReportRepository } from './repositories/offerReportRepository';
 export type { OfferReportDoc } from './repositories/offerReportRepository';
+export { campaignReportRepository } from './repositories/campaignReportRepository';
+export type { CampaignReportDoc, CampaignSource } from './repositories/campaignReportRepository';
 export { googleAdsConnectionRepository } from './repositories/googleAdsConnectionRepository';
 export { googleAdsMccChildrenRepository, buildMccChildId } from './repositories/googleAdsMccChildrenRepository';
 export { googleAdsRouteRepository, buildRouteId } from './repositories/googleAdsRouteRepository';

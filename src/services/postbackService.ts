@@ -6,7 +6,9 @@ import {
   affiliateApiRepository,
   offerReportRepository,
   drilldownRepository,
+  campaignReportRepository,
 } from '../firestore';
+import { __campaignFromExtra as extractCampaign } from './clickService';
 import { networkService } from './networkService';
 import { googleAdsForwardingService } from './googleAdsForwardingService';
 import type { ConversionRecord, Network, VerificationReason } from '../types';
@@ -169,6 +171,28 @@ export const postbackService = {
           error: err instanceof Error ? err.message : String(err),
         });
       });
+
+      // Campaign rollup. Only when the resolved click carries a campaign tag
+      // — unverified postbacks (no click match) can't be attributed to a
+      // campaign, so they're skipped entirely.
+      const campaign = click ? extractCampaign(click.extra_params) : null;
+      if (campaign) {
+        campaignReportRepository.incrementConversion({
+          campaign_id: campaign.campaign_id,
+          source: campaign.source,
+          at: new Date(conv.created_at),
+          verified: conv.verified,
+          status: conv.status,
+          payout: conv.payout,
+          offer_id: conv.offer_id,
+        }).catch((err: unknown) => {
+          logger.warn('campaign_report_conversion_increment_failed', {
+            conversion_id: conv.conversion_id,
+            campaign_id: campaign.campaign_id,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        });
+      }
     }
 
     // Fan out to Google Ads in the background. Never block or fail the

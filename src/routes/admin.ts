@@ -46,6 +46,11 @@ adminRoutes.post('/api/reports/offers/backfill', (c) => adminController.backfill
 adminRoutes.get('/api/reports/offers/:id/detail', (c) => adminController.reportOfferDetail(c));
 adminRoutes.get('/api/reports/postbacks', (c) => adminController.reportPostbacks(c));
 adminRoutes.get('/api/reports/postbacks/:id/detail', (c) => adminController.reportPostbackDetail(c));
+adminRoutes.get('/api/reports/campaigns', (c) => adminController.reportCampaigns(c));
+adminRoutes.post('/api/reports/campaigns/backfill', (c) => adminController.backfillCampaignReports(c));
+adminRoutes.get('/api/reports/campaigns/:id/detail', (c) => adminController.reportCampaignDetail(c));
+adminRoutes.patch('/api/reports/campaigns/:id/spend', (c) => adminController.updateCampaignSpend(c));
+adminRoutes.patch('/api/reports/campaigns/:id/name', (c) => adminController.updateCampaignName(c));
 
 // Affiliate APIs (pull-based conversion ingestion)
 adminRoutes.get('/api/affiliate-apis', (c) => affiliateApiController.list(c));
