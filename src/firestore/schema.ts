@@ -144,6 +144,9 @@ export const COLLECTIONS = {
   // ROAS = revenue/spend and ROI = (revenue-spend)/spend can be computed at
   // read-time. Survives the 90-day TTL on raw clicks/conversions.
   CAMPAIGN_REPORTS: 'campaign_reports',
+  // Singleton key/value store for global app state (sync prefs, last-synced
+  // timestamps, etc.). Doc id is the state key, e.g. 'google_ads_sync'.
+  APP_STATE: 'app_state',
 } as const;
 
 export type CollectionName = (typeof COLLECTIONS)[keyof typeof COLLECTIONS];

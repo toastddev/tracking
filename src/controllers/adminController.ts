@@ -16,6 +16,7 @@ import { campaignReportsService } from '../services/campaignReportsService';
 import { campaignReportDetailService } from '../services/campaignReportDetailService';
 import { campaignReportsBackfillService } from '../services/campaignReportsBackfillService';
 import { campaignReportRepository } from '../firestore';
+import { googleAdsSyncStateRepository } from '../firestore';
 import { googleAdsForwardingService } from '../services/googleAdsForwardingService';
 import { googleAdsCampaignSyncService } from '../services/googleAdsCampaignSyncService';
 
@@ -191,9 +192,10 @@ export const adminController = {
     const from = parseDate(body.from);
     const to = parseDate(body.to);
     
-    // Default to the last 30 days if not provided
-    const effectiveFrom = from || new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
-    const effectiveTo = to || new Date();
+    // Default to 1st of current month → today when not provided
+    const now = new Date();
+    const effectiveFrom = from || new Date(now.getFullYear(), now.getMonth(), 1);
+    const effectiveTo = to || now;
 
     if (effectiveFrom.getTime() > effectiveTo.getTime()) {
       return c.json({ error: 'from_after_to' }, 400);
@@ -205,6 +207,23 @@ export const adminController = {
       logger.error('sync_google_ads_campaigns_failed', { error: err instanceof Error ? err.message : String(err) });
       return c.json({ error: 'internal' }, 500);
     }
+  },
+
+  async getGoogleAdsSyncState(c: Context) {
+    const state = await googleAdsSyncStateRepository.get();
+    return c.json(state);
+  },
+
+  async saveGoogleAdsSyncPrefs(c: Context) {
+    const body = (await c.req.json().catch(() => ({}))) as { from?: unknown; to?: unknown };
+    const from = typeof body.from === 'string' ? body.from : '';
+    const to = typeof body.to === 'string' ? body.to : '';
+    if (!isValidDateKey(from) || !isValidDateKey(to)) {
+      return c.json({ error: 'invalid_date' }, 400);
+    }
+    if (from > to) return c.json({ error: 'from_after_to' }, 400);
+    const state = await googleAdsSyncStateRepository.savePrefs({ from, to });
+    return c.json(state);
   },
 
   // ── networks ──────────────────────────────────────────────────────

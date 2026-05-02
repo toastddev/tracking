@@ -1,6 +1,7 @@
 import { googleAdsConnectionRepository } from '../firestore/repositories/googleAdsConnectionRepository';
 import { googleAdsMccChildrenRepository } from '../firestore/repositories/googleAdsMccChildrenRepository';
 import { campaignReportRepository } from '../firestore/repositories/campaignReportRepository';
+import { googleAdsSyncStateRepository } from '../firestore/repositories/googleAdsSyncStateRepository';
 import { buildCustomer } from './googleAdsClient';
 import { logger } from '../utils/logger';
 import { toUsd } from '../utils/fxRates';
@@ -151,6 +152,8 @@ export const googleAdsCampaignSyncService = {
       total_spend_micros: totalSpendMicros,
       duration_ms: Date.now() - started,
     };
+
+    await googleAdsSyncStateRepository.touchLastSynced({ from: fromStr, to: toStr });
 
     logger.info('google_ads_campaign_sync_completed', { ...result });
     return result;
