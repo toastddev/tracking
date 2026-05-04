@@ -1,4 +1,5 @@
 import { buildCustomer } from './googleAdsClient';
+import { eventDate } from './eventTime';
 import {
   googleAdsConnectionRepository,
   googleAdsRouteRepository,
@@ -249,7 +250,7 @@ export const googleAdsForwardingService = {
         conversion_action_resource: conn.sale_conversion_action_resource,
         conversion_value: conversion.payout ?? 0,
         currency_code: conversion.currency,
-        conversion_date_time_iso: conversion.created_at,
+        conversion_date_time_iso: eventDate(conversion).toISOString(),
         order_id: conversion.conversion_id,    // same order_id across MCCs is fine — different customer scope
       };
       const result = await callGoogleAds(conn, ctx);
@@ -286,7 +287,7 @@ export const googleAdsForwardingService = {
           conversion_action_resource: route.sale_conversion_action_resource,
           conversion_value: conversion.payout ?? 0,
           currency_code: conversion.currency,
-          conversion_date_time_iso: conversion.created_at,
+          conversion_date_time_iso: eventDate(conversion).toISOString(),
           order_id: conversion.conversion_id,
         };
         const result = await callGoogleAds(target, ctx);
@@ -450,7 +451,7 @@ export const googleAdsForwardingService = {
         const cc: Record<string, unknown> = {
           conversion_action: conn.sale_conversion_action_resource,
           conversion_date_time: formatGoogleAdsDateTime(
-            conversion.created_at,
+            eventDate(conversion).toISOString(),
             conn.time_zone || 'UTC'
           ),
           conversion_value: conversion.payout ?? 0,
@@ -472,7 +473,7 @@ export const googleAdsForwardingService = {
         const cc: Record<string, unknown> = {
           conversion_action: route.sale_conversion_action_resource,
           conversion_date_time: formatGoogleAdsDateTime(
-            conversion.created_at,
+            eventDate(conversion).toISOString(),
             conn.time_zone || 'UTC'
           ),
           conversion_value: conversion.payout ?? 0,
