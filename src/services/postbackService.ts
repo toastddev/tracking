@@ -11,6 +11,7 @@ import {
 import { __campaignFromExtra as extractCampaign } from './clickService';
 import { networkService } from './networkService';
 import { googleAdsForwardingService } from './googleAdsForwardingService';
+import { eventDate } from './eventTime';
 import type { ConversionRecord, Network, VerificationReason } from '../types';
 
 export interface PostbackInput {
@@ -145,7 +146,7 @@ export const postbackService = {
         .incrementConversion({
           offer_id: offerForReport,
           network_id: conv.network_id,
-          at: new Date(conv.created_at),
+          at: eventDate(conv),
           verified: conv.verified,
           status: conv.status,
           payout: conv.payout,
@@ -180,7 +181,7 @@ export const postbackService = {
         campaignReportRepository.incrementConversion({
           campaign_id: campaign.campaign_id,
           source: campaign.source,
-          at: new Date(conv.created_at),
+          at: eventDate(conv),
           verified: conv.verified,
           status: conv.status,
           payout: conv.payout,

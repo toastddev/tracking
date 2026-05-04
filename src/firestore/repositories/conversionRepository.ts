@@ -28,6 +28,12 @@ export interface ConversionListOptions {
 export interface ConversionListAllOptions {
   network_id?: string;
   offer_id?: string;
+  // Multi-offer filter. Applied in-memory on top of the index-backed
+  // (network_id, created_at) scan so we don't need a new composite index for
+  // every (network, offer-set) combination. Practical cap is ~30 ids; bigger
+  // sets become inefficient because we may have to over-fetch to fill a page.
+  // If both `offer_id` and `offer_ids` are set, `offer_ids` wins.
+  offer_ids?: string[];
   verified?: boolean;
   status?: string;
   from?: Date;
@@ -184,25 +190,26 @@ export const conversionRepository = {
   // we declare the common ones; exotic combos will surface a Firestore error.
   async listAll(opts: ConversionListAllOptions = {}): Promise<ListResult<ConversionRecord>> {
     const limit = Math.min(Math.max(opts.limit ?? 25, 1), 200);
-    let query: FirebaseFirestore.Query = db().collection(COLLECTIONS.CONVERSIONS);
+    const offerSet = opts.offer_ids && opts.offer_ids.length > 0
+      ? new Set(opts.offer_ids)
+      : null;
 
-    if (opts.network_id) query = query.where('network_id', '==', opts.network_id);
-    if (opts.offer_id) query = query.where('offer_id', '==', opts.offer_id);
-    if (typeof opts.verified === 'boolean') query = query.where('verified', '==', opts.verified);
-    if (opts.status) query = query.where('status', '==', opts.status);
-    if (opts.from) query = query.where('created_at', '>=', opts.from);
-    if (opts.to) query = query.where('created_at', '<=', opts.to);
+    function buildBaseQuery(startAfter?: Date): FirebaseFirestore.Query {
+      let q: FirebaseFirestore.Query = db().collection(COLLECTIONS.CONVERSIONS);
+      if (opts.network_id) q = q.where('network_id', '==', opts.network_id);
+      // When an explicit multi-set is provided, skip the single-id filter —
+      // the in-memory `offerSet` check below covers it.
+      if (!offerSet && opts.offer_id) q = q.where('offer_id', '==', opts.offer_id);
+      if (typeof opts.verified === 'boolean') q = q.where('verified', '==', opts.verified);
+      if (opts.status) q = q.where('status', '==', opts.status);
+      if (opts.from) q = q.where('created_at', '>=', opts.from);
+      if (opts.to) q = q.where('created_at', '<=', opts.to);
+      q = q.orderBy('created_at', 'desc');
+      if (startAfter) q = q.startAfter(startAfter);
+      return q;
+    }
 
-    query = query.orderBy('created_at', 'desc');
-
-    const cursorVal = decodeCursor(opts.cursor);
-    if (cursorVal) query = query.startAfter(new Date(cursorVal));
-
-    const snap = await query.limit(limit + 1).get();
-    const docs = snap.docs.slice(0, limit);
-    const hasMore = snap.docs.length > limit;
-
-    const items: ConversionRecord[] = docs.map((d) => {
+    function rowFromDoc(d: FirebaseFirestore.QueryDocumentSnapshot): ConversionRecord {
       const raw = d.data() as Record<string, unknown>;
       return {
         ...(raw as unknown as ConversionRecord),
@@ -212,13 +219,71 @@ export const conversionRepository = {
           (raw.created_at as string | undefined) ??
           '',
       };
-    });
+    }
+
+    const cursorVal = decodeCursor(opts.cursor);
+    let cursorDate = cursorVal ? new Date(cursorVal) : undefined;
+
+    // Simple path: no in-memory filter needed.
+    if (!offerSet) {
+      const snap = await buildBaseQuery(cursorDate).limit(limit + 1).get();
+      const docs = snap.docs.slice(0, limit);
+      const hasMore = snap.docs.length > limit;
+      const items = docs.map(rowFromDoc);
+      let nextCursor: string | null = null;
+      if (hasMore && docs.length > 0) {
+        const last = docs[docs.length - 1]!;
+        const ts = (last.data().created_at as { toDate?: () => Date } | undefined)?.toDate?.();
+        if (ts) nextCursor = encodeCursor(ts.toISOString());
+      }
+      return { items, nextCursor };
+    }
+
+    // Multi-offer path: page through the index-backed scan, filter in memory,
+    // accumulate until we have `limit` rows or run out. The cursor returned
+    // is the created_at of the last RETURNED (filter-passing) row, so paging
+    // remains monotonic even with sparse pages.
+    const FETCH_BATCH = Math.min(200, Math.max(limit * 5, 50));
+    const SCAN_CAP = 1000; // hard cap on rows scanned per request to avoid runaway reads
+    const items: ConversionRecord[] = [];
+    let scanned = 0;
+    let lastCursorAdvance = cursorDate;
+    let underlyingExhausted = false;
+
+    while (items.length < limit && scanned < SCAN_CAP) {
+      const snap = await buildBaseQuery(lastCursorAdvance).limit(FETCH_BATCH).get();
+      if (snap.empty) {
+        underlyingExhausted = true;
+        break;
+      }
+      scanned += snap.size;
+      for (const d of snap.docs) {
+        const row = rowFromDoc(d);
+        if (offerSet.has(row.offer_id ?? '')) {
+          items.push(row);
+          if (items.length >= limit) break;
+        }
+      }
+      // Advance cursor past the last scanned row regardless of whether it
+      // matched, so the next inner page picks up after it.
+      const lastScannedTs = (snap.docs[snap.docs.length - 1]!.data().created_at as { toDate?: () => Date } | undefined)?.toDate?.();
+      if (!lastScannedTs) {
+        underlyingExhausted = true;
+        break;
+      }
+      lastCursorAdvance = lastScannedTs;
+      if (snap.size < FETCH_BATCH) {
+        underlyingExhausted = true;
+        break;
+      }
+    }
 
     let nextCursor: string | null = null;
-    if (hasMore && docs.length > 0) {
-      const last = docs[docs.length - 1]!;
-      const ts = (last.data().created_at as { toDate?: () => Date } | undefined)?.toDate?.();
-      if (ts) nextCursor = encodeCursor(ts.toISOString());
+    if (items.length >= limit && !underlyingExhausted) {
+      // Cursor for next page: the created_at of the last returned row, not
+      // the last scanned row, so paging is stable across `offer_ids` changes.
+      const lastReturnedTs = items[items.length - 1]!.created_at;
+      if (lastReturnedTs) nextCursor = encodeCursor(lastReturnedTs);
     }
 
     return { items, nextCursor };

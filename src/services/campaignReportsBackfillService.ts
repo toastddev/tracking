@@ -3,6 +3,11 @@ import { db } from '../firestore/config';
 import { COLLECTIONS } from '../firestore/schema';
 import { campaignReportRepository } from '../firestore';
 import { logger } from '../utils/logger';
+import {
+  eventDateFromRaw,
+  BACKFILL_SCAN_PAD_BEFORE_MS,
+  BACKFILL_SCAN_PAD_AFTER_MS,
+} from './eventTime';
 
 // Reconstructs the campaign_reports rollup from the source clicks +
 // conversions collections. Idempotent — each run computes totals locally and
@@ -206,13 +211,17 @@ export const campaignReportsBackfillService = {
     let conversions_with_campaign = 0;
     let orphan_lookups = 0;
     {
+      const scanFrom = new Date(from.getTime() - BACKFILL_SCAN_PAD_BEFORE_MS);
+      const scanTo = new Date(to.getTime() + BACKFILL_SCAN_PAD_AFTER_MS);
+      const fromDay = dayKeyUTC(from);
+      const toDay = dayKeyUTC(to);
       let cursor: Date | null = null;
       // eslint-disable-next-line no-constant-condition
       while (true) {
         let q: FirebaseFirestore.Query = db()
           .collection(COLLECTIONS.CONVERSIONS)
-          .where('created_at', '>=', from)
-          .where('created_at', '<=', to)
+          .where('created_at', '>=', scanFrom)
+          .where('created_at', '<=', scanTo)
           .orderBy('created_at', 'asc')
           .limit(PAGE);
         if (cursor) q = q.startAfter(cursor);
@@ -225,6 +234,10 @@ export const campaignReportsBackfillService = {
           if (raw.shadow === true) continue;
           const at = tsToDate(raw.created_at);
           if (!at) continue;
+          // Bucket on event-time so late API pulls land in the right day.
+          const eventAt = eventDateFromRaw(at, raw.network_timestamp);
+          const eventDay = dayKeyUTC(eventAt);
+          if (eventDay < fromDay || eventDay > toDay) continue;
           const verified = Boolean(raw.verified);
           const click_id = (raw.click_id as string | undefined) || '';
           conversions_scanned += 1;
@@ -264,7 +277,7 @@ export const campaignReportsBackfillService = {
           const payout = typeof raw.payout === 'number' ? (raw.payout as number) : 0;
           const status = raw.status as string | undefined;
 
-          const b = bucketFor(meta.campaign_id, meta.source, dayKeyUTC(at));
+          const b = bucketFor(meta.campaign_id, meta.source, eventDay);
           b.postbacks += 1;
           b.conversions += 1;
           if (Number.isFinite(payout)) b.revenue += payout;

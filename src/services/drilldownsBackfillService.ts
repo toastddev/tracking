@@ -3,6 +3,11 @@ import { db } from '../firestore/config';
 import { COLLECTIONS } from '../firestore/schema';
 import { logger } from '../utils/logger';
 import { drilldownRepository } from '../firestore/repositories/drilldownRepository';
+import {
+  eventDateFromRaw,
+  BACKFILL_SCAN_PAD_BEFORE_MS,
+  BACKFILL_SCAN_PAD_AFTER_MS,
+} from './eventTime';
 import type { ClickRecord, ConversionRecord } from '../types';
 
 const PAGE = 1000;
@@ -167,12 +172,19 @@ export const drilldownsBackfillService = {
 
     let conversions_scanned = 0;
     {
+      // Widen the receipt-time scan to catch rows whose event-day falls
+      // inside [from, to] but were ingested earlier or later. Inside the
+      // loop we re-check the event-day and skip out-of-range buckets.
+      const scanFrom = new Date(from.getTime() - BACKFILL_SCAN_PAD_BEFORE_MS);
+      const scanTo = new Date(to.getTime() + BACKFILL_SCAN_PAD_AFTER_MS);
+      const fromDay = dayKeyUTC(from);
+      const toDay = dayKeyUTC(to);
       let cursor: Date | null = null;
       while (true) {
         let q: FirebaseFirestore.Query = db()
           .collection(COLLECTIONS.CONVERSIONS)
-          .where('created_at', '>=', from)
-          .where('created_at', '<=', to)
+          .where('created_at', '>=', scanFrom)
+          .where('created_at', '<=', scanTo)
           .orderBy('created_at', 'asc')
           .limit(PAGE);
         if (cursor) q = q.startAfter(cursor);
@@ -184,6 +196,14 @@ export const drilldownsBackfillService = {
           const at = tsToDate(raw.created_at);
           if (!at) continue;
 
+          // Bucket on event-time so late API pulls land in the right day.
+          const eventAt = eventDateFromRaw(at, raw.network_timestamp);
+          const eventDay = dayKeyUTC(eventAt);
+          // The widened scan can pick up rows whose event-day is outside
+          // the requested rebuild window — skip those, the user only asked
+          // us to rebuild [from, to].
+          if (eventDay < fromDay || eventDay > toDay) continue;
+
           const click_id = String(raw.click_id ?? '');
           const offer_id = (raw.offer_id as string | undefined) || 'unknown';
           const network_id = (raw.network_id as string | undefined) || '(unknown)';
@@ -192,7 +212,7 @@ export const drilldownsBackfillService = {
           const status = raw.status as string | undefined;
 
           // Process Offer Drilldown for Conversion
-          const ob = getOfferBucket(offer_id, dayKeyUTC(at));
+          const ob = getOfferBucket(offer_id, eventDay);
           if (verified) {
             const click = clickMap.get(click_id);
             if (click) {
@@ -216,8 +236,8 @@ export const drilldownsBackfillService = {
             }
           }
 
-          // Process Postback Drilldown
-          const pb = getPostbackBucket(network_id, dayKeyUTC(at));
+          // Process Postback Drilldown — same event-day bucket.
+          const pb = getPostbackBucket(network_id, eventDay);
           const srcRaw = raw.source as string | undefined;
           const src = srcRaw === 'postback' || srcRaw === 'api' ? srcRaw : 'unknown';
           const methRaw = raw.method as string | undefined;
@@ -230,8 +250,10 @@ export const drilldownsBackfillService = {
           incrementSubMap(pb.sources, src, 'postbacks', 1);
           if (method !== 'unknown') incrementSubMap(pb.methods, method, 'postbacks', 1);
 
-          const dow = at.getUTCDay();
-          const hour = at.getUTCHours();
+          // Heatmap reflects when the event actually occurred on the
+          // network's side, not when we received it.
+          const dow = eventAt.getUTCDay();
+          const hour = eventAt.getUTCHours();
           incrementMap(pb.heatmap, `${dow}_${hour}`, 1);
 
           if (verified) {

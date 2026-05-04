@@ -14,6 +14,7 @@ import {
 import { __campaignFromExtra as extractCampaign } from './clickService';
 import { generateConversionId } from '../utils/idGenerator';
 import { googleAdsForwardingService } from './googleAdsForwardingService';
+import { eventDate } from './eventTime';
 import type {
   AffiliateApi,
   AffiliateApiAuthConfig,
@@ -366,7 +367,9 @@ export async function runAffiliateApi(api: AffiliateApi, opts: RunOptions): Prom
           .map((b) => ({
             offer_id: b.conv.offer_id as string,
             network_id: b.conv.network_id,
-            at: new Date(b.conv.created_at),
+            // Bucket on event-time (network_timestamp), not receipt-time —
+            // this is the path that smears late pulls across days.
+            at: eventDate(b.conv),
             verified: true,
             status: b.conv.status,
             payout: b.conv.payout,
@@ -389,7 +392,7 @@ export async function runAffiliateApi(api: AffiliateApi, opts: RunOptions): Prom
             return {
               campaign_id: c.campaign_id,
               source: c.source,
-              at: new Date(b.conv.created_at),
+              at: eventDate(b.conv),
               verified: true,
               status: b.conv.status,
               payout: b.conv.payout,

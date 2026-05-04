@@ -1,4 +1,4 @@
-import { networkRepository, conversionRepository, drilldownRepository } from '../firestore';
+import { networkRepository, conversionRepository, drilldownRepository, offerRepository } from '../firestore';
 import type { ConversionRecord } from '../types';
 
 // A postback drill-down is much cheaper than an offer drill-down because we
@@ -12,6 +12,18 @@ export interface PostbackDetailFilters {
   network_id: string;
   from: Date;
   to: Date;
+  // When set, summary/series/deltas/offer-breakdown are restricted to these
+  // offer_ids. Filtering happens in-memory on the same daily drilldown docs we
+  // already fetch, so it costs no extra Firestore reads.
+  offer_ids?: string[];
+}
+
+// All offers seen for this network in the window (unfiltered). Drives the
+// frontend's offer multi-select.
+export interface AvailableOffer {
+  offer_id: string;
+  name?: string;
+  postbacks: number;
 }
 
 // Daily timeline. The split between verified and unverified is the operator's
@@ -197,6 +209,19 @@ export interface PostbackDetailResponse {
     verified: RecentVerifiedSample[];
     unmatched: UnmatchedSample[];
   };
+
+  // All offers this network fired for in the window — sorted by fires desc.
+  // Used to populate the offer multi-select on the frontend.
+  available_offers: AvailableOffer[];
+  // Echo of the applied filter so the frontend can render its filter chips
+  // from the canonical server view.
+  applied_offer_ids: string[];
+  // True when an offer filter is active. Cards that aggregate non-offer
+  // dimensions (sources, methods, heatmap, latency, mapping_health, recent
+  // samples) are NOT scoped by the filter — drilldowns store those at the
+  // network/day level only, so they remain network-wide. The frontend uses
+  // this flag to surface that distinction in the UI.
+  offer_filter_applied: boolean;
 }
 
 function eachDayKeyUTC(from: Date, to: Date): string[] {
@@ -303,6 +328,9 @@ function buildSeries(rows: ConvForReport[], from: Date, to: Date): PostbackDetai
 export const postbackReportDetailService = {
   async getDetail(f: PostbackDetailFilters): Promise<PostbackDetailResponse> {
     const { network_id, from, to } = f;
+    const offerFilter = f.offer_ids && f.offer_ids.length > 0
+      ? new Set(f.offer_ids)
+      : null;
     const periodMs = to.getTime() - from.getTime();
     const prevTo = new Date(from.getTime() - 1);
     const prevFrom = new Date(prevTo.getTime() - periodMs);
@@ -322,6 +350,7 @@ export const postbackReportDetailService = {
       for (const d of docs) {
         if (d.offers) {
           for (const [oid, m] of Object.entries(d.offers)) {
+            if (offerFilter && !offerFilter.has(oid)) continue;
             uniqueOffers.add(oid);
             postbacks += m.postbacks ?? 0;
             verified += m.verified ?? 0;
@@ -366,7 +395,8 @@ export const postbackReportDetailService = {
       const p = seriesBucket.get(d.date);
       if (!p) continue;
       if (d.offers) {
-        for (const m of Object.values(d.offers)) {
+        for (const [oid, m] of Object.entries(d.offers)) {
+          if (offerFilter && !offerFilter.has(oid)) continue;
           p.postbacks += m.postbacks ?? 0;
           p.verified += m.verified ?? 0;
           p.unverified += m.unverified ?? 0;
@@ -380,11 +410,15 @@ export const postbackReportDetailService = {
     const series = Array.from(seriesBucket.values()).sort((a, b) => a.date.localeCompare(b.date));
 
     // ── Breakdowns
+    // offerAgg respects the filter (it's the offer-by-offer view of the
+    // selected slice). availableOfferAgg ignores the filter — it's the full
+    // population of offers seen in the window, used to build the multi-select.
     const offerAgg = new Map<string, PostbackOfferBreakdown>();
+    const availableOfferAgg = new Map<string, number>();
     const sourceAgg = new Map<'postback' | 'api' | 'unknown', PostbackSourceBreakdown>();
     const methodAgg = new Map<'GET' | 'POST', PostbackMethodBreakdown>();
     const heatmap: PostbackHourHeatmap = Array.from({ length: 7 }, () => Array(24).fill(0));
-    
+
     let firesWithPayout = 0;
     let firesWithStatus = 0;
     let firesWithTxnId = 0;
@@ -393,6 +427,8 @@ export const postbackReportDetailService = {
     for (const d of drilldowns) {
       if (d.offers) {
         for (const [key, m] of Object.entries(d.offers)) {
+          availableOfferAgg.set(key, (availableOfferAgg.get(key) ?? 0) + (m.postbacks ?? 0));
+          if (offerFilter && !offerFilter.has(key)) continue;
           let row = offerAgg.get(key);
           if (!row) {
             row = { offer_id: key, postbacks: 0, verified: 0, unverified: 0, approved: 0, rejected: 0, revenue: 0, match_rate: 0 };
@@ -574,6 +610,32 @@ export const postbackReportDetailService = {
       .sort((a, b) => b.postbacks - a.postbacks)
       .slice(0, 10);
 
+    // Look up offer names so the multi-select shows "Dell Direct" instead of
+    // a raw offer_id. offerRepository.getById is cached, so for a typical
+    // network with a handful of offers this is essentially free on the second
+    // call onwards. Failures fall through to offer_id-only.
+    const availableOfferIds = Array.from(availableOfferAgg.keys()).filter(
+      (id) => id && id !== '(unattributed)'
+    );
+    const offerNamePairs = await Promise.all(
+      availableOfferIds.map(async (id): Promise<[string, string | undefined]> => {
+        try {
+          const o = await offerRepository.getById(id);
+          return [id, o?.name];
+        } catch {
+          return [id, undefined];
+        }
+      })
+    );
+    const offerNames = new Map(offerNamePairs);
+    const available_offers: AvailableOffer[] = Array.from(availableOfferAgg.entries())
+      .map(([offer_id, postbacks]) => ({
+        offer_id,
+        name: offerNames.get(offer_id),
+        postbacks,
+      }))
+      .sort((a, b) => b.postbacks - a.postbacks);
+
     return {
       network: {
         network_id: network?.network_id ?? network_id,
@@ -609,6 +671,9 @@ export const postbackReportDetailService = {
         verified: recentVerified,
         unmatched: recentUnmatched,
       },
+      available_offers,
+      applied_offer_ids: offerFilter ? Array.from(offerFilter) : [],
+      offer_filter_applied: !!offerFilter,
     };
   },
 };

@@ -2,6 +2,7 @@ import { FieldValue } from 'firebase-admin/firestore';
 import { db } from '../config';
 import { COLLECTIONS } from '../schema';
 import type { ClickRecord, ConversionRecord } from '../../types';
+import { eventDate } from '../../services/eventTime';
 
 function dayKeyUTC(d: Date): string {
   return d.toISOString().slice(0, 10);
@@ -112,7 +113,9 @@ export const drilldownRepository = {
 
   async incrementOfferConversion(conv: ConversionRecord, click: ClickRecord | null): Promise<void> {
     if (conv.shadow) return;
-    const date = new Date(conv.created_at);
+    // Bucket on event-time, not receipt-time, so late API pulls don't smear
+    // a May-1 conversion into May 2.
+    const date = eventDate(conv);
     if (Number.isNaN(date.getTime())) return;
     const day = dayKeyUTC(date);
 
@@ -172,7 +175,10 @@ export const drilldownRepository = {
   // ── Postback Drilldowns ────────────────────────────────────────────────
   async incrementPostback(conv: ConversionRecord): Promise<void> {
     if (conv.shadow) return;
-    const date = new Date(conv.created_at);
+    // Day key, heatmap dow/hour both reflect the event time the network
+    // reported. Latency below still uses created_at vs network_timestamp
+    // separately — that's the whole point of the latency metric.
+    const date = eventDate(conv);
     if (Number.isNaN(date.getTime())) return;
     const day = dayKeyUTC(date);
 
@@ -225,8 +231,10 @@ export const drilldownRepository = {
     if (Object.keys(mappingHealth).length > 0) update.mapping_health = mappingHealth;
 
     if (verified && conv.network_timestamp) {
+      // Latency is fundamentally (receipt - event), so it must use the raw
+      // `created_at` here, NOT the event-bucketed `date` above.
       const networkAt = new Date(conv.network_timestamp).getTime();
-      const receivedAt = date.getTime();
+      const receivedAt = new Date(conv.created_at).getTime();
       if (Number.isFinite(networkAt) && Number.isFinite(receivedAt) && receivedAt >= networkAt) {
         const latencyMins = (receivedAt - networkAt) / 60_000;
         let bucket = '60+';

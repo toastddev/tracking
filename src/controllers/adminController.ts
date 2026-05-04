@@ -368,9 +368,21 @@ export const adminController = {
       verifiedQ === 'false' ? false :
       undefined;
 
+    const idsRaw = c.req.query('offer_ids');
+    let offer_ids: string[] | undefined;
+    if (idsRaw) {
+      const list = idsRaw.split(',').map((s) => s.trim()).filter(Boolean);
+      for (const oid of list) {
+        if (!isValidId(oid)) return c.json({ error: 'invalid_offer_id' }, 400);
+      }
+      if (list.length > 30) return c.json({ error: 'too_many_offer_ids' }, 400);
+      offer_ids = list;
+    }
+
     const result = await conversionRepository.listAll({
       network_id: c.req.query('network_id'),
       offer_id: c.req.query('offer_id'),
+      offer_ids,
       status: c.req.query('status'),
       verified,
       from: parseDate(c.req.query('from')),
@@ -527,11 +539,24 @@ export const adminController = {
     if (!id || !isValidId(id)) return c.json({ error: 'invalid_id' }, 400);
     const parsed = parseReportFilters(c);
     if (!parsed.ok) return c.json({ error: parsed.error }, 400);
+
+    const idsRaw = c.req.query('offer_ids');
+    let offer_ids: string[] | undefined;
+    if (idsRaw) {
+      const list = idsRaw.split(',').map((s) => s.trim()).filter(Boolean);
+      for (const oid of list) {
+        if (!isValidId(oid)) return c.json({ error: 'invalid_offer_id' }, 400);
+      }
+      if (list.length > 50) return c.json({ error: 'too_many_offer_ids' }, 400);
+      offer_ids = list;
+    }
+
     try {
       const detail = await postbackReportDetailService.getDetail({
         network_id: id,
         from: parsed.filters.from,
         to: parsed.filters.to,
+        offer_ids,
       });
       return c.json(detail);
     } catch (err) {

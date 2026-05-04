@@ -2,6 +2,11 @@ import { FieldValue } from 'firebase-admin/firestore';
 import { db } from '../firestore/config';
 import { COLLECTIONS } from '../firestore/schema';
 import { logger } from '../utils/logger';
+import {
+  eventDateFromRaw,
+  BACKFILL_SCAN_PAD_BEFORE_MS,
+  BACKFILL_SCAN_PAD_AFTER_MS,
+} from './eventTime';
 
 // Reconstructs the offer_reports rollup collection from the source clicks
 // and conversions data. Idempotent — each run computes the totals locally,
@@ -135,13 +140,21 @@ export const offerReportsBackfillService = {
     // ── 2. conversions ───────────────────────────────────────────────
     let conversions_scanned = 0;
     {
+      // Widen the receipt-time scan to catch rows whose event-day falls
+      // inside [from, to] but whose receipt-day spills outside (late API
+      // pulls). The event-day bounds check inside the loop discards rows
+      // outside the requested window.
+      const scanFrom = new Date(from.getTime() - BACKFILL_SCAN_PAD_BEFORE_MS);
+      const scanTo = new Date(to.getTime() + BACKFILL_SCAN_PAD_AFTER_MS);
+      const fromDay = dayKeyUTC(from);
+      const toDay = dayKeyUTC(to);
       let cursor: Date | null = null;
       // eslint-disable-next-line no-constant-condition
       while (true) {
         let q: FirebaseFirestore.Query = db()
           .collection(COLLECTIONS.CONVERSIONS)
-          .where('created_at', '>=', from)
-          .where('created_at', '<=', to)
+          .where('created_at', '>=', scanFrom)
+          .where('created_at', '<=', scanTo)
           .orderBy('created_at', 'asc')
           .limit(PAGE);
         if (cursor) q = q.startAfter(cursor);
@@ -155,12 +168,15 @@ export const offerReportsBackfillService = {
           const offer_id = (raw.offer_id as string | undefined) || 'unknown';
           const at = tsToDate(raw.created_at);
           if (!at) continue;
+          const eventAt = eventDateFromRaw(at, raw.network_timestamp);
+          const eventDay = dayKeyUTC(eventAt);
+          if (eventDay < fromDay || eventDay > toDay) continue;
           const verified = Boolean(raw.verified);
           const payout = typeof raw.payout === 'number' ? (raw.payout as number) : 0;
           const status = raw.status as string | undefined;
           const network_id = (raw.network_id as string | undefined) || 'none';
-          
-          const b = bucketFor(offer_id, network_id, dayKeyUTC(at));
+
+          const b = bucketFor(offer_id, network_id, eventDay);
           b.postbacks += 1;
           if (verified) {
             b.conversions += 1;
