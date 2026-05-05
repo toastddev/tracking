@@ -351,18 +351,17 @@ export async function runAffiliateApi(api: AffiliateApi, opts: RunOptions): Prom
     const batch = buffer.splice(0, buffer.length);
     try {
       const convs = batch.map((b) => b.conv);
-      const { inserted, duplicates } = await conversionRepository.bulkInsertIfAbsent(convs);
+      const { inserted, duplicates, insertedRecords } = await conversionRepository.bulkInsertIfAbsent(convs);
       run.records_inserted = (run.records_inserted ?? 0) + inserted;
       run.records_skipped_duplicate = (run.records_skipped_duplicate ?? 0) + duplicates;
 
-      // Roll-up into offer_reports. We can't easily separate which rows in
-      // the batch were duplicates vs new (BulkWriter resolves async), so we
-      // increment based on the full batch — for an idempotent re-run of the
-      // same window this would double-count. Mitigate by only rolling up
-      // when the inserted/duplicates ratio shows mostly fresh inserts:
-      // duplicate-heavy batches are skipped to avoid corrupting the rollup.
-      if (inserted > 0 && inserted >= duplicates) {
-        const rollupRows = batch
+      // Filter the original batch down to strictly the new inserts
+      const insertedIds = new Set(insertedRecords.map((c) => c.conversion_id));
+      const newBatch = batch.filter((b) => insertedIds.has(b.conv.conversion_id));
+
+      if (newBatch.length > 0) {
+        // --- 1. Aggregation / Rollups ---
+        const rollupRows = newBatch
           .filter((b) => b.conv.offer_id && b.conv.verified)
           .map((b) => ({
             offer_id: b.conv.offer_id as string,
@@ -384,7 +383,7 @@ export async function runAffiliateApi(api: AffiliateApi, opts: RunOptions): Prom
         // Same pattern for campaign_reports — derive campaign_id from each
         // conversion's click extra_params. Rows without a campaign tag are
         // dropped silently (they don't belong to any campaign).
-        const campaignRollupRows = batch
+        const campaignRollupRows = newBatch
           .filter((b) => b.conv.offer_id && b.conv.verified)
           .map((b) => {
             const c = extractCampaign(b.click.extra_params);
@@ -409,7 +408,7 @@ export async function runAffiliateApi(api: AffiliateApi, opts: RunOptions): Prom
           });
         }
 
-        for (const { conv, click } of batch) {
+        for (const { conv, click } of newBatch) {
           drilldownRepository.incrementOfferConversion(conv, click).catch((err: unknown) => {
             logger.warn('drilldown_offer_conversion_aff_api_failed', {
               api_id: api.api_id,
@@ -423,27 +422,30 @@ export async function runAffiliateApi(api: AffiliateApi, opts: RunOptions): Prom
             });
           });
         }
-      }
 
-      // Hand rows to Google Ads forwarder in a single batch call per
-      // connection — dramatically reduces API calls vs one-by-one.
-      const verifiedBatch = batch.filter((b) => b.conv.verified);
-      if (verifiedBatch.length > 0) {
-        try {
-          const gadsResult = await googleAdsForwardingService.dispatchConversionsBatch(
-            verifiedBatch.map((b) => ({ conversion: b.conv, click: b.click }))
-          );
-          gadsStats.sent += gadsResult.sent;
-          gadsStats.skipped += gadsResult.skipped;
-          gadsStats.failed += gadsResult.failed;
-          gadsStats.errors.push(...gadsResult.errors);
-        } catch (err) {
-          gadsStats.failed += verifiedBatch.length;
-          gadsStats.errors.push(err instanceof Error ? err.message : String(err));
-          logger.warn('gads_batch_dispatch_failed', {
-            api_id: api.api_id,
-            error: err instanceof Error ? err.message : String(err),
-          });
+        // --- 2. Google Ads Forwarding ---
+        // Hand rows to Google Ads forwarder in a single batch call per
+        // connection — dramatically reduces API calls vs one-by-one.
+        // Restricting this to newBatch avoids redundantly sending duplicates.
+        const verifiedBatch = newBatch.filter((b) => b.conv.verified);
+        
+        if (verifiedBatch.length > 0) {
+          try {
+            const gadsResult = await googleAdsForwardingService.dispatchConversionsBatch(
+              verifiedBatch.map((b) => ({ conversion: b.conv, click: b.click }))
+            );
+            gadsStats.sent += gadsResult.sent;
+            gadsStats.skipped += gadsResult.skipped;
+            gadsStats.failed += gadsResult.failed;
+            gadsStats.errors.push(...gadsResult.errors);
+          } catch (err) {
+            gadsStats.failed += verifiedBatch.length;
+            gadsStats.errors.push(err instanceof Error ? err.message : String(err));
+            logger.warn('gads_batch_dispatch_failed', {
+              api_id: api.api_id,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
         }
       }
     } catch (err) {

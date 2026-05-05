@@ -76,11 +76,12 @@ export const conversionRepository = {
 
   // Bulk variant for hot loops. Uses a BulkWriter with create() so existing
   // docs error out and are silently dropped — deterministic-id dedupe.
-  async bulkInsertIfAbsent(records: ConversionRecord[]): Promise<{ inserted: number; duplicates: number }> {
-    if (records.length === 0) return { inserted: 0, duplicates: 0 };
+  async bulkInsertIfAbsent(records: ConversionRecord[]): Promise<{ inserted: number; duplicates: number; insertedRecords: ConversionRecord[] }> {
+    if (records.length === 0) return { inserted: 0, duplicates: 0, insertedRecords: [] };
     const writer = db().bulkWriter();
     let inserted = 0;
     let duplicates = 0;
+    const insertedRecords: ConversionRecord[] = [];
     writer.onWriteError((err) => {
       if (err.code === 6 /* ALREADY_EXISTS */) {
         duplicates++;
@@ -92,11 +93,14 @@ export const conversionRepository = {
     for (const conv of records) {
       const ref = db().collection(COLLECTIONS.CONVERSIONS).doc(conv.conversion_id);
       writer.create(ref, { ...conv, created_at: FieldValue.serverTimestamp() })
-        .then(() => { inserted++; })
+        .then(() => { 
+          inserted++; 
+          insertedRecords.push(conv);
+        })
         .catch(() => { /* surfaced via onWriteError */ });
     }
     await writer.close();
-    return { inserted, duplicates };
+    return { inserted, duplicates, insertedRecords };
   },
 
   // All conversions tied to one click_id, newest first. Backed by the
