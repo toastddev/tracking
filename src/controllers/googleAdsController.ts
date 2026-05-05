@@ -285,6 +285,40 @@ export const googleAdsController = {
     return c.json({ ok: true });
   },
 
+  async refreshMccChildren(c: Context) {
+    const id = c.req.param('id');
+    if (!id) return c.json({ error: 'invalid_id' }, 400);
+    const conn = await googleAdsConnectionRepository.getById(id);
+    if (!conn) return c.json({ error: 'not_found' }, 404);
+    if (conn.type !== 'mcc') return c.json({ error: 'not_mcc' }, 400);
+
+    let tree: GoogleAdsCandidate[];
+    try {
+      tree = await googleAdsAccountService.discoverHierarchy({
+        refresh_token_enc: conn.refresh_token_enc,
+        rootCustomerId: conn.customer_id,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return c.json({ error: 'discover_failed', message: msg }, 502);
+    }
+
+    const mccChildren = tree
+      .filter((cand) => !cand.is_manager)
+      .map((cand) => ({
+        customer_id: cand.customer_id,
+        descriptive_name: cand.descriptive_name ?? '',
+        currency_code: cand.currency_code ?? '',
+        time_zone: cand.time_zone ?? '',
+      }));
+
+    if (mccChildren.length > 0) {
+      await googleAdsMccChildrenRepository.upsertMany(conn.connection_id, mccChildren);
+    }
+
+    return c.json({ mcc_children: mccChildren });
+  },
+
   // Patch the conversion-action mappings on a connection. For MCC this is the
   // cross-account default; for a child it's used unless a per-offer route
   // overrides.

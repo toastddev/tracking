@@ -22,6 +22,10 @@ integrationsRoutes.get(
   `${base}/connections/:id/conversion-actions`,
   (c) => googleAdsController.listConversionActions(c)
 );
+integrationsRoutes.post(
+  `${base}/connections/:id/mcc-children/refresh`,
+  (c) => googleAdsController.refreshMccChildren(c)
+);
 
 // Routes (which offer/network goes to which CHILD connection)
 integrationsRoutes.get(`${base}/routes`,              (c) => googleAdsController.getRoute(c));
