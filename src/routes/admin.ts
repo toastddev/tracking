@@ -41,6 +41,7 @@ adminRoutes.get('/api/clicks/:id', (c) => adminController.getClick(c));
 // Reports
 adminRoutes.get('/api/reports/summary', (c) => adminController.reportSummary(c));
 adminRoutes.get('/api/reports/timeseries', (c) => adminController.reportTimeseries(c));
+adminRoutes.get('/api/reports/overview', (c) => adminController.reportOverview(c));
 adminRoutes.get('/api/reports/offers', (c) => adminController.reportOffers(c));
 adminRoutes.post('/api/reports/offers/backfill', (c) => adminController.backfillOfferReports(c));
 adminRoutes.get('/api/reports/offers/:id/detail', (c) => adminController.reportOfferDetail(c));

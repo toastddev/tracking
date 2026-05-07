@@ -442,6 +442,20 @@ export const adminController = {
     }
   },
 
+  // Combined summary + timeseries — one Firestore scan covers both. The
+  // /reports page uses this in place of two separate endpoints.
+  async reportOverview(c: Context) {
+    const parsed = parseReportFilters(c);
+    if (!parsed.ok) return c.json({ error: parsed.error }, 400);
+    try {
+      const overview = await reportsService.overview(parsed.filters);
+      return c.json(overview);
+    } catch (err) {
+      logger.error('report_overview_failed', { error: err instanceof Error ? err.message : String(err) });
+      return c.json({ error: 'internal' }, 500);
+    }
+  },
+
   // Per-offer aggregated reports drawn from the offer_reports rollup
   // collection (TTL-safe). Accepts an optional offer_ids list (comma-
   // separated) so the UI can persist a multi-select locally and only ask

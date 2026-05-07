@@ -1,6 +1,13 @@
 import { FieldValue, Timestamp } from 'firebase-admin/firestore';
 import { db } from '../config';
 import { COLLECTIONS } from '../schema';
+import { TTLCache } from '../../utils/ttlCache';
+
+// 60s read-through cache for fetchRange. The /reports page fires multiple
+// overlapping calls per load; this collapses them to one Firestore scan per
+// range. Writes on the hot path do not invalidate — the rollup is already
+// eventually-consistent and the frontend's staleTime is 30s.
+const fetchRangeCache = new TTLCache<OfferReportDoc[]>({ ttlMs: 60_000, maxEntries: 128 });
 
 // Offer-level pre-aggregated daily metrics. Doc id = `{offer_id}__{network_id}__{YYYY-MM-DD}`
 // (UTC day). This collection survives the 90-day TTL on clicks/conversions —
@@ -179,39 +186,46 @@ export const offerReportRepository = {
 
   // Range fetch in date order. Optionally restricted to a set of offers.
   // Without `offer_ids`, returns all docs in the range — caller filters.
+  // Wrapped in a 60s TTL cache; see fetchRangeCache above.
   async fetchRange(opts: OfferReportRangeOptions): Promise<OfferReportDoc[]> {
     const fromKey = dayKeyUTC(opts.from);
     const toKey = dayKeyUTC(opts.to);
     const max = Math.max(1, Math.min(opts.max ?? 50_000, 200_000));
+    const idsKey = opts.offer_ids && opts.offer_ids.length > 0
+      ? [...opts.offer_ids].sort().join(',')
+      : '';
+    const cacheKey = `${fromKey}|${toKey}|${max}|${idsKey}`;
 
-    if (opts.offer_ids && opts.offer_ids.length > 0) {
-      // Fan out per offer — Firestore "in" supports up to 30 values, and we
-      // need ordered date scans anyway. Parallel queries are cheap.
-      const out: OfferReportDoc[] = [];
-      const promises = opts.offer_ids.map(async (offer_id) => {
-        const snap = await db()
-          .collection(COLLECTIONS.OFFER_REPORTS)
-          .where('offer_id', '==', offer_id)
-          .where('date', '>=', fromKey)
-          .where('date', '<=', toKey)
-          .orderBy('date', 'asc')
-          .limit(max)
-          .get();
-        return snap.docs.map((d) => hydrate(d.data() as Record<string, unknown>));
-      });
-      const chunks = await Promise.all(promises);
-      for (const c of chunks) out.push(...c);
-      return out;
-    }
+    return fetchRangeCache.getOrLoad(cacheKey, async () => {
+      if (opts.offer_ids && opts.offer_ids.length > 0) {
+        // Fan out per offer — Firestore "in" supports up to 30 values, and we
+        // need ordered date scans anyway. Parallel queries are cheap.
+        const out: OfferReportDoc[] = [];
+        const promises = opts.offer_ids.map(async (offer_id) => {
+          const snap = await db()
+            .collection(COLLECTIONS.OFFER_REPORTS)
+            .where('offer_id', '==', offer_id)
+            .where('date', '>=', fromKey)
+            .where('date', '<=', toKey)
+            .orderBy('date', 'asc')
+            .limit(max)
+            .get();
+          return snap.docs.map((d) => hydrate(d.data() as Record<string, unknown>));
+        });
+        const chunks = await Promise.all(promises);
+        for (const c of chunks) out.push(...c);
+        return out;
+      }
 
-    const snap = await db()
-      .collection(COLLECTIONS.OFFER_REPORTS)
-      .where('date', '>=', fromKey)
-      .where('date', '<=', toKey)
-      .orderBy('date', 'asc')
-      .limit(max)
-      .get();
-    return snap.docs.map((d) => hydrate(d.data() as Record<string, unknown>));
+      const snap = await db()
+        .collection(COLLECTIONS.OFFER_REPORTS)
+        .where('date', '>=', fromKey)
+        .where('date', '<=', toKey)
+        .orderBy('date', 'asc')
+        .limit(max)
+        .get();
+      return snap.docs.map((d) => hydrate(d.data() as Record<string, unknown>));
+    });
   },
 };
 

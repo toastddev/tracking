@@ -1,6 +1,11 @@
 import { FieldValue, Timestamp } from 'firebase-admin/firestore';
 import { db } from '../config';
 import { COLLECTIONS } from '../schema';
+import { TTLCache } from '../../utils/ttlCache';
+
+// 60s read-through cache for fetchRange. Mirrors offerReportRepository — see
+// the comment there for the rationale.
+const fetchRangeCache = new TTLCache<CampaignReportDoc[]>({ ttlMs: 60_000, maxEntries: 128 });
 
 // Per-campaign daily rollup. Doc id = `{campaign_id}__{YYYY-MM-DD}` (UTC day).
 // `campaign_id` is sourced from the `gad_campaignid` URL param (Google Ads)
@@ -243,33 +248,39 @@ export const campaignReportRepository = {
     const fromKey = dayKeyUTC(opts.from);
     const toKey = dayKeyUTC(opts.to);
     const max = Math.max(1, Math.min(opts.max ?? 50_000, 200_000));
+    const idsKey = opts.campaign_ids && opts.campaign_ids.length > 0
+      ? [...opts.campaign_ids].sort().join(',')
+      : '';
+    const cacheKey = `${fromKey}|${toKey}|${max}|${idsKey}`;
 
-    if (opts.campaign_ids && opts.campaign_ids.length > 0) {
-      const out: CampaignReportDoc[] = [];
-      const promises = opts.campaign_ids.map(async (campaign_id) => {
-        const snap = await db()
-          .collection(COLLECTIONS.CAMPAIGN_REPORTS)
-          .where('campaign_id', '==', campaign_id)
-          .where('date', '>=', fromKey)
-          .where('date', '<=', toKey)
-          .orderBy('date', 'asc')
-          .limit(max)
-          .get();
-        return snap.docs.map((d) => hydrate(d.data() as Record<string, unknown>));
-      });
-      const chunks = await Promise.all(promises);
-      for (const c of chunks) out.push(...c);
-      return out;
-    }
+    return fetchRangeCache.getOrLoad(cacheKey, async () => {
+      if (opts.campaign_ids && opts.campaign_ids.length > 0) {
+        const out: CampaignReportDoc[] = [];
+        const promises = opts.campaign_ids.map(async (campaign_id) => {
+          const snap = await db()
+            .collection(COLLECTIONS.CAMPAIGN_REPORTS)
+            .where('campaign_id', '==', campaign_id)
+            .where('date', '>=', fromKey)
+            .where('date', '<=', toKey)
+            .orderBy('date', 'asc')
+            .limit(max)
+            .get();
+          return snap.docs.map((d) => hydrate(d.data() as Record<string, unknown>));
+        });
+        const chunks = await Promise.all(promises);
+        for (const c of chunks) out.push(...c);
+        return out;
+      }
 
-    const snap = await db()
-      .collection(COLLECTIONS.CAMPAIGN_REPORTS)
-      .where('date', '>=', fromKey)
-      .where('date', '<=', toKey)
-      .orderBy('date', 'asc')
-      .limit(max)
-      .get();
-    return snap.docs.map((d) => hydrate(d.data() as Record<string, unknown>));
+      const snap = await db()
+        .collection(COLLECTIONS.CAMPAIGN_REPORTS)
+        .where('date', '>=', fromKey)
+        .where('date', '<=', toKey)
+        .orderBy('date', 'asc')
+        .limit(max)
+        .get();
+      return snap.docs.map((d) => hydrate(d.data() as Record<string, unknown>));
+    });
   },
 
   // Convenience read for the detail page. Single campaign across the full
