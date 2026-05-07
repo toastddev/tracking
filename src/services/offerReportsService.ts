@@ -19,6 +19,12 @@ export interface OfferReportSummary {
   pending: number;
   rejected: number;
   revenue: number;
+  // Sub-totals for unknown-click rows on this offer's bucket. Always 0 for
+  // real offers (unknown-click rows can't be attributed to an offer); non-zero
+  // only on the synthetic offer_id='unknown' summary the dashboard renders
+  // as an "Unknown click" row.
+  unknown_click_conversions: number;
+  unknown_click_revenue: number;
   cvr: number;            // conversions / clicks
   epc: number;            // revenue / clicks
   rpm: number;            // revenue * 1000 / clicks
@@ -38,6 +44,8 @@ export interface OfferDailyPoint {
   postbacks: number;
   conversions: number;
   revenue: number;
+  unknown_click_conversions: number;
+  unknown_click_revenue: number;
 }
 
 export interface OfferReportsResponse {
@@ -52,6 +60,8 @@ export interface OfferReportsResponse {
     conversions: number;
     unverified: number;
     revenue: number;
+    unknown_click_conversions: number;
+    unknown_click_revenue: number;
     est_month_end_revenue: number;
   };
 }
@@ -147,6 +157,8 @@ export const offerReportsService = {
     let totalConv = 0;
     let totalUnv = 0;
     let totalRevenue = 0;
+    let totalUnknownClickConv = 0;
+    let totalUnknownClickRev = 0;
     let totalForecast = 0;
 
     for (const offer_id of offerIds) {
@@ -156,7 +168,10 @@ export const offerReportsService = {
       // Build day buckets so the series is dense (zeros included).
       const seriesMap = new Map<string, OfferDailyPoint>();
       for (const day of days) {
-        seriesMap.set(day, { date: day, clicks: 0, postbacks: 0, conversions: 0, revenue: 0 });
+        seriesMap.set(day, {
+          date: day, clicks: 0, postbacks: 0, conversions: 0, revenue: 0,
+          unknown_click_conversions: 0, unknown_click_revenue: 0,
+        });
       }
       let clicks = 0;
       let postbacks = 0;
@@ -166,6 +181,8 @@ export const offerReportsService = {
       let pending = 0;
       let rejected = 0;
       let revenue = 0;
+      let unknown_click_conversions = 0;
+      let unknown_click_revenue = 0;
       for (const r of offerRows) {
         clicks += r.clicks;
         postbacks += r.postbacks;
@@ -175,12 +192,16 @@ export const offerReportsService = {
         pending += r.pending;
         rejected += r.rejected;
         revenue += r.revenue;
+        unknown_click_conversions += r.unknown_click_conversions;
+        unknown_click_revenue += r.unknown_click_revenue;
         const point = seriesMap.get(r.date);
         if (point) {
           point.clicks += r.clicks;
           point.postbacks += r.postbacks;
           point.conversions += r.conversions;
           point.revenue += r.revenue;
+          point.unknown_click_conversions += r.unknown_click_conversions;
+          point.unknown_click_revenue += r.unknown_click_revenue;
         }
       }
 
@@ -191,7 +212,7 @@ export const offerReportsService = {
 
       summaries.push({
         offer_id,
-        offer_name: meta?.name,
+        offer_name: meta?.name ?? (offer_id === 'unknown' ? 'Unknown click' : undefined),
         status: meta?.status,
         clicks,
         postbacks,
@@ -201,6 +222,8 @@ export const offerReportsService = {
         pending,
         rejected,
         revenue,
+        unknown_click_conversions,
+        unknown_click_revenue,
         cvr: clicks > 0 ? conversions / clicks : 0,
         epc: clicks > 0 ? revenue / clicks : 0,
         rpm: clicks > 0 ? (revenue * 1000) / clicks : 0,
@@ -215,6 +238,8 @@ export const offerReportsService = {
       totalConv += conversions;
       totalUnv += unverified;
       totalRevenue += revenue;
+      totalUnknownClickConv += unknown_click_conversions;
+      totalUnknownClickRev += unknown_click_revenue;
       totalForecast += forecast;
     }
 
@@ -232,6 +257,8 @@ export const offerReportsService = {
         conversions: totalConv,
         unverified: totalUnv,
         revenue: totalRevenue,
+        unknown_click_conversions: totalUnknownClickConv,
+        unknown_click_revenue: totalUnknownClickRev,
         est_month_end_revenue: totalForecast,
       },
     };

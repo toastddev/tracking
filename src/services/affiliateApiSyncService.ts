@@ -15,6 +15,7 @@ import { __campaignFromExtra as extractCampaign } from './clickService';
 import { generateConversionId } from '../utils/idGenerator';
 import { googleAdsForwardingService } from './googleAdsForwardingService';
 import { eventDate } from './eventTime';
+import { retry } from '../utils/retry';
 import type {
   AffiliateApi,
   AffiliateApiAuthConfig,
@@ -341,7 +342,9 @@ export async function runAffiliateApi(api: AffiliateApi, opts: RunOptions): Prom
   // Buffer carries the click alongside the conversion so flush() can hand
   // it directly to the forwarder without a second Firestore read. Halves
   // per-item read cost vs. looking the click up twice.
-  const buffer: Array<{ conv: ConversionRecord; click: ClickRecord }> = [];
+  // `click` is null for unknown-click-id conversions — those still get
+  // persisted (verified=false) so they're audit-visible instead of vanishing.
+  const buffer: Array<{ conv: ConversionRecord; click: ClickRecord | null }> = [];
   // Accumulate Google Ads batch upload stats across all flush() calls.
   const gadsStats = { sent: 0, skipped: 0, failed: 0, errors: [] as string[] };
 
@@ -361,32 +364,46 @@ export async function runAffiliateApi(api: AffiliateApi, opts: RunOptions): Prom
 
       if (newBatch.length > 0) {
         // --- 1. Aggregation / Rollups ---
+        // Awaited with retry. Was fire-and-forget which lost ~10-15 conversions
+        // per day in production whenever a single bucket-write hit transient
+        // contention. The reconciliation scheduler still re-derives the rollup
+        // periodically as a safety net.
+        //
+        // Unknown-click rows are INCLUDED — they bucket under offer_id='unknown'
+        // and get tracked separately via unknown_click_conversions /
+        // unknown_click_revenue so the dashboard can call them out distinctly
+        // without polluting verified totals.
         const rollupRows = newBatch
-          .filter((b) => b.conv.offer_id && b.conv.verified)
+          .filter((b) => b.conv.offer_id) // every row gets a real or 'unknown' offer_id
           .map((b) => ({
             offer_id: b.conv.offer_id as string,
             network_id: b.conv.network_id,
             // Bucket on event-time (network_timestamp), not receipt-time —
             // this is the path that smears late pulls across days.
             at: eventDate(b.conv),
-            verified: true,
+            verified: !!b.conv.verified,
             status: b.conv.status,
             payout: b.conv.payout,
+            verification_reason: b.conv.verification_reason,
           }));
-        offerReportRepository.incrementConversionsBulk(rollupRows).catch((err: unknown) => {
-          logger.warn('offer_report_aff_api_rollup_failed', {
-            api_id: api.api_id,
-            error: err instanceof Error ? err.message : String(err),
-          });
-        });
+        if (rollupRows.length > 0) {
+          try {
+            await retry(() => offerReportRepository.incrementConversionsBulk(rollupRows));
+          } catch (err) {
+            logger.warn('offer_report_aff_api_rollup_failed', {
+              api_id: api.api_id,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
+        }
 
         // Same pattern for campaign_reports — derive campaign_id from each
         // conversion's click extra_params. Rows without a campaign tag are
         // dropped silently (they don't belong to any campaign).
         const campaignRollupRows = newBatch
-          .filter((b) => b.conv.offer_id && b.conv.verified)
+          .filter((b) => b.conv.offer_id && b.conv.verified && b.click)
           .map((b) => {
-            const c = extractCampaign(b.click.extra_params);
+            const c = extractCampaign(b.click!.extra_params);
             if (!c) return null;
             return {
               campaign_id: c.campaign_id,
@@ -400,12 +417,14 @@ export async function runAffiliateApi(api: AffiliateApi, opts: RunOptions): Prom
           })
           .filter((r): r is NonNullable<typeof r> => r !== null);
         if (campaignRollupRows.length > 0) {
-          campaignReportRepository.incrementConversionsBulk(campaignRollupRows).catch((err: unknown) => {
+          try {
+            await retry(() => campaignReportRepository.incrementConversionsBulk(campaignRollupRows));
+          } catch (err) {
             logger.warn('campaign_report_aff_api_rollup_failed', {
               api_id: api.api_id,
               error: err instanceof Error ? err.message : String(err),
             });
-          });
+          }
         }
 
         for (const { conv, click } of newBatch) {
@@ -423,16 +442,25 @@ export async function runAffiliateApi(api: AffiliateApi, opts: RunOptions): Prom
           });
         }
 
+        // Tally how many unknown-click rows landed in this flush so the run
+        // summary remains accurate ("we stored these but couldn't verify").
+        const unknownInBatch = newBatch.filter((b) => b.click === null).length;
+        if (unknownInBatch > 0) {
+          run.records_skipped_unknown_click =
+            (run.records_skipped_unknown_click ?? 0) + unknownInBatch;
+        }
+
         // --- 2. Google Ads Forwarding ---
         // Hand rows to Google Ads forwarder in a single batch call per
         // connection — dramatically reduces API calls vs one-by-one.
         // Restricting this to newBatch avoids redundantly sending duplicates.
-        const verifiedBatch = newBatch.filter((b) => b.conv.verified);
-        
+        // Filter out unknown-click rows (click===null): no gclid available.
+        const verifiedBatch = newBatch.filter((b) => b.conv.verified && b.click !== null);
+
         if (verifiedBatch.length > 0) {
           try {
             const gadsResult = await googleAdsForwardingService.dispatchConversionsBatch(
-              verifiedBatch.map((b) => ({ conversion: b.conv, click: b.click }))
+              verifiedBatch.map((b) => ({ conversion: b.conv, click: b.click! }))
             );
             gadsStats.sent += gadsResult.sent;
             gadsStats.skipped += gadsResult.skipped;
@@ -492,21 +520,22 @@ export async function runAffiliateApi(api: AffiliateApi, opts: RunOptions): Prom
 
         const conversion_id = deterministicConversionId(api.api_id, mapped.external_id);
 
-        // Click verification. Skip the row entirely if we don't recognise the
-        // click — keeps reports clean. Counted separately for visibility.
+        // Click verification. Persist the row either way: when click resolves
+        // it's a normal verified conversion; when not, store with verified=false
+        // so the postback log captures it (audit trail) and the rollup counts
+        // it as `unverified` instead of dropping silently. The
+        // records_skipped_unknown_click counter is incremented in flush() so
+        // it only includes truly-new rows (not duplicates from prior runs).
         // The repository's getById is cached so repeat lookups within a run
         // (same click hit twice) are free.
         const click = await clickRepository.getById(mapped.click_id);
-        if (!click) {
-          run.records_skipped_unknown_click = (run.records_skipped_unknown_click ?? 0) + 1;
-          continue;
-        }
+        const verified = click !== null;
 
         const conv: ConversionRecord = {
           conversion_id,
           network_id: api.network_id ?? api.api_id,
           click_id: mapped.click_id,
-          offer_id: click.offer_id,
+          offer_id: click?.offer_id ?? 'unknown',
           payout: mapped.payout,
           currency: mapped.currency,
           status: mapped.status ?? api.mapping.default_status ?? 'approved',
@@ -514,8 +543,8 @@ export async function runAffiliateApi(api: AffiliateApi, opts: RunOptions): Prom
           network_timestamp: mapped.network_timestamp,
           raw_payload: item as Record<string, unknown>,
           method: 'GET',
-          verified: true,
-          verification_reason: 'click_found',
+          verified,
+          verification_reason: verified ? 'click_found' : 'unknown_click_id',
           source: 'api',
           shadow: false,
           aff_api_id: api.api_id,

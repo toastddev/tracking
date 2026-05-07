@@ -22,6 +22,12 @@ import {
 // admin sees the trade-off.
 
 const PAGE = 1000;          // Firestore page size for streaming reads
+// Safety ceilings — protect against runaway costs if traffic spikes 100×
+// or if a manual call passes a wide window. Tunable via env so ops can raise
+// the cap deliberately for one-off historical rebuilds.
+const MAX_CLICKS_SCAN      = Number(process.env.OFFER_REPORTS_BACKFILL_MAX_CLICKS      ?? 500_000);
+const MAX_CONVERSIONS_SCAN = Number(process.env.OFFER_REPORTS_BACKFILL_MAX_CONVERSIONS ?? 200_000);
+const MAX_BUCKETS_FLUSH    = Number(process.env.OFFER_REPORTS_BACKFILL_MAX_BUCKETS     ?? 50_000);
 const STATUS_BUCKETS = ['approved', 'pending', 'rejected'] as const;
 type StatusBucket = (typeof STATUS_BUCKETS)[number];
 
@@ -37,6 +43,8 @@ interface Bucket {
   approved: number;
   pending: number;
   rejected: number;
+  unknown_click_conversions: number;
+  unknown_click_revenue: number;
 }
 
 function emptyBucket(offer_id: string, network_id: string, date: string): Bucket {
@@ -52,6 +60,8 @@ function emptyBucket(offer_id: string, network_id: string, date: string): Bucket
     approved: 0,
     pending: 0,
     rejected: 0,
+    unknown_click_conversions: 0,
+    unknown_click_revenue: 0,
   };
 }
 
@@ -89,6 +99,8 @@ export interface BackfillResult {
   conversions_scanned: number;
   buckets_written: number;
   duration_ms: number;
+  truncated?: boolean;       // true if any safety cap was hit
+  truncated_reason?: string;
 }
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -110,10 +122,21 @@ export const offerReportsBackfillService = {
 
     // ── 1. clicks ────────────────────────────────────────────────────
     let clicks_scanned = 0;
+    let truncated = false;
+    let truncated_reason: string | undefined;
     {
       let cursor: Date | null = null;
       // eslint-disable-next-line no-constant-condition
       while (true) {
+        if (clicks_scanned >= MAX_CLICKS_SCAN) {
+          truncated = true;
+          truncated_reason = `clicks_cap_reached (${MAX_CLICKS_SCAN})`;
+          logger.warn('offer_reports_backfill_clicks_cap_hit', {
+            scanned: clicks_scanned,
+            cap: MAX_CLICKS_SCAN,
+          });
+          break;
+        }
         let q: FirebaseFirestore.Query = db()
           .collection(COLLECTIONS.CLICKS)
           .where('created_at', '>=', from)
@@ -151,6 +174,15 @@ export const offerReportsBackfillService = {
       let cursor: Date | null = null;
       // eslint-disable-next-line no-constant-condition
       while (true) {
+        if (conversions_scanned >= MAX_CONVERSIONS_SCAN) {
+          truncated = true;
+          truncated_reason = `conversions_cap_reached (${MAX_CONVERSIONS_SCAN})`;
+          logger.warn('offer_reports_backfill_conversions_cap_hit', {
+            scanned: conversions_scanned,
+            cap: MAX_CONVERSIONS_SCAN,
+          });
+          break;
+        }
         let q: FirebaseFirestore.Query = db()
           .collection(COLLECTIONS.CONVERSIONS)
           .where('created_at', '>=', scanFrom)
@@ -165,16 +197,25 @@ export const offerReportsBackfillService = {
           // Skip shadow rows — those are audit-only postbacks for API-backed
           // networks and should not double-count against the API source.
           if (raw.shadow === true) continue;
-          const offer_id = (raw.offer_id as string | undefined) || 'unknown';
+          // Unknown-click rows are kept (bucketed under offer_id='unknown')
+          // so reports can show them tagged via unknown_click_* counters.
+          // Verified rows without an offer_id (very rare legacy bug) are
+          // dropped — there's nowhere sane to attribute them.
+          const verified = Boolean(raw.verified);
+          let offer_id = (raw.offer_id as string | undefined);
+          if (!offer_id) {
+            if (verified) continue;
+            offer_id = 'unknown';
+          }
           const at = tsToDate(raw.created_at);
           if (!at) continue;
           const eventAt = eventDateFromRaw(at, raw.network_timestamp);
           const eventDay = dayKeyUTC(eventAt);
           if (eventDay < fromDay || eventDay > toDay) continue;
-          const verified = Boolean(raw.verified);
           const payout = typeof raw.payout === 'number' ? (raw.payout as number) : 0;
           const status = raw.status as string | undefined;
           const network_id = (raw.network_id as string | undefined) || 'none';
+          const verification_reason = raw.verification_reason as string | undefined;
 
           const b = bucketFor(offer_id, network_id, eventDay);
           b.postbacks += 1;
@@ -184,6 +225,10 @@ export const offerReportsBackfillService = {
             b[statusBucket(status)] += 1;
           } else {
             b.unverified += 1;
+            if (verification_reason === 'unknown_click_id') {
+              b.unknown_click_conversions += 1;
+              if (Number.isFinite(payout)) b.unknown_click_revenue += payout;
+            }
           }
           conversions_scanned += 1;
         }
@@ -198,7 +243,15 @@ export const offerReportsBackfillService = {
     // the same totals; live increments racing with the backfill window may
     // be lost — see file-header note.
     let buckets_written = 0;
-    if (buckets.size > 0) {
+    if (buckets.size > MAX_BUCKETS_FLUSH) {
+      truncated = true;
+      truncated_reason = `bucket_cap_reached (${buckets.size}/${MAX_BUCKETS_FLUSH})`;
+      logger.warn('offer_reports_backfill_bucket_cap_hit', {
+        bucket_count: buckets.size,
+        cap: MAX_BUCKETS_FLUSH,
+      });
+    }
+    if (buckets.size > 0 && buckets.size <= MAX_BUCKETS_FLUSH) {
       const writer = db().bulkWriter();
       writer.onWriteError((err) => err.failedAttempts < 5);
       for (const b of buckets.values()) {
@@ -215,6 +268,8 @@ export const offerReportsBackfillService = {
           approved: b.approved,
           pending: b.pending,
           rejected: b.rejected,
+          unknown_click_conversions: b.unknown_click_conversions,
+          unknown_click_revenue: b.unknown_click_revenue,
           updated_at: FieldValue.serverTimestamp(),
           backfilled_at: FieldValue.serverTimestamp(),
         }).catch(() => { /* surfaced via onWriteError */ });
@@ -230,6 +285,7 @@ export const offerReportsBackfillService = {
       conversions_scanned,
       buckets_written,
       duration_ms: Date.now() - started,
+      ...(truncated ? { truncated, truncated_reason } : {}),
     };
     logger.info('offer_reports_backfill_completed', { ...result });
     return result;

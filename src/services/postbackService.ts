@@ -12,6 +12,7 @@ import { __campaignFromExtra as extractCampaign } from './clickService';
 import { networkService } from './networkService';
 import { googleAdsForwardingService } from './googleAdsForwardingService';
 import { eventDate } from './eventTime';
+import { retry } from '../utils/retry';
 import type { ConversionRecord, Network, VerificationReason } from '../types';
 
 export interface PostbackInput {
@@ -138,26 +139,37 @@ export const postbackService = {
 
     // Roll-up into offer_reports. Skip shadow rows — those are audit-only
     // (the affiliate API pull is the source of truth and rolls up its own
-    // increments). Unverified rows still increment postbacks/unverified so
-    // the offer report mirrors the postback log.
+    // increments).
+    //
+    // Unknown-click rows are INCLUDED here so reports can show them tagged
+    // distinctly: they roll up under offer_id='unknown' and bump the new
+    // unknown_click_conversions / unknown_click_revenue counters (in addition
+    // to the legacy `unverified` counter). Verified totals stay clean.
+    //
+    // Awaited (was fire-and-forget). The reconciliation scheduler that runs
+    // every 30 min would re-derive correct totals from raw conversions even
+    // if this fails, but persisting in real-time keeps the dashboard fresh.
     if (!shadow) {
       const offerForReport = click?.offer_id || 'unknown';
-      offerReportRepository
-        .incrementConversion({
-          offer_id: offerForReport,
-          network_id: conv.network_id,
-          at: eventDate(conv),
-          verified: conv.verified,
-          status: conv.status,
-          payout: conv.payout,
-        })
-        .catch((err: unknown) => {
-          logger.warn('offer_report_conversion_increment_failed', {
-            network_id: conv.network_id,
+      try {
+        await retry(() =>
+          offerReportRepository.incrementConversion({
             offer_id: offerForReport,
-            error: err instanceof Error ? err.message : String(err),
-          });
+            network_id: conv.network_id,
+            at: eventDate(conv),
+            verified: conv.verified,
+            status: conv.status,
+            payout: conv.payout,
+            verification_reason: conv.verification_reason,
+          }),
+        );
+      } catch (err) {
+        logger.warn('offer_report_conversion_increment_failed', {
+          network_id: conv.network_id,
+          offer_id: offerForReport,
+          error: err instanceof Error ? err.message : String(err),
         });
+      }
 
       drilldownRepository.incrementOfferConversion(conv, click || null).catch((err: unknown) => {
         logger.warn('drilldown_offer_conversion_increment_failed', {

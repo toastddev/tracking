@@ -9,11 +9,13 @@ import { integrationsRoutes } from './routes/integrations';
 import { initFirestore } from './firestore';
 import { logger } from './utils/logger';
 import { affiliateApiScheduler } from './services/affiliateApiScheduler';
+import { offerReportsReconciliationScheduler } from './services/offerReportsReconciliationScheduler';
 
 try {
   initFirestore();
   logger.info('firestore_ready');
   affiliateApiScheduler.start();
+  offerReportsReconciliationScheduler.start();
 } catch (err) {
   logger.warn('firestore_init_skipped', {
     error: err instanceof Error ? err.message : String(err),
@@ -71,6 +73,7 @@ for (const sig of ['SIGTERM', 'SIGINT'] as const) {
   process.on(sig, () => {
     logger.info('shutdown_signal', { signal: sig });
     affiliateApiScheduler.stop();
+    offerReportsReconciliationScheduler.stop();
     server.close(() => process.exit(0));
   });
 }

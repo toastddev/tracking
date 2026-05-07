@@ -27,6 +27,15 @@ export interface OfferReportDoc {
   approved: number;      // verified with status approved
   pending: number;       // verified with status pending
   rejected: number;      // verified with status rejected
+  // Unknown-click rows (verification_reason='unknown_click_id') are kept
+  // SEPARATE from the verified totals so reports can show "we received N
+  // conversions worth $X but couldn't attribute the click". They're a subset
+  // of the row's `unverified` count — every unknown_click_conversions row is
+  // also counted in `unverified` and `postbacks`, but NOT in `conversions`
+  // or `revenue`. The synthetic offer_id='unknown' bucket holds rows whose
+  // click_id never resolved to a real click.
+  unknown_click_conversions: number;
+  unknown_click_revenue: number;
   unique_aff_ids?: number; // approximate distinct aff_ids (best-effort, not strict)
   updated_at?: string;
 }
@@ -61,6 +70,10 @@ export interface IncrementConversionInput {
   verified: boolean;
   status?: string;
   payout?: number;
+  // When 'unknown_click_id', the row is counted toward
+  // unknown_click_conversions / unknown_click_revenue (in addition to the
+  // existing `unverified` counter) so reports can call it out distinctly.
+  verification_reason?: 'click_found' | 'unknown_click_id';
 }
 
 export interface OfferReportRangeOptions {
@@ -109,6 +122,12 @@ export const offerReportRepository = {
       patch[bucket] = FieldValue.increment(1);
     } else {
       patch.unverified = FieldValue.increment(1);
+      if (input.verification_reason === 'unknown_click_id') {
+        patch.unknown_click_conversions = FieldValue.increment(1);
+        if (typeof input.payout === 'number' && Number.isFinite(input.payout)) {
+          patch.unknown_click_revenue = FieldValue.increment(input.payout);
+        }
+      }
     }
     await ref.set(patch, { merge: true });
   },
@@ -129,6 +148,8 @@ export const offerReportRepository = {
       approved: number;
       pending: number;
       rejected: number;
+      unknown_click_conversions: number;
+      unknown_click_revenue: number;
     };
     const buckets = new Map<string, Bucket>();
     for (const r of rows) {
@@ -148,6 +169,8 @@ export const offerReportRepository = {
           approved: 0,
           pending: 0,
           rejected: 0,
+          unknown_click_conversions: 0,
+          unknown_click_revenue: 0,
         };
         buckets.set(key, b);
       }
@@ -159,6 +182,10 @@ export const offerReportRepository = {
         b[sb] += 1;
       } else {
         b.unverified += 1;
+        if (r.verification_reason === 'unknown_click_id') {
+          b.unknown_click_conversions += 1;
+          if (typeof r.payout === 'number' && Number.isFinite(r.payout)) b.unknown_click_revenue += r.payout;
+        }
       }
     }
 
@@ -178,6 +205,8 @@ export const offerReportRepository = {
       if (b.approved) patch.approved = FieldValue.increment(b.approved);
       if (b.pending) patch.pending = FieldValue.increment(b.pending);
       if (b.rejected) patch.rejected = FieldValue.increment(b.rejected);
+      if (b.unknown_click_conversions) patch.unknown_click_conversions = FieldValue.increment(b.unknown_click_conversions);
+      if (b.unknown_click_revenue) patch.unknown_click_revenue = FieldValue.increment(b.unknown_click_revenue);
       writer.set(ref, patch, { merge: true }).catch(() => { /* surfaced via onWriteError */ });
     }
     writer.onWriteError((err) => err.failedAttempts < 5);
@@ -242,6 +271,8 @@ function hydrate(raw: Record<string, unknown>): OfferReportDoc {
     approved: numOr0(raw.approved),
     pending: numOr0(raw.pending),
     rejected: numOr0(raw.rejected),
+    unknown_click_conversions: numOr0(raw.unknown_click_conversions),
+    unknown_click_revenue: numOr0(raw.unknown_click_revenue),
     updated_at:
       raw.updated_at instanceof Timestamp
         ? (raw.updated_at as Timestamp).toDate().toISOString()

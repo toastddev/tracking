@@ -15,6 +15,11 @@ export interface ReportSummary {
   conversions: number;     // verified only
   unverified: number;      // postbacks - conversions
   revenue: number;         // sum of payout across verified conversions
+  // Unknown-click sub-totals — surfaced separately so the dashboard can show
+  // "we received N more conversions worth $X but couldn't attribute the click".
+  // Already counted inside `unverified`; NOT counted in `conversions` or `revenue`.
+  unknown_click_conversions: number;
+  unknown_click_revenue: number;
   cvr: number;             // conversions / clicks
   epc: number;             // revenue / clicks
 }
@@ -25,6 +30,8 @@ export interface TimeseriesPoint {
   postbacks: number;
   conversions: number;
   revenue: number;
+  unknown_click_conversions: number;
+  unknown_click_revenue: number;
 }
 
 export interface ReportOverview {
@@ -56,13 +63,18 @@ async function loadAndReduce(f: ReportFilters): Promise<ReportOverview> {
 
   const buckets = new Map<string, TimeseriesPoint>();
   for (const day of eachDayUTC(f.from, f.to)) {
-    buckets.set(day, { date: day, clicks: 0, postbacks: 0, conversions: 0, revenue: 0 });
+    buckets.set(day, {
+      date: day, clicks: 0, postbacks: 0, conversions: 0, revenue: 0,
+      unknown_click_conversions: 0, unknown_click_revenue: 0,
+    });
   }
 
   let clicks = 0;
   let postbacks = 0;
   let conversions = 0;
   let revenue = 0;
+  let unknown_click_conversions = 0;
+  let unknown_click_revenue = 0;
 
   for (const r of rollupDocs) {
     // Clicks are stored under network_id = 'none'; they apply regardless of
@@ -76,6 +88,8 @@ async function loadAndReduce(f: ReportFilters): Promise<ReportOverview> {
       postbacks += r.postbacks;
       conversions += r.conversions;
       revenue += r.revenue;
+      unknown_click_conversions += r.unknown_click_conversions;
+      unknown_click_revenue += r.unknown_click_revenue;
     }
 
     const b = buckets.get(r.date);
@@ -87,6 +101,8 @@ async function loadAndReduce(f: ReportFilters): Promise<ReportOverview> {
       b.postbacks += r.postbacks;
       b.conversions += r.conversions;
       b.revenue += r.revenue;
+      b.unknown_click_conversions += r.unknown_click_conversions;
+      b.unknown_click_revenue += r.unknown_click_revenue;
     }
   }
 
@@ -98,6 +114,8 @@ async function loadAndReduce(f: ReportFilters): Promise<ReportOverview> {
     conversions,
     unverified: Math.max(0, postbacks - conversions),
     revenue,
+    unknown_click_conversions,
+    unknown_click_revenue,
     cvr: clicks > 0 ? conversions / clicks : 0,
     epc: clicks > 0 ? revenue / clicks : 0,
   };
