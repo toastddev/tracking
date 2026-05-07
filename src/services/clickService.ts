@@ -8,6 +8,7 @@ import {
   campaignReportRepository,
 } from '../firestore';
 import { googleAdsForwardingService } from './googleAdsForwardingService';
+import { retry } from '../utils/retry';
 import type { AdIds, ClickRecord, Offer } from '../types';
 
 // Pull a campaign id off the click's extra_params. `gad_campaignid` is the
@@ -80,10 +81,13 @@ export const clickService = {
   },
 
   // Fire-and-forget. Requirement: redirect must be fast and never block on the
-  // DB write. Persist failures are logged and swallowed — the user has already
-  // been redirected by the time this rejects.
+  // DB write. Each side-effect runs through `retry()` so a transient Firestore
+  // error gets up to 3 attempts (~700ms total) BEFORE it gets logged and
+  // swallowed. The retry runs detached from the redirect — no added latency on
+  // the user-visible path. The reconciliation scheduler is the long-tail
+  // safety net if all retries fail.
   persistAsync(click: ClickRecord): void {
-    clickRepository.insert(click).catch((err: unknown) => {
+    retry(() => clickRepository.insert(click)).catch((err: unknown) => {
       logger.error('click_persist_failed', {
         click_id: click.click_id,
         offer_id: click.offer_id,
@@ -92,19 +96,21 @@ export const clickService = {
     });
 
     // Roll-up into the TTL-safe offer_reports collection so historical
-    // reporting survives the 90-day click TTL. Independent of the raw insert
-    // — failure here is logged but never blocks the redirect path.
-    offerReportRepository
-      .incrementClick({ offer_id: click.offer_id, at: new Date(click.created_at) })
-      .catch((err: unknown) => {
-        logger.warn('offer_report_click_increment_failed', {
-          click_id: click.click_id,
-          offer_id: click.offer_id,
-          error: err instanceof Error ? err.message : String(err),
-        });
+    // reporting survives the 90-day click TTL.
+    retry(() =>
+      offerReportRepository.incrementClick({
+        offer_id: click.offer_id,
+        at: new Date(click.created_at),
+      })
+    ).catch((err: unknown) => {
+      logger.warn('offer_report_click_increment_failed', {
+        click_id: click.click_id,
+        offer_id: click.offer_id,
+        error: err instanceof Error ? err.message : String(err),
       });
+    });
 
-    drilldownRepository.incrementOfferClick(click).catch((err: unknown) => {
+    retry(() => drilldownRepository.incrementOfferClick(click)).catch((err: unknown) => {
       logger.warn('drilldown_offer_click_increment_failed', {
         click_id: click.click_id,
         error: err instanceof Error ? err.message : String(err),
@@ -113,15 +119,17 @@ export const clickService = {
 
     // Campaign rollup. Fed only when the click carries a Google Ads campaign
     // id or a utm_campaign tag — non-tagged organic traffic doesn't produce
-    // a campaign row. Same fire-and-forget contract as the offer rollup.
+    // a campaign row.
     const campaign = extractCampaign(click.extra_params);
     if (campaign) {
-      campaignReportRepository.incrementClick({
-        campaign_id: campaign.campaign_id,
-        source: campaign.source,
-        at: new Date(click.created_at),
-        offer_id: click.offer_id,
-      }).catch((err: unknown) => {
+      retry(() =>
+        campaignReportRepository.incrementClick({
+          campaign_id: campaign.campaign_id,
+          source: campaign.source,
+          at: new Date(click.created_at),
+          offer_id: click.offer_id,
+        })
+      ).catch((err: unknown) => {
         logger.warn('campaign_report_click_increment_failed', {
           click_id: click.click_id,
           campaign_id: campaign.campaign_id,

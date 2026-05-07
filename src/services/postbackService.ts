@@ -171,14 +171,14 @@ export const postbackService = {
         });
       }
 
-      drilldownRepository.incrementOfferConversion(conv, click || null).catch((err: unknown) => {
+      retry(() => drilldownRepository.incrementOfferConversion(conv, click || null)).catch((err: unknown) => {
         logger.warn('drilldown_offer_conversion_increment_failed', {
           conversion_id: conv.conversion_id,
           error: err instanceof Error ? err.message : String(err),
         });
       });
 
-      drilldownRepository.incrementPostback(conv).catch((err: unknown) => {
+      retry(() => drilldownRepository.incrementPostback(conv)).catch((err: unknown) => {
         logger.warn('drilldown_postback_increment_failed', {
           conversion_id: conv.conversion_id,
           error: err instanceof Error ? err.message : String(err),
@@ -190,15 +190,17 @@ export const postbackService = {
       // campaign, so they're skipped entirely.
       const campaign = click ? extractCampaign(click.extra_params) : null;
       if (campaign) {
-        campaignReportRepository.incrementConversion({
-          campaign_id: campaign.campaign_id,
-          source: campaign.source,
-          at: eventDate(conv),
-          verified: conv.verified,
-          status: conv.status,
-          payout: conv.payout,
-          offer_id: conv.offer_id,
-        }).catch((err: unknown) => {
+        retry(() =>
+          campaignReportRepository.incrementConversion({
+            campaign_id: campaign.campaign_id,
+            source: campaign.source,
+            at: eventDate(conv),
+            verified: conv.verified,
+            status: conv.status,
+            payout: conv.payout,
+            offer_id: conv.offer_id,
+          })
+        ).catch((err: unknown) => {
           logger.warn('campaign_report_conversion_increment_failed', {
             conversion_id: conv.conversion_id,
             campaign_id: campaign.campaign_id,

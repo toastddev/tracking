@@ -35,12 +35,23 @@
 import { offerReportsBackfillService } from './offerReportsBackfillService';
 import { logger } from '../utils/logger';
 
-// Defaults sized for the current low traffic — fast heal, near-zero bill.
-// Override via env if traffic grows or you spin up many Cloud Run instances.
-const FAST_INTERVAL_MS = Number(process.env.OFFER_REPORTS_RECON_FAST_MS ?? 30 * 60_000);   // 30 min
-const SLOW_INTERVAL_MS = Number(process.env.OFFER_REPORTS_RECON_SLOW_MS ?? 24 * 60 * 60_000); // 24 h
+// Defaults are deliberately conservative because the hot path now has
+// `retry()` on every write — drift is rare, so the reconciler is a backstop,
+// not the primary mechanism. At ~600 clicks/day + ~200 conversions/day these
+// settings cost ≈ $0.30/month; the SLOW tick alone heals anything FAST misses.
+//
+// Cadence trade-off:
+//   FAST every 1h × 6h lookback → drift in last 6h heals within 1h (fast),
+//                                  drift older than 6h waits for SLOW.
+//   SLOW every 12h × 7d lookback → twice-daily safety net for the long tail.
+//
+// Override these via env if traffic grows or your reporting needs are tighter:
+//   OFFER_REPORTS_RECON_FAST_MS=1800000  (30 min — old default)
+//   OFFER_REPORTS_RECON_FAST_LOOKBACK_MS=86400000  (24h)
+const FAST_INTERVAL_MS = Number(process.env.OFFER_REPORTS_RECON_FAST_MS ?? 60 * 60_000);   // 1 h
+const SLOW_INTERVAL_MS = Number(process.env.OFFER_REPORTS_RECON_SLOW_MS ?? 12 * 60 * 60_000); // 12 h
 
-const FAST_LOOKBACK_MS = Number(process.env.OFFER_REPORTS_RECON_FAST_LOOKBACK_MS ?? 24 * 60 * 60_000); // last 24 h
+const FAST_LOOKBACK_MS = Number(process.env.OFFER_REPORTS_RECON_FAST_LOOKBACK_MS ?? 6 * 60 * 60_000); // last 6 h
 const SLOW_LOOKBACK_MS = Number(process.env.OFFER_REPORTS_RECON_SLOW_LOOKBACK_MS ?? 7 * 24 * 60 * 60_000); // last 7 d
 
 // Cap on a single tick's wallclock duration. If a tick is still running at the
