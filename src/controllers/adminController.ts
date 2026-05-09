@@ -739,6 +739,10 @@ export const adminController = {
 const MAX_RANGE_DAYS = 180;
 const DAY_MS = 24 * 60 * 60 * 1000;
 
+function startOfUtcMonth(d: Date): Date {
+  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1));
+}
+
 type FilterParseResult =
   | { ok: true; filters: { from: Date; to: Date; offer_id?: string; network_id?: string } }
   | { ok: false; error: string };
@@ -746,8 +750,8 @@ type FilterParseResult =
 function parseReportFilters(c: Context): FilterParseResult {
   const now = new Date();
   const to = parseDate(c.req.query('to')) ?? now;
-  // Default: last 30 days.
-  const defaultFrom = new Date(to.getTime() - 30 * DAY_MS);
+  // Default: current UTC calendar month, matching the dashboard preset.
+  const defaultFrom = startOfUtcMonth(to);
   const from = parseDate(c.req.query('from')) ?? defaultFrom;
 
   if (from.getTime() > to.getTime()) return { ok: false, error: 'from_after_to' };

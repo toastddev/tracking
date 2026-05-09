@@ -9,28 +9,28 @@ import {
   BACKFILL_SCAN_PAD_AFTER_MS,
 } from './eventTime';
 
-// Reconstructs the campaign_reports rollup from the source clicks +
-// conversions collections. Idempotent — each run computes totals locally and
-// writes them with `set({...}, { merge: true })`. The merge intentionally
-// omits the operator-entered `spend` and `campaign_name` fields so a rebuild
-// never overwrites manually entered ad-spend or display names.
+// Reconstructs conversion-side fields in campaign_reports from source
+// conversions. Click counts are intentionally not recalculated here: they are
+// only incremented from the /click redirect path. The merge intentionally
+// omits click counts, operator-entered `spend`, and `campaign_name`.
 //
-// Scope: clicks/conversions whose created_at falls in [from, to]. The default
-// window is the last 120 days (covers the 90-day TTL ceiling with a buffer).
+// Scope: all UTC days touched by [from, to]. The default window is the last
+// 120 days (covers the 90-day TTL ceiling with a buffer).
 //
-// Click → campaign mapping: every click carries its own extra_params, so the
-// click pass is direct. Conversions only carry click_id; we resolve their
+// Click -> campaign mapping: every click carries its own extra_params, so the
+// metadata pass is direct. Conversions only carry click_id; we resolve their
 // campaign by looking the click up in the in-memory map first, then falling
 // back to a single Firestore read per miss (capped — see CONVERSION_LOOKUP_CAP).
 //
-// Concurrency: live writes via clickService/postbackService also touch the
-// rollup. Running this during low-traffic windows is recommended — any click
-// or conversion that lands while the backfill is computing may be lost when
-// the backfill writes the bucket. The operator-entered `spend` field is
-// preserved across reruns thanks to the merge strategy above.
+// Concurrency: live writes via postbackService/API sync also touch the
+// conversion fields. Running this during low-traffic windows is recommended:
+// a conversion that lands while the backfill is computing may be overwritten
+// until the next reconciliation tick.
 
 const PAGE = 1000;
 const CONVERSION_LOOKUP_CAP = 5000;
+const MAX_CONVERSIONS_SCAN = Number(process.env.CAMPAIGN_REPORTS_BACKFILL_MAX_CONVERSIONS ?? 200_000);
+const MAX_BUCKETS_FLUSH = Number(process.env.CAMPAIGN_REPORTS_BACKFILL_MAX_BUCKETS ?? 50_000);
 const STATUS_BUCKETS = ['approved', 'pending', 'rejected'] as const;
 type StatusBucket = (typeof STATUS_BUCKETS)[number];
 type CampaignSource = 'gad_campaignid' | 'utm_campaign';
@@ -39,7 +39,6 @@ interface Bucket {
   campaign_id: string;
   source: CampaignSource;
   date: string;
-  clicks: number;
   postbacks: number;
   conversions: number;
   unverified: number;
@@ -61,7 +60,6 @@ function emptyBucket(campaign_id: string, source: CampaignSource, date: string):
     campaign_id,
     source,
     date,
-    clicks: 0,
     postbacks: 0,
     conversions: 0,
     unverified: 0,
@@ -75,6 +73,14 @@ function emptyBucket(campaign_id: string, source: CampaignSource, date: string):
 
 function dayKeyUTC(d: Date): string {
   return d.toISOString().slice(0, 10);
+}
+
+function startOfUtcDay(d: Date): Date {
+  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
+}
+
+function endOfUtcDay(d: Date): Date {
+  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + 1) - 1);
 }
 
 function statusBucket(status: string | undefined): StatusBucket {
@@ -122,12 +128,17 @@ export interface CampaignBackfillResult {
   from: string;
   to: string;
   clicks_scanned: number;
+  clicks_untouched: true;
+  click_metadata_scanned: number;
   clicks_with_campaign: number;
+  existing_buckets_scanned: number;
   conversions_scanned: number;
   conversions_with_campaign: number;
   conversions_orphan_lookups: number;
   buckets_written: number;
   duration_ms: number;
+  truncated?: boolean;
+  truncated_reason?: string;
   campaign_spends?: Array<{
     campaign_id: string;
     campaign_name: string;
@@ -140,13 +151,23 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 export const campaignReportsBackfillService = {
   async rebuild(opts: CampaignBackfillOptions = {}): Promise<CampaignBackfillResult> {
     const started = Date.now();
-    const to = opts.to ?? new Date();
-    const from = opts.from ?? new Date(to.getTime() - 120 * DAY_MS);
+    const requestedTo = opts.to ?? new Date();
+    const requestedFrom = opts.from ?? new Date(requestedTo.getTime() - 120 * DAY_MS);
+
+    // Campaign docs are daily rollups. Rebuild whole UTC days so a short
+    // reconciliation window cannot overwrite conversion fields with only a
+    // partial-day view.
+    const from = startOfUtcDay(requestedFrom);
+    const to = endOfUtcDay(requestedTo);
     logger.info('campaign_reports_backfill_started', {
+      requested_from: requestedFrom.toISOString(),
+      requested_to: requestedTo.toISOString(),
       from: from.toISOString(),
       to: to.toISOString(),
     });
 
+    const fromDay = dayKeyUTC(from);
+    const toDay = dayKeyUTC(to);
     const buckets = new Map<string, Bucket>();
     const bucketFor = (campaign_id: string, source: CampaignSource, date: string): Bucket => {
       const key = `${campaign_id}__${date}`;
@@ -162,9 +183,51 @@ export const campaignReportsBackfillService = {
     // current scale is fine.
     const clickMeta = new Map<string, ClickMeta>();
 
-    // ── 1. clicks ────────────────────────────────────────────────────
-    let clicks_scanned = 0;
+    // ── 1. existing daily docs + click metadata ──────────────────────
+    // Existing docs seed zeroed conversion buckets while preserving click
+    // counts and manually-entered spend. The click scan below only builds
+    // click_id -> campaign metadata for conversion attribution; it never
+    // increments or rewrites click counters.
+    const clicks_scanned = 0;
+    let click_metadata_scanned = 0;
     let clicks_with_campaign = 0;
+    let existing_buckets_scanned = 0;
+    let truncated = false;
+    let truncated_reason: string | undefined;
+    {
+      const snap = await db()
+        .collection(COLLECTIONS.CAMPAIGN_REPORTS)
+        .where('date', '>=', fromDay)
+        .where('date', '<=', toDay)
+        .orderBy('date', 'asc')
+        .limit(MAX_BUCKETS_FLUSH + 1)
+        .get();
+      existing_buckets_scanned = snap.size;
+      if (snap.size > MAX_BUCKETS_FLUSH) {
+        truncated = true;
+        truncated_reason = `bucket_cap_reached (${snap.size}/${MAX_BUCKETS_FLUSH})`;
+        logger.warn('campaign_reports_backfill_existing_bucket_cap_hit', {
+          bucket_count: snap.size,
+          cap: MAX_BUCKETS_FLUSH,
+        });
+      } else {
+        for (const d of snap.docs) {
+          const raw = d.data() as Record<string, unknown>;
+          const campaign_id = String(raw.campaign_id ?? '').trim();
+          const sourceRaw = String(raw.source ?? 'gad_campaignid');
+          const source: CampaignSource = sourceRaw === 'utm_campaign' ? 'utm_campaign' : 'gad_campaignid';
+          const date = String(raw.date ?? '').trim();
+          if (!campaign_id || !date) continue;
+          const b = bucketFor(campaign_id, source, date);
+          if (Array.isArray(raw.offers)) {
+            for (const offer of raw.offers) {
+              const offerId = String(offer ?? '').trim();
+              if (offerId) b.offers.add(offerId);
+            }
+          }
+        }
+      }
+    }
     {
       let cursor: Date | null = null;
       // eslint-disable-next-line no-constant-condition
@@ -183,7 +246,7 @@ export const campaignReportsBackfillService = {
           const at = tsToDate(raw.created_at);
           const offer_id = String(raw.offer_id ?? '');
           if (!at || !offer_id) continue;
-          clicks_scanned += 1;
+          click_metadata_scanned += 1;
           const campaign = extractCampaign(raw.extra_params);
           if (!campaign) continue;
           clicks_with_campaign += 1;
@@ -193,9 +256,6 @@ export const campaignReportsBackfillService = {
             source: campaign.source,
             offer_id,
           });
-          const bucket = bucketFor(campaign.campaign_id, campaign.source, dayKeyUTC(at));
-          bucket.clicks += 1;
-          bucket.offers.add(offer_id);
         }
         const last = snap.docs[snap.docs.length - 1]!;
         cursor = tsToDate((last.data() as Record<string, unknown>).created_at);
@@ -213,11 +273,18 @@ export const campaignReportsBackfillService = {
     {
       const scanFrom = new Date(from.getTime() - BACKFILL_SCAN_PAD_BEFORE_MS);
       const scanTo = new Date(to.getTime() + BACKFILL_SCAN_PAD_AFTER_MS);
-      const fromDay = dayKeyUTC(from);
-      const toDay = dayKeyUTC(to);
       let cursor: Date | null = null;
       // eslint-disable-next-line no-constant-condition
       while (true) {
+        if (conversions_scanned >= MAX_CONVERSIONS_SCAN) {
+          truncated = true;
+          truncated_reason = `conversions_cap_reached (${MAX_CONVERSIONS_SCAN})`;
+          logger.warn('campaign_reports_backfill_conversions_cap_hit', {
+            scanned: conversions_scanned,
+            cap: MAX_CONVERSIONS_SCAN,
+          });
+          break;
+        }
         let q: FirebaseFirestore.Query = db()
           .collection(COLLECTIONS.CONVERSIONS)
           .where('created_at', '>=', scanFrom)
@@ -292,11 +359,18 @@ export const campaignReportsBackfillService = {
     }
 
     // ── 3. flush ─────────────────────────────────────────────────────
-    // Merge-write so operator-entered `spend` and `campaign_name` survive a
-    // rebuild. Note: this overwrites any concurrent hot-path increment —
-    // re-running during low traffic is recommended.
+    // Merge-write conversion fields only so click counters, operator-entered
+    // spend, and campaign names survive a rebuild.
     let buckets_written = 0;
-    if (buckets.size > 0) {
+    if (buckets.size > MAX_BUCKETS_FLUSH) {
+      truncated = true;
+      truncated_reason = `bucket_cap_reached (${buckets.size}/${MAX_BUCKETS_FLUSH})`;
+      logger.warn('campaign_reports_backfill_bucket_cap_hit', {
+        bucket_count: buckets.size,
+        cap: MAX_BUCKETS_FLUSH,
+      });
+    }
+    if (!truncated && buckets.size > 0) {
       const writer = db().bulkWriter();
       writer.onWriteError((err) => err.failedAttempts < 5);
       for (const b of buckets.values()) {
@@ -305,7 +379,6 @@ export const campaignReportsBackfillService = {
           campaign_id: b.campaign_id,
           source: b.source,
           date: b.date,
-          clicks: b.clicks,
           postbacks: b.postbacks,
           conversions: b.conversions,
           unverified: b.unverified,
@@ -316,8 +389,8 @@ export const campaignReportsBackfillService = {
           offers: Array.from(b.offers),
           updated_at: FieldValue.serverTimestamp(),
           backfilled_at: FieldValue.serverTimestamp(),
-          // NOTE: deliberately omitting `spend` and `campaign_name` — the
-          // merge keeps whatever the operator entered.
+          // NOTE: deliberately omitting `clicks`, `spend`, and
+          // `campaign_name` — the merge keeps the canonical values.
         }, { merge: true }).catch(() => { /* surfaced via onWriteError */ });
         buckets_written += 1;
       }
@@ -354,12 +427,16 @@ export const campaignReportsBackfillService = {
       from: from.toISOString(),
       to: to.toISOString(),
       clicks_scanned,
+      clicks_untouched: true,
+      click_metadata_scanned,
       clicks_with_campaign,
+      existing_buckets_scanned,
       conversions_scanned,
       conversions_with_campaign,
       conversions_orphan_lookups: orphan_lookups,
       buckets_written,
       duration_ms: Date.now() - started,
+      ...(truncated ? { truncated, truncated_reason } : {}),
       campaign_spends,
     };
     logger.info('campaign_reports_backfill_completed', { ...result, campaign_spends: undefined });

@@ -46,3 +46,27 @@ export function toUsd(amount: number, currency: string | undefined): number | nu
   if (!rate || rate <= 0) return null;
   return amount / rate;
 }
+
+// Convert between any two configured currencies. Rates are stored as
+// `<currency units per USD>`, so conversion goes through USD as the pivot.
+export function convertCurrency(
+  amount: number,
+  fromCurrency: string | undefined,
+  toCurrency: string | undefined,
+): { amount: number; currency: string } | null {
+  const from = (fromCurrency || 'USD').toUpperCase().trim();
+  const to = (toCurrency || from || 'USD').toUpperCase().trim();
+  if (!Number.isFinite(amount)) return null;
+  if (from === to) return { amount, currency: to };
+
+  const rates = fxRates();
+  const fromRate = from === 'USD' ? 1 : rates[from];
+  const toRate = to === 'USD' ? 1 : rates[to];
+  if (!fromRate || fromRate <= 0 || !toRate || toRate <= 0) return null;
+
+  const usd = amount / fromRate;
+  return {
+    amount: Number((usd * toRate).toFixed(6)),
+    currency: to,
+  };
+}

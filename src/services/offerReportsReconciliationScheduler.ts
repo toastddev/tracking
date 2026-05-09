@@ -33,17 +33,17 @@
 //   set OFFER_REPORTS_RECON_DISABLED=1 on all but one instance.
 
 import { offerReportsBackfillService } from './offerReportsBackfillService';
+import { campaignReportsBackfillService } from './campaignReportsBackfillService';
 import { logger } from '../utils/logger';
 
 // Defaults are deliberately conservative because the hot path now has
-// `retry()` on every write — drift is rare, so the reconciler is a backstop,
-// not the primary mechanism. At ~600 clicks/day + ~200 conversions/day these
-// settings cost ≈ $0.30/month; the SLOW tick alone heals anything FAST misses.
+// `retry()` on every write. The reconciler is a conversion/revenue backstop:
+// it never recalculates click counts from raw clicks.
 //
 // Cadence trade-off:
-//   FAST every 1h × 6h lookback → drift in last 6h heals within 1h (fast),
-//                                  drift older than 6h waits for SLOW.
-//   SLOW every 12h × 7d lookback → twice-daily safety net for the long tail.
+//   FAST every 1h x 24h lookback -> rebuilds the full UTC days touched by the
+//                                   last 24h, usually today + yesterday.
+//   SLOW every 12h x 7d lookback -> twice-daily safety net for the long tail.
 //
 // Override these via env if traffic grows or your reporting needs are tighter:
 //   OFFER_REPORTS_RECON_FAST_MS=1800000  (30 min — old default)
@@ -51,7 +51,7 @@ import { logger } from '../utils/logger';
 const FAST_INTERVAL_MS = Number(process.env.OFFER_REPORTS_RECON_FAST_MS ?? 60 * 60_000);   // 1 h
 const SLOW_INTERVAL_MS = Number(process.env.OFFER_REPORTS_RECON_SLOW_MS ?? 12 * 60 * 60_000); // 12 h
 
-const FAST_LOOKBACK_MS = Number(process.env.OFFER_REPORTS_RECON_FAST_LOOKBACK_MS ?? 6 * 60 * 60_000); // last 6 h
+const FAST_LOOKBACK_MS = Number(process.env.OFFER_REPORTS_RECON_FAST_LOOKBACK_MS ?? 24 * 60 * 60_000); // last 24 h
 const SLOW_LOOKBACK_MS = Number(process.env.OFFER_REPORTS_RECON_SLOW_LOOKBACK_MS ?? 7 * 24 * 60 * 60_000); // last 7 d
 
 // Cap on a single tick's wallclock duration. If a tick is still running at the
@@ -99,7 +99,8 @@ async function runFastTick(): Promise<void> {
     logger.info('offer_reports_recon_fast_done', {
       from: result.from,
       to: result.to,
-      clicks_scanned: result.clicks_scanned,
+      clicks_untouched: result.clicks_untouched,
+      existing_buckets_scanned: result.existing_buckets_scanned,
       conversions_scanned: result.conversions_scanned,
       buckets_written: result.buckets_written,
       duration_ms: result.duration_ms,
@@ -108,6 +109,26 @@ async function runFastTick(): Promise<void> {
     });
   } catch (err) {
     logger.error('offer_reports_recon_fast_failed', {
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+  try {
+    const result = await campaignReportsBackfillService.rebuild({ from, to: now });
+    logger.info('campaign_reports_recon_fast_done', {
+      from: result.from,
+      to: result.to,
+      clicks_untouched: result.clicks_untouched,
+      click_metadata_scanned: result.click_metadata_scanned,
+      existing_buckets_scanned: result.existing_buckets_scanned,
+      conversions_scanned: result.conversions_scanned,
+      conversions_with_campaign: result.conversions_with_campaign,
+      buckets_written: result.buckets_written,
+      duration_ms: result.duration_ms,
+      truncated: result.truncated,
+      truncated_reason: result.truncated_reason,
+    });
+  } catch (err) {
+    logger.error('campaign_reports_recon_fast_failed', {
       error: err instanceof Error ? err.message : String(err),
     });
   } finally {
@@ -135,7 +156,8 @@ async function runSlowTick(): Promise<void> {
     logger.info('offer_reports_recon_slow_done', {
       from: result.from,
       to: result.to,
-      clicks_scanned: result.clicks_scanned,
+      clicks_untouched: result.clicks_untouched,
+      existing_buckets_scanned: result.existing_buckets_scanned,
       conversions_scanned: result.conversions_scanned,
       buckets_written: result.buckets_written,
       duration_ms: result.duration_ms,
@@ -144,6 +166,26 @@ async function runSlowTick(): Promise<void> {
     });
   } catch (err) {
     logger.error('offer_reports_recon_slow_failed', {
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+  try {
+    const result = await campaignReportsBackfillService.rebuild({ from, to: now });
+    logger.info('campaign_reports_recon_slow_done', {
+      from: result.from,
+      to: result.to,
+      clicks_untouched: result.clicks_untouched,
+      click_metadata_scanned: result.click_metadata_scanned,
+      existing_buckets_scanned: result.existing_buckets_scanned,
+      conversions_scanned: result.conversions_scanned,
+      conversions_with_campaign: result.conversions_with_campaign,
+      buckets_written: result.buckets_written,
+      duration_ms: result.duration_ms,
+      truncated: result.truncated,
+      truncated_reason: result.truncated_reason,
+    });
+  } catch (err) {
+    logger.error('campaign_reports_recon_slow_failed', {
       error: err instanceof Error ? err.message : String(err),
     });
   } finally {
