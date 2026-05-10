@@ -18,6 +18,10 @@ import type {
 export interface DispatchConversionInput {
   conversion: ConversionRecord;
   click: ClickRecord | null;
+  /** IANA timezone of the network that produced this conversion (e.g. 'America/New_York').
+   *  When set, the forwarding service re-interprets network_timestamp from
+   *  this timezone to produce a correct UTC date for Google Ads. */
+  postback_timezone?: string;
 }
 export interface DispatchClickInput {
   click: ClickRecord;
@@ -37,7 +41,42 @@ function pickIdentifier(adIds: ClickRecord['ad_ids'] | undefined): IdentifierPic
 }
 
 // "yyyy-mm-dd HH:mm:ss+|-HH:mm" in the destination account's timezone.
-function formatGoogleAdsDateTime(iso: string, timeZone: string): string {
+function formatGoogleAdsDateTime(
+  iso: string,
+  timeZone: string,
+  rawNetworkTimestamp?: string,
+  postbackTimezone?: string,
+  convertTzToAccount?: boolean
+): string {
+  // Default behavior: pass original time with postback timezone offset
+  if (!convertTzToAccount && postbackTimezone && rawNetworkTimestamp) {
+    const networkTs = new Date(rawNetworkTimestamp);
+    if (!Number.isNaN(networkTs.getTime())) {
+      const trueUtcMs = new Date(iso).getTime();
+      const offsetMin = Math.round(
+        (new Date(new Date(trueUtcMs).toLocaleString('en-US', { timeZone: postbackTimezone })).getTime() -
+         new Date(new Date(trueUtcMs).toLocaleString('en-US', { timeZone: 'UTC' })).getTime()) /
+         60000
+      );
+      
+      const fmt = new Intl.DateTimeFormat('en-US', {
+        timeZone: 'UTC',
+        year: 'numeric', month: '2-digit', day: '2-digit',
+        hour: '2-digit', minute: '2-digit', second: '2-digit',
+        hour12: false,
+      });
+      const parts = Object.fromEntries(fmt.formatToParts(networkTs).map((p) => [p.type, p.value]));
+      const date = `${parts.year}-${parts.month}-${parts.day}`;
+      const time = `${parts.hour === '24' ? '00' : parts.hour}:${parts.minute}:${parts.second}`;
+
+      const sign = offsetMin >= 0 ? '+' : '-';
+      const abs = Math.abs(offsetMin);
+      const oh = String(Math.floor(abs / 60)).padStart(2, '0');
+      const om = String(abs % 60).padStart(2, '0');
+      return `${date} ${time}${sign}${oh}:${om}`;
+    }
+  }
+
   const d = iso ? new Date(iso) : new Date();
   const tz = timeZone || 'UTC';
 
@@ -63,6 +102,54 @@ function formatGoogleAdsDateTime(iso: string, timeZone: string): string {
   return `${date} ${time}${sign}${oh}:${om}`;
 }
 
+/**
+ * Re-interprets a network_timestamp that was sent in a non-UTC timezone.
+ *
+ * Problem: networks like MaxBounty (EST) or AdMedia (PST) send timestamps
+ * without timezone info (e.g. "2026-05-09T17:35:00"). JavaScript's `new Date()`
+ * parses these as UTC, but the actual wall-clock time is in the network's local
+ * timezone. When we forward this to Google Ads (whose account is in IST), the
+ * conversion_date_time ends up hours behind the real event, causing Google to
+ * reject it with "timestamp precedes the click".
+ *
+ * Fix: if postback_timezone is set, calculate the UTC offset for that timezone
+ * at the given time and shift the date accordingly.
+ *
+ * This helper is ONLY used for the Google Ads upload path — it does NOT affect
+ * conversion recording, report bucketing, or any other system.
+ */
+function adjustEventDateForGads(
+  conversion: ConversionRecord,
+  postbackTimezone?: string
+): Date {
+  const fallback = eventDate(conversion);
+  if (!postbackTimezone || !conversion.network_timestamp) return fallback;
+
+  // eventDate() already does sanity-check and may return created_at instead.
+  // We only adjust if eventDate() actually chose the network_timestamp.
+  const networkTs = new Date(conversion.network_timestamp);
+  if (Number.isNaN(networkTs.getTime())) return fallback;
+  if (fallback.getTime() !== networkTs.getTime()) return fallback;
+
+  // The network_timestamp string was parsed as UTC by `new Date()`, but the
+  // actual wall-clock time is in postbackTimezone. Calculate the offset
+  // between UTC and postbackTimezone at this instant, then shift.
+  try {
+    // Get what "UTC" looks like in the network's timezone at this moment.
+    const utcStr = networkTs.toLocaleString('en-US', { timeZone: 'UTC' });
+    const tzStr = networkTs.toLocaleString('en-US', { timeZone: postbackTimezone });
+    const utcMs = new Date(utcStr).getTime();
+    const tzMs = new Date(tzStr).getTime();
+    const offsetMs = tzMs - utcMs; // positive = timezone is ahead of UTC
+    // The raw timestamp was in the network's local time but parsed as UTC.
+    // Subtract the offset to get the true UTC time.
+    return new Date(networkTs.getTime() - offsetMs);
+  } catch {
+    // Invalid timezone — fall back to unadjusted eventDate
+    return fallback;
+  }
+}
+
 interface UploadContext {
   kind: GoogleAdsUploadKind;
   source_id: string;
@@ -74,6 +161,8 @@ interface UploadContext {
   conversion_value: number;
   currency_code?: string;
   conversion_date_time_iso: string;       // when the original event happened
+  raw_network_timestamp?: string;
+  postback_timezone?: string;
   // idempotency: same (kind, source_id, connection) repeated calls should
   // upload with the same order_id
   order_id: string;
@@ -137,7 +226,13 @@ async function callGoogleAds(
   });
   const cc: Record<string, unknown> = {
     conversion_action: ctx.conversion_action_resource,
-    conversion_date_time: formatGoogleAdsDateTime(ctx.conversion_date_time_iso, connection.time_zone || 'UTC'),
+    conversion_date_time: formatGoogleAdsDateTime(
+      ctx.conversion_date_time_iso,
+      connection.time_zone || 'UTC',
+      ctx.raw_network_timestamp,
+      ctx.postback_timezone,
+      connection.convert_tz_to_account
+    ),
     conversion_value: ctx.conversion_value,
     currency_code: ctx.currency_code || connection.currency_code || 'USD',
     order_id: ctx.order_id,
@@ -299,7 +394,9 @@ export const googleAdsForwardingService = {
         conversion_action_resource: conn.sale_conversion_action_resource,
         conversion_value: money.conversion_value,
         currency_code: money.currency_code,
-        conversion_date_time_iso: eventDate(conversion).toISOString(),
+        conversion_date_time_iso: adjustEventDateForGads(conversion, input.postback_timezone).toISOString(),
+        raw_network_timestamp: conversion.network_timestamp,
+        postback_timezone: input.postback_timezone,
         order_id: conversion.conversion_id,    // same order_id across MCCs is fine — different customer scope
       };
       const result = await callGoogleAds(conn, ctx);
@@ -337,7 +434,9 @@ export const googleAdsForwardingService = {
           conversion_action_resource: route.sale_conversion_action_resource,
           conversion_value: money.conversion_value,
           currency_code: money.currency_code,
-          conversion_date_time_iso: eventDate(conversion).toISOString(),
+          conversion_date_time_iso: adjustEventDateForGads(conversion, input.postback_timezone).toISOString(),
+          raw_network_timestamp: conversion.network_timestamp,
+          postback_timezone: input.postback_timezone,
           order_id: conversion.conversion_id,
         };
         const result = await callGoogleAds(target, ctx);
@@ -432,9 +531,10 @@ export const googleAdsForwardingService = {
       conversion: ConversionRecord;
       click: ClickRecord;
       identifier: IdentifierPick;
+      postback_timezone?: string;
     };
     const eligible: Eligible[] = [];
-    for (const { conversion, click } of inputs) {
+    for (const { conversion, click, postback_timezone } of inputs) {
       if (!conversion.verified || !click) {
         stats.skipped++;
         continue;
@@ -444,7 +544,7 @@ export const googleAdsForwardingService = {
         stats.skipped++;
         continue;
       }
-      eligible.push({ conversion, click, identifier });
+      eligible.push({ conversion, click, identifier, postback_timezone });
     }
     if (eligible.length === 0) return stats;
 
@@ -502,8 +602,11 @@ export const googleAdsForwardingService = {
         const cc: Record<string, unknown> = {
           conversion_action: conn.sale_conversion_action_resource,
           conversion_date_time: formatGoogleAdsDateTime(
-            eventDate(conversion).toISOString(),
-            conn.time_zone || 'UTC'
+            adjustEventDateForGads(conversion, item.postback_timezone).toISOString(),
+            conn.time_zone || 'UTC',
+            conversion.network_timestamp,
+            item.postback_timezone,
+            conn.convert_tz_to_account
           ),
           conversion_value: money.conversion_value,
           currency_code: money.currency_code,
@@ -525,8 +628,11 @@ export const googleAdsForwardingService = {
         const cc: Record<string, unknown> = {
           conversion_action: route.sale_conversion_action_resource,
           conversion_date_time: formatGoogleAdsDateTime(
-            eventDate(conversion).toISOString(),
-            conn.time_zone || 'UTC'
+            adjustEventDateForGads(conversion, item.postback_timezone).toISOString(),
+            conn.time_zone || 'UTC',
+            conversion.network_timestamp,
+            item.postback_timezone,
+            conn.convert_tz_to_account
           ),
           conversion_value: money.conversion_value,
           currency_code: money.currency_code,

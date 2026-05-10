@@ -59,6 +59,15 @@ const RESERVED_CANONICALS = new Set([
   'click_id', 'payout', 'currency', 'status', 'transaction_id', 'event_time',
 ]);
 
+function isValidTimezone(tz: string): boolean {
+  try {
+    Intl.DateTimeFormat(undefined, { timeZone: tz });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 type ExtraResult =
   | { ok: true; value: Record<string, string> }
   | { ok: false; error: string };
@@ -273,7 +282,15 @@ export const adminController = {
       extra_mappings: extras.value,
       default_status: body.default_status ? String(body.default_status).trim() : undefined,
       postback_api_id: body.postback_api_id ? String(body.postback_api_id).trim() : undefined,
+      postback_timezone: undefined as string | undefined,
     };
+
+    // Validate and set postback_timezone (IANA tz for Google Ads upload only).
+    if (typeof body.postback_timezone === 'string' && body.postback_timezone.trim()) {
+      const tz = body.postback_timezone.trim();
+      if (!isValidTimezone(tz)) return c.json({ error: 'invalid_postback_timezone' }, 400);
+      data.postback_timezone = tz;
+    }
 
     try {
       const network = await networkRepository.create(network_id, data);
@@ -305,6 +322,17 @@ export const adminController = {
       'mapping_status', 'mapping_txn_id', 'mapping_timestamp', 'default_status',
       'postback_api_id',
     ] as const;
+
+    // postback_timezone: allow setting and clearing (empty string = remove).
+    if ('postback_timezone' in body) {
+      const raw = typeof body.postback_timezone === 'string' ? body.postback_timezone.trim() : '';
+      if (raw) {
+        if (!isValidTimezone(raw)) return c.json({ error: 'invalid_postback_timezone' }, 400);
+        patch.postback_timezone = raw;
+      } else {
+        patch.postback_timezone = undefined;
+      }
+    }
     for (const f of fields) {
       if (typeof body[f] === 'string') patch[f] = (body[f] as string).trim() || undefined;
     }

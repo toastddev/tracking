@@ -3,7 +3,7 @@ import { db } from '../config';
 import { COLLECTIONS } from '../schema';
 import type { GoogleAdsConnection, GoogleAdsConnectionType } from '../../types/googleAds';
 
-const TTL_MS = 30_000;
+const TTL_MS = 7_200_000; // 2 hours
 const cache = new Map<string, { conn: GoogleAdsConnection; expires: number }>();
 
 function fromDoc(id: string, raw: Record<string, unknown>): GoogleAdsConnection {
@@ -26,6 +26,7 @@ function fromDoc(id: string, raw: Record<string, unknown>): GoogleAdsConnection 
     scopes: Array.isArray(raw.scopes) ? (raw.scopes as string[]) : [],
     status: (raw.status as GoogleAdsConnection['status']) ?? 'active',
     last_error: raw.last_error as string | undefined,
+    convert_tz_to_account: raw.convert_tz_to_account as boolean | undefined,
     created_at: created?.toISOString(),
     updated_at: updated?.toISOString(),
   };
@@ -50,6 +51,7 @@ export const googleAdsConnectionRepository = {
       scopes: conn.scopes,
       status: conn.status,
       last_error: conn.last_error,
+      convert_tz_to_account: conn.convert_tz_to_account,
       created_at: FieldValue.serverTimestamp(),
       updated_at: FieldValue.serverTimestamp(),
     });
@@ -100,6 +102,7 @@ export const googleAdsConnectionRepository = {
       | 'sale_conversion_action_name'
       | 'click_conversion_action_resource'
       | 'click_conversion_action_name'
+      | 'convert_tz_to_account'
     >>
   ): Promise<GoogleAdsConnection | null> {
     const ref = db().collection(COLLECTIONS.GOOGLE_ADS_CONNECTIONS).doc(connection_id);

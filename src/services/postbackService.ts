@@ -216,7 +216,7 @@ export const postbackService = {
     // sent/skipped/failed status separately. Skip when shadow — the API
     // run will trigger the forward instead so we don't double-upload.
     if (!shadow) {
-      googleAdsForwardingService.forgetConversion({ conversion: conv, click });
+      googleAdsForwardingService.forgetConversion({ conversion: conv, click, postback_timezone: network.postback_timezone });
     }
 
     return { ok: true, conversion_id: conv.conversion_id, verified, verification_reason };

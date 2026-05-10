@@ -10,6 +10,7 @@ import {
   offerReportRepository,
   drilldownRepository,
   campaignReportRepository,
+  networkRepository,
 } from '../firestore';
 import { __campaignFromExtra as extractCampaign } from './clickService';
 import { generateConversionId } from '../utils/idGenerator';
@@ -293,6 +294,16 @@ export interface RunOptions {
 export async function runAffiliateApi(api: AffiliateApi, opts: RunOptions): Promise<AffiliateApiRunRecord> {
   const run_id = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
   const started = new Date();
+
+  // Look up the network's postback_timezone once at the start of the run.
+  // Used exclusively by the Google Ads forwarding path to re-interpret
+  // network_timestamp correctly.
+  let postback_timezone: string | undefined;
+  if (api.network_id) {
+    const network = await networkRepository.getById(api.network_id).catch(() => null);
+    postback_timezone = network?.postback_timezone;
+  }
+
   const incremental = api.incremental;
   const lookback = (incremental.lookback_minutes ?? 30) * 60_000;
   const lastRun = api.schedule.last_run_at ? new Date(api.schedule.last_run_at) : null;
@@ -460,7 +471,7 @@ export async function runAffiliateApi(api: AffiliateApi, opts: RunOptions): Prom
         if (verifiedBatch.length > 0) {
           try {
             const gadsResult = await googleAdsForwardingService.dispatchConversionsBatch(
-              verifiedBatch.map((b) => ({ conversion: b.conv, click: b.click! }))
+              verifiedBatch.map((b) => ({ conversion: b.conv, click: b.click!, postback_timezone }))
             );
             gadsStats.sent += gadsResult.sent;
             gadsStats.skipped += gadsResult.skipped;

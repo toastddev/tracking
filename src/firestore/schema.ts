@@ -25,6 +25,7 @@
  *    mapping_txn_id    string   optional — incoming param name for transaction id
  *    mapping_timestamp string   optional — incoming param name for the event timestamp
  *    default_status    string   optional fallback when mapping_status is absent / empty
+ *    postback_timezone string   optional IANA tz (e.g. 'America/New_York') — Google Ads upload only
  *    created_at        timestamp
  *    updated_at        timestamp
  *
@@ -84,6 +85,7 @@
  *    scopes              string[]
  *    status              'active' | 'revoked' | 'error'
  *    last_error          string?
+ *    convert_tz_to_account boolean?
  *    created_at, updated_at
  *
  *  google_ads_mcc_children/{ga_child_id}         — display-only snapshot of an MCC's children

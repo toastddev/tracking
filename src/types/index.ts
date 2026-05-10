@@ -54,6 +54,12 @@ export interface Network {
   // in the example URL placeholder; value is the parameter name the network sends.
   extra_mappings?: Record<string, string>;
   default_status?: string;
+  // IANA timezone of timestamps sent by this network (e.g. 'America/New_York',
+  // 'America/Los_Angeles', 'UTC'). Used exclusively by the Google Ads
+  // forwarding service to correctly interpret network_timestamp before
+  // formatting for upload. Does NOT affect conversion recording, click
+  // tracking, or report bucketing.
+  postback_timezone?: string;
   // When set and the referenced affiliate API is active, the API pull is the
   // source of truth for conversions/reports for this network. Postbacks still
   // arrive and are persisted as audit-only (verified=true, shadow=true) so we

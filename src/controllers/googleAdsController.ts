@@ -45,6 +45,7 @@ function publicConnection(conn: GoogleAdsConnection): GoogleAdsConnectionPublic 
     click_conversion_action_name: conn.click_conversion_action_name,
     status: conn.status,
     last_error: conn.last_error,
+    convert_tz_to_account: conn.convert_tz_to_account,
     created_at: conn.created_at,
     updated_at: conn.updated_at,
   };
@@ -316,6 +317,7 @@ export const googleAdsController = {
       await googleAdsMccChildrenRepository.upsertMany(conn.connection_id, mccChildren);
     }
 
+    googleAdsConnectionRepository.invalidate(id);
     return c.json({ mcc_children: mccChildren });
   },
 
@@ -330,6 +332,7 @@ export const googleAdsController = {
       sale_conversion_action_name?: string | null;
       click_conversion_action_resource?: string | null;
       click_conversion_action_name?: string | null;
+      convert_tz_to_account?: boolean | null;
     };
     const patch: Parameters<typeof googleAdsConnectionRepository.update>[1] = {};
     if (body.sale_conversion_action_resource !== undefined) {
@@ -347,6 +350,9 @@ export const googleAdsController = {
     }
     if (body.click_conversion_action_name !== undefined) {
       patch.click_conversion_action_name = body.click_conversion_action_name ?? undefined;
+    }
+    if (body.convert_tz_to_account !== undefined) {
+      patch.convert_tz_to_account = body.convert_tz_to_account ?? undefined;
     }
     const updated = await googleAdsConnectionRepository.update(id, patch);
     if (!updated) return c.json({ error: 'not_found' }, 404);
@@ -368,6 +374,7 @@ export const googleAdsController = {
         connection: conn,
         forceRefresh: c.req.query('refresh') === 'true',
       });
+      googleAdsConnectionRepository.invalidate(id);
       return c.json({ items: actions });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
