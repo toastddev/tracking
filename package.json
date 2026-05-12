@@ -11,6 +11,7 @@
     "start": "node --env-file=.env --import tsx src/index.ts",
     "seed": "node --env-file=.env --import tsx seed.ts",
     "recalc": "node --env-file=.env --import tsx scripts/recalcCampaignData.ts",
+    "admedia": "node --env-file=.env --import tsx scripts/pull-admedia-fetch.ts",
     "typecheck": "tsc --noEmit",
     "build": "tsup src/index.ts --format esm --clean"
   },
