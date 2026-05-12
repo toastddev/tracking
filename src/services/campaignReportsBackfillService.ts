@@ -3,6 +3,7 @@ import { db } from '../firestore/config';
 import { COLLECTIONS } from '../firestore/schema';
 import { campaignReportRepository } from '../firestore';
 import { logger } from '../utils/logger';
+import { toInr } from '../utils/fxRates';
 import {
   eventDateFromRaw,
   BACKFILL_SCAN_PAD_BEFORE_MS,
@@ -135,6 +136,7 @@ export interface CampaignBackfillResult {
   conversions_scanned: number;
   conversions_with_campaign: number;
   conversions_orphan_lookups: number;
+  revenue_fx_skipped: number;
   buckets_written: number;
   duration_ms: number;
   truncated?: boolean;
@@ -293,6 +295,8 @@ export const campaignReportsBackfillService = {
     let conversions_scanned = 0;
     let conversions_with_campaign = 0;
     let orphan_lookups = 0;
+    let revenue_fx_skipped = 0;
+    const fxWarnedCurrencies = new Set<string>();
     {
       const scanFrom = new Date(from.getTime() - BACKFILL_SCAN_PAD_BEFORE_MS);
       const scanTo = new Date(to.getTime() + BACKFILL_SCAN_PAD_AFTER_MS);
@@ -386,11 +390,32 @@ export const campaignReportsBackfillService = {
           if (!meta) continue;
           const offer_id = (item.raw.offer_id as string | undefined) || meta.offer_id || 'unknown';
           const payout = typeof item.raw.payout === 'number' ? (item.raw.payout as number) : 0;
+          const currency = (item.raw.currency as string | undefined) || undefined;
           const status = item.raw.status as string | undefined;
           const b = bucketFor(meta.campaign_id, meta.source, item.eventDay);
           b.postbacks += 1;
           b.conversions += 1;
-          if (Number.isFinite(payout)) b.revenue += payout;
+          // Campaign revenue is canonically INR. Historical conversions may be
+          // stored in USD/EUR/etc., so convert via fxRates here. Missing-rate
+          // currencies are dropped (counted but not summed) so we don't
+          // mislabel raw USD as INR — `revenue_fx_skipped` surfaces in logs
+          // and on the result so the operator can fix the env var.
+          if (Number.isFinite(payout)) {
+            const inr = toInr(payout, currency);
+            if (inr != null) {
+              b.revenue += inr;
+            } else {
+              revenue_fx_skipped += 1;
+              const code = (currency ?? '').toUpperCase().trim() || 'unknown';
+              if (!fxWarnedCurrencies.has(code)) {
+                fxWarnedCurrencies.add(code);
+                logger.warn('campaign_backfill_revenue_fx_missing', {
+                  currency: code,
+                  hint: 'Set GOOGLE_ADS_FX_RATES env var (e.g. INR:93,EUR:100) for this code.',
+                });
+              }
+            }
+          }
           b[statusBucket(status)] += 1;
           if (offer_id) b.offers.add(offer_id);
           conversions_with_campaign += 1;
@@ -498,6 +523,7 @@ export const campaignReportsBackfillService = {
       conversions_scanned,
       conversions_with_campaign,
       conversions_orphan_lookups: orphan_lookups,
+      revenue_fx_skipped,
       buckets_written,
       duration_ms: Date.now() - started,
       ...(truncated ? { truncated, truncated_reason } : {}),

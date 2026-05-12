@@ -2,6 +2,8 @@ import { FieldValue, Timestamp } from 'firebase-admin/firestore';
 import { db } from '../config';
 import { COLLECTIONS } from '../schema';
 import { TTLCache } from '../../utils/ttlCache';
+import { toInr } from '../../utils/fxRates';
+import { logger } from '../../utils/logger';
 
 // 60s read-through cache for fetchRange. Mirrors offerReportRepository — see
 // the comment there for the rationale.
@@ -78,6 +80,11 @@ export interface IncrementConversionInput {
   verified: boolean;
   status?: string;
   payout?: number;
+  // Currency the `payout` arrived in (per the postback / affiliate API).
+  // Campaign revenue is canonically INR, so the repository converts via
+  // `fxRates.toInr` before the FieldValue.increment. Empty / unknown is
+  // treated as INR (operator default), matching the dashboard standard.
+  currency?: string;
   offer_id?: string;
 }
 
@@ -121,7 +128,8 @@ export const campaignReportRepository = {
     if (input.verified) {
       patch.conversions = FieldValue.increment(1);
       if (typeof input.payout === 'number' && Number.isFinite(input.payout)) {
-        patch.revenue = FieldValue.increment(input.payout);
+        const inr = payoutToInr(input.payout, input.currency, input.campaign_id);
+        if (inr != null) patch.revenue = FieldValue.increment(inr);
       }
       const bucket = statusBucket(input.status);
       patch[bucket] = FieldValue.increment(1);
@@ -172,7 +180,10 @@ export const campaignReportRepository = {
       b.postbacks += 1;
       if (r.verified) {
         b.conversions += 1;
-        if (typeof r.payout === 'number' && Number.isFinite(r.payout)) b.revenue += r.payout;
+        if (typeof r.payout === 'number' && Number.isFinite(r.payout)) {
+          const inr = payoutToInr(r.payout, r.currency, r.campaign_id);
+          if (inr != null) b.revenue += inr;
+        }
         b[statusBucket(r.status)] += 1;
       } else {
         b.unverified += 1;
@@ -377,4 +388,35 @@ function hydrate(raw: Record<string, unknown>): CampaignReportDoc {
 
 function numOr0(v: unknown): number {
   return typeof v === 'number' && Number.isFinite(v) ? v : 0;
+}
+
+// Throttled warn so a misconfigured FX rate (or unknown currency from a single
+// network) doesn't flood the logs while still surfacing the problem once.
+const fxWarnCache = new Set<string>();
+
+// Converts a postback/API payout into INR for storage on campaign_reports.
+// Empty / missing currency is treated as INR — matches the dashboard default
+// and the operator's mental model. Conversions are dropped (returned null) only
+// when an explicit non-INR currency has no FX rate configured; the caller then
+// skips the increment so we don't silently mis-attribute USD as INR.
+function payoutToInr(
+  payout: number,
+  currency: string | undefined,
+  campaign_id: string,
+): number | null {
+  const inr = toInr(payout, currency);
+  if (inr == null) {
+    const code = (currency ?? '').toUpperCase().trim() || 'unknown';
+    const key = `campaign_revenue_fx:${code}`;
+    if (!fxWarnCache.has(key)) {
+      fxWarnCache.add(key);
+      logger.warn('campaign_revenue_fx_missing', {
+        currency: code,
+        campaign_id,
+        hint: 'Set GOOGLE_ADS_FX_RATES env var (e.g. INR:93,EUR:100) for this code.',
+      });
+    }
+    return null;
+  }
+  return inr;
 }

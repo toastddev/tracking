@@ -198,6 +198,7 @@ export const postbackService = {
             verified: conv.verified,
             status: conv.status,
             payout: conv.payout,
+            currency: conv.currency,
             offer_id: conv.offer_id,
           })
         ).catch((err: unknown) => {

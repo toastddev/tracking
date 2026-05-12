@@ -423,6 +423,7 @@ export async function runAffiliateApi(api: AffiliateApi, opts: RunOptions): Prom
               verified: true,
               status: b.conv.status,
               payout: b.conv.payout,
+              currency: b.conv.currency,
               offer_id: b.conv.offer_id as string,
             };
           })

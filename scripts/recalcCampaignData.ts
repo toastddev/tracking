@@ -135,6 +135,9 @@ Examples:
       console.log(`     - conversions_with_campaign : ${result.conversions_with_campaign.toLocaleString()}`);
       console.log(`     - clicks_scanned_for_meta   : ${result.click_metadata_scanned.toLocaleString()}`);
       console.log(`     - buckets_written           : ${result.buckets_written.toLocaleString()}`);
+      if (result.revenue_fx_skipped > 0) {
+        console.warn(`     ! revenue_fx_skipped       : ${result.revenue_fx_skipped.toLocaleString()} (no FX rate — set GOOGLE_ADS_FX_RATES)`);
+      }
       if (result.truncated) {
         console.warn(`   ! Truncated: ${result.truncated_reason}`);
       }
