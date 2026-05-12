@@ -19,6 +19,7 @@ import { campaignReportRepository } from '../firestore';
 import { googleAdsSyncStateRepository } from '../firestore';
 import { googleAdsForwardingService } from '../services/googleAdsForwardingService';
 import { googleAdsCampaignSyncService } from '../services/googleAdsCampaignSyncService';
+import { refreshService } from '../services/refreshService';
 
 import { dataResetService } from '../services/dataResetService';
 import { logger } from '../utils/logger';
@@ -739,6 +740,69 @@ export const adminController = {
     } catch (err) {
       logger.error('update_campaign_name_failed', {
         campaign_id: id, error: err instanceof Error ? err.message : String(err),
+      });
+      return c.json({ error: 'internal' }, 500);
+    }
+  },
+
+  // ── refresh (orchestrated) ────────────────────────────────────────
+  // Runs every active affiliate API sequentially, then runs the offer +
+  // campaign report backfills from the last successful refresh timestamp
+  // (or DEFAULT_LOOKBACK_DAYS for a first refresh).
+  //
+  // Multi-instance safety: serialised by a leased Firestore lock in
+  // app_state/refresh_state. If another Cloud Run instance (or a second
+  // operator click) is already running a refresh, returns 409 with the
+  // active run_id so the UI can attach to its progress instead of erroring.
+  //
+  // The HTTP request blocks until the run completes, but the client should
+  // also poll /api/refresh/runs/:id for live step-by-step progress. Polling
+  // is what surfaces in-flight progress to the UI; the response body just
+  // confirms terminal status.
+  async refreshAll(c: Context) {
+    try {
+      const result = await refreshService.refreshAll();
+      if (!result.ok) {
+        return c.json(
+          {
+            error: result.reason ?? 'refresh_failed',
+            active_run_id: result.active_run_id,
+            active_started_at: result.active_started_at,
+          },
+          409
+        );
+      }
+      // Pull the final run state so the client gets a single response with
+      // all the info it needs without an extra round-trip.
+      const run = result.run_id ? await refreshService.getRun(result.run_id) : null;
+      return c.json({ ok: true, run_id: result.run_id, run });
+    } catch (err) {
+      logger.error('refresh_all_failed', { error: err instanceof Error ? err.message : String(err) });
+      return c.json({ error: 'refresh_failed', message: err instanceof Error ? err.message : String(err) }, 500);
+    }
+  },
+
+  async refreshStatus(c: Context) {
+    try {
+      const status = await refreshService.getStatus();
+      return c.json(status);
+    } catch (err) {
+      logger.error('refresh_status_failed', { error: err instanceof Error ? err.message : String(err) });
+      return c.json({ error: 'internal' }, 500);
+    }
+  },
+
+  async refreshRun(c: Context) {
+    const id = c.req.param('id');
+    if (!id) return c.json({ error: 'invalid_id' }, 400);
+    try {
+      const run = await refreshService.getRun(id);
+      if (!run) return c.json({ error: 'not_found' }, 404);
+      return c.json(run);
+    } catch (err) {
+      logger.error('refresh_run_lookup_failed', {
+        run_id: id,
+        error: err instanceof Error ? err.message : String(err),
       });
       return c.json({ error: 'internal' }, 500);
     }

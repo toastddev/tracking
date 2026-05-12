@@ -26,11 +26,24 @@ export interface CampaignReportDoc {
   conversions: number;
   unverified: number;
   revenue: number;
-  spend: number;           // operator-entered or Google Ads API
+  spend: number;           // operator-entered or Google Ads API (INR)
   approved: number;
   pending: number;
   rejected: number;
   offers: string[];        // distinct offers seen on this campaign-day
+  // GAds-side daily metrics pulled from googleAdsCampaignSyncService. Stored
+  // raw (clicks/impressions as integers; CTR is impressions-derived so we keep
+  // both inputs and recompute at aggregation time).
+  gads_clicks?: number;
+  gads_impressions?: number;
+  gads_cost?: number;      // same as `spend` (INR) — denormalised for clarity at the GAds layer
+  // Average CPC reported by GAds for this campaign-day in INR. Useful as a
+  // sanity check vs computed cost/clicks but we always recompute on read so
+  // weighted averages aggregate correctly.
+  gads_avg_cpc?: number;
+  // CTR is daily: impressions == 0 means undefined. We persist what GAds
+  // reports for the day, but aggregate by recomputing clicks/impressions.
+  gads_ctr?: number;
   updated_at?: string;
 }
 
@@ -190,6 +203,43 @@ export const campaignReportRepository = {
     await writer.close();
   },
 
+  // Bulk overwrite of GAds metrics for a single campaign-day. Called by the
+  // googleAdsCampaignSyncService when it pulls daily metrics from Google Ads.
+  // Idempotent — a fresh sync overwrites the previous values (these come from
+  // the canonical GAds API, not user-entered).
+  async updateAdsMetrics(input: {
+    campaign_id: string;
+    date: string;
+    gads_clicks: number;
+    gads_impressions: number;
+    gads_cost: number;
+    gads_avg_cpc: number;
+    gads_ctr: number;
+    spend?: number; // when set, also overwrite the canonical spend field
+  }): Promise<void> {
+    if (!Number.isFinite(input.gads_clicks) || input.gads_clicks < 0) {
+      throw new Error('invalid_gads_clicks');
+    }
+    if (!Number.isFinite(input.gads_impressions) || input.gads_impressions < 0) {
+      throw new Error('invalid_gads_impressions');
+    }
+    const ref = db().collection(COLLECTIONS.CAMPAIGN_REPORTS).doc(docId(input.campaign_id, input.date));
+    const patch: Record<string, unknown> = {
+      campaign_id: input.campaign_id,
+      date: input.date,
+      gads_clicks: input.gads_clicks,
+      gads_impressions: input.gads_impressions,
+      gads_cost: input.gads_cost,
+      gads_avg_cpc: input.gads_avg_cpc,
+      gads_ctr: input.gads_ctr,
+      updated_at: FieldValue.serverTimestamp(),
+    };
+    if (typeof input.spend === 'number' && Number.isFinite(input.spend) && input.spend >= 0) {
+      patch.spend = input.spend;
+    }
+    await ref.set(patch, { merge: true });
+  },
+
   // Set/update operator-entered ad spend for a single campaign-day. Idempotent:
   // a fresh value overwrites the previous (this is a true "set", not increment)
   // because spend comes from a manual entry that the operator can edit.
@@ -313,6 +363,11 @@ function hydrate(raw: Record<string, unknown>): CampaignReportDoc {
     pending: numOr0(raw.pending),
     rejected: numOr0(raw.rejected),
     offers: Array.isArray(raw.offers) ? (raw.offers as unknown[]).map(String) : [],
+    gads_clicks: typeof raw.gads_clicks === 'number' ? raw.gads_clicks : undefined,
+    gads_impressions: typeof raw.gads_impressions === 'number' ? raw.gads_impressions : undefined,
+    gads_cost: typeof raw.gads_cost === 'number' ? raw.gads_cost : undefined,
+    gads_avg_cpc: typeof raw.gads_avg_cpc === 'number' ? raw.gads_avg_cpc : undefined,
+    gads_ctr: typeof raw.gads_ctr === 'number' ? raw.gads_ctr : undefined,
     updated_at:
       raw.updated_at instanceof Timestamp
         ? (raw.updated_at as Timestamp).toDate().toISOString()

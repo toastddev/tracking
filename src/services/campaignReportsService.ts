@@ -14,6 +14,11 @@ export interface CampaignDailyPoint {
   revenue: number;
   spend: number;
   profit: number;          // revenue - spend
+  // GAds-side daily metrics. Zero when we have no GAds data for the day.
+  gads_clicks: number;
+  gads_impressions: number;
+  gads_ctr: number;        // recomputed from clicks/impressions
+  gads_cpc: number;        // recomputed from spend/clicks (INR)
 }
 
 export interface CampaignReportSummary {
@@ -39,6 +44,12 @@ export interface CampaignReportSummary {
   approval_rate: number;
   spend_coverage: number;  // share of active days that have spend recorded (0..1)
   offers: string[];        // distinct offer_ids seen
+  // GAds totals across the window. Recomputed metrics (CTR, CPC) use the
+  // aggregated clicks/impressions/spend so they're properly weighted.
+  gads_clicks: number;
+  gads_impressions: number;
+  gads_ctr: number;
+  gads_cpc: number;
   series: CampaignDailyPoint[];
 }
 
@@ -71,6 +82,11 @@ export interface CampaignReportsResponse {
     profitable_campaigns: number;
     unprofitable_campaigns: number;
     spend_coverage: number;     // share of campaigns with any spend recorded
+    // GAds-side aggregate metrics across the window.
+    gads_clicks: number;
+    gads_impressions: number;
+    gads_ctr: number;
+    gads_cpc: number;
   };
   insights: CampaignInsight[];
 }
@@ -145,6 +161,8 @@ export const campaignReportsService = {
     let profitableCampaigns = 0;
     let unprofitableCampaigns = 0;
     let campaignsWithSpend = 0;
+    let totalGadsClicks = 0;
+    let totalGadsImpressions = 0;
 
     for (const campaign_id of campaignIds) {
       const cRows = byCampaign.get(campaign_id) ?? [];
@@ -159,6 +177,10 @@ export const campaignReportsService = {
           revenue: 0,
           spend: 0,
           profit: 0,
+          gads_clicks: 0,
+          gads_impressions: 0,
+          gads_ctr: 0,
+          gads_cpc: 0,
         });
       }
 
@@ -173,6 +195,8 @@ export const campaignReportsService = {
       let spend = 0;
       let activeDays = 0;
       let daysWithSpend = 0;
+      let gadsClicks = 0;
+      let gadsImpressions = 0;
       let campaign_name: string | undefined;
       let source = 'gad_campaignid';
       const offers = new Set<string>();
@@ -187,6 +211,8 @@ export const campaignReportsService = {
         rejected += r.rejected;
         revenue += r.revenue;
         spend += r.spend;
+        gadsClicks += r.gads_clicks ?? 0;
+        gadsImpressions += r.gads_impressions ?? 0;
         if (r.campaign_name) campaign_name = r.campaign_name;
         if (r.source) source = r.source;
         for (const o of r.offers) offers.add(o);
@@ -198,6 +224,11 @@ export const campaignReportsService = {
           point.revenue += r.revenue;
           point.spend += r.spend;
           point.profit = point.revenue - point.spend;
+          point.gads_clicks += r.gads_clicks ?? 0;
+          point.gads_impressions += r.gads_impressions ?? 0;
+          // Recompute daily CTR / CPC from inputs so they aggregate correctly.
+          point.gads_ctr = safeDiv(point.gads_clicks, point.gads_impressions);
+          point.gads_cpc = safeDiv(point.spend, point.gads_clicks);
         }
         const isActive = r.clicks > 0 || r.postbacks > 0 || r.spend > 0;
         if (isActive) activeDays += 1;
@@ -234,6 +265,10 @@ export const campaignReportsService = {
         approval_rate: safeDiv(approved, conversions),
         spend_coverage: safeDiv(daysWithSpend, Math.max(activeDays, 1)),
         offers: Array.from(offers).sort(),
+        gads_clicks: gadsClicks,
+        gads_impressions: gadsImpressions,
+        gads_ctr: safeDiv(gadsClicks, gadsImpressions),
+        gads_cpc: safeDiv(spend, gadsClicks),
         series: Array.from(seriesMap.values()).sort((a, b) => a.date.localeCompare(b.date)),
       });
 
@@ -243,6 +278,8 @@ export const campaignReportsService = {
       totalUnv += unverified;
       totalRevenue += revenue;
       totalSpend += spend;
+      totalGadsClicks += gadsClicks;
+      totalGadsImpressions += gadsImpressions;
     }
 
     // Highest revenue surfaces first — same convention as offer reports.
@@ -265,6 +302,10 @@ export const campaignReportsService = {
       profitable_campaigns: profitableCampaigns,
       unprofitable_campaigns: unprofitableCampaigns,
       spend_coverage: safeDiv(campaignsWithSpend, Math.max(summaries.length, 1)),
+      gads_clicks: totalGadsClicks,
+      gads_impressions: totalGadsImpressions,
+      gads_ctr: safeDiv(totalGadsClicks, totalGadsImpressions),
+      gads_cpc: safeDiv(totalSpend, totalGadsClicks),
     };
 
     const insights = buildInsights(summaries, totals);
@@ -278,6 +319,21 @@ export const campaignReportsService = {
     };
   },
 };
+
+// Campaign reports are denominated in INR (revenue from postbacks is stored
+// raw and is treated as INR; spend is converted to INR during Google Ads
+// sync). Insight messages use a minimal INR formatter so amounts stay
+// readable without dragging in Intl on the server-rendered text.
+function fmtInr(amount: number): string {
+  const sign = amount < 0 ? '-' : '';
+  const abs = Math.abs(amount);
+  // Compact notation for big values so insight banners stay short. The frontend
+  // re-formats with a tooltip so the operator can see the exact amount.
+  if (abs >= 1_00_00_000) return `${sign}₹${(abs / 1_00_00_000).toFixed(2)} Cr`;
+  if (abs >= 1_00_000) return `${sign}₹${(abs / 1_00_000).toFixed(2)} L`;
+  if (abs >= 1_000) return `${sign}₹${abs.toLocaleString('en-IN', { maximumFractionDigits: 0 })}`;
+  return `${sign}₹${abs.toFixed(2)}`;
+}
 
 function buildInsights(
   campaigns: CampaignReportSummary[],
@@ -315,8 +371,8 @@ function buildInsights(
         severity: 'success',
         title: `Top ROAS: ${bestRoas.campaign_name ?? bestRoas.campaign_id}`,
         detail:
-          `${bestRoas.roas.toFixed(2)}× return ($${bestRoas.revenue.toFixed(2)} on $${bestRoas.spend.toFixed(2)} spend, ` +
-          `profit $${bestRoas.profit.toFixed(2)}). Consider scaling budget here.`,
+          `${bestRoas.roas.toFixed(2)}× return (${fmtInr(bestRoas.revenue)} on ${fmtInr(bestRoas.spend)} spend, ` +
+          `profit ${fmtInr(bestRoas.profit)}). Consider scaling budget here.`,
         campaign_id: bestRoas.campaign_id,
       });
     }
@@ -334,8 +390,8 @@ function buildInsights(
         severity: 'critical',
         title: `Losing money: ${worstRoas.campaign_name ?? worstRoas.campaign_id}`,
         detail:
-          `ROAS ${worstRoas.roas.toFixed(2)}× — burning $${(-worstRoas.profit).toFixed(2)} ` +
-          `(spent $${worstRoas.spend.toFixed(2)}, earned $${worstRoas.revenue.toFixed(2)}). ` +
+          `ROAS ${worstRoas.roas.toFixed(2)}× — burning ${fmtInr(-worstRoas.profit)} ` +
+          `(spent ${fmtInr(worstRoas.spend)}, earned ${fmtInr(worstRoas.revenue)}). ` +
           'Review creatives, geo or pause.',
         campaign_id: worstRoas.campaign_id,
       });
@@ -371,7 +427,7 @@ function buildInsights(
       title: `${burning.length} campaign${burning.length === 1 ? '' : 's'} spending without conversions`,
       detail:
         `Top loser: ${worst.campaign_name ?? worst.campaign_id} ` +
-        `($${worst.spend.toFixed(2)} spent, 0 conversions). Tracking break or wrong audience.`,
+        `(${fmtInr(worst.spend)} spent, 0 conversions). Tracking break or wrong audience.`,
       campaign_id: worst.campaign_id,
     });
   }
@@ -387,14 +443,14 @@ function buildInsights(
       out.push({
         severity: 'success',
         title: `${top.campaign_name ?? top.campaign_id} trending up`,
-        detail: `Revenue line is climbing across the window (slope ≈ $${revSlope.toFixed(2)}/day). Keep going.`,
+        detail: `Revenue line is climbing across the window (slope ≈ ${fmtInr(revSlope)}/day). Keep going.`,
         campaign_id: top.campaign_id,
       });
     } else if (relSlope <= -0.05) {
       out.push({
         severity: 'warn',
         title: `${top.campaign_name ?? top.campaign_id} trending down`,
-        detail: `Revenue line is falling (slope ≈ $${revSlope.toFixed(2)}/day). Investigate before it accelerates.`,
+        detail: `Revenue line is falling (slope ≈ ${fmtInr(revSlope)}/day). Investigate before it accelerates.`,
         campaign_id: top.campaign_id,
       });
     }
@@ -408,7 +464,7 @@ function buildInsights(
       title: 'No anomalies detected',
       detail:
         `${totals.campaigns} campaign${totals.campaigns === 1 ? '' : 's'} active in this window. ` +
-        `Total profit $${totals.profit.toFixed(2)} on $${totals.spend.toFixed(2)} spend.`,
+        `Total profit ${fmtInr(totals.profit)} on ${fmtInr(totals.spend)} spend.`,
     });
   }
 

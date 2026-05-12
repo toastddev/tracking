@@ -47,6 +47,23 @@ export function toUsd(amount: number, currency: string | undefined): number | nu
   return amount / rate;
 }
 
+// Convert `amount` from `currency` to INR. The dashboard standardises on INR
+// for campaign spend / GAds metrics. Pass-through when the currency is already
+// INR. Returns null when no rate is configured for either side.
+export function toInr(amount: number, currency: string | undefined): number | null {
+  const code = (currency ?? '').toUpperCase().trim();
+  if (!Number.isFinite(amount)) return null;
+  if (!code || code === 'INR') return amount;
+  const rates = fxRates();
+  const inrRate = rates.INR;
+  if (!inrRate || inrRate <= 0) return null;
+  if (code === 'USD') return amount * inrRate;
+  const fromRate = rates[code];
+  if (!fromRate || fromRate <= 0) return null;
+  // amount (local) → USD → INR
+  return (amount / fromRate) * inrRate;
+}
+
 // Convert between any two configured currencies. Rates are stored as
 // `<currency units per USD>`, so conversion goes through USD as the pivot.
 export function convertCurrency(

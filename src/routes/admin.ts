@@ -67,5 +67,16 @@ adminRoutes.post('/api/affiliate-apis/:id/unlock', (c) => affiliateApiController
 adminRoutes.post('/api/affiliate-apis/:id/test', (c) => affiliateApiController.testRun(c));
 adminRoutes.get('/api/affiliate-apis/:id/runs', (c) => affiliateApiController.runs(c));
 
+// Refresh (orchestrated): hits all affiliate APIs, then reconciles/backfills
+// offer + campaign rollups from the last successful refresh timestamp.
+// /api/refresh — start a run (409 if one is already in flight, with active_run_id).
+// /api/refresh/status — last_refresh_at + active_run_id for quick polling.
+// /api/refresh/runs/:id — live step-by-step progress (UI polls this while
+// the run is in flight; works from any Cloud Run instance since state lives
+// in Firestore).
+adminRoutes.post('/api/refresh', (c) => adminController.refreshAll(c));
+adminRoutes.get('/api/refresh/status', (c) => adminController.refreshStatus(c));
+adminRoutes.get('/api/refresh/runs/:id', (c) => adminController.refreshRun(c));
+
 // Settings → destructive ops
 adminRoutes.post('/api/settings/reset-data', (c) => adminController.resetData(c));

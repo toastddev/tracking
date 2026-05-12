@@ -389,8 +389,10 @@ export const campaignReportsBackfillService = {
           offers: Array.from(b.offers),
           updated_at: FieldValue.serverTimestamp(),
           backfilled_at: FieldValue.serverTimestamp(),
-          // NOTE: deliberately omitting `clicks`, `spend`, and
-          // `campaign_name` — the merge keeps the canonical values.
+          // NOTE: deliberately omitting `clicks`, `spend`, `campaign_name`,
+          // and all `gads_*` fields — the merge keeps the canonical values
+          // (Google Ads sync owns the gads_* fields and the spend/name fields
+          // are user/api-managed).
         }, { merge: true }).catch(() => { /* surfaced via onWriteError */ });
         buckets_written += 1;
       }

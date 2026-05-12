@@ -149,6 +149,13 @@ export const COLLECTIONS = {
   // Singleton key/value store for global app state (sync prefs, last-synced
   // timestamps, etc.). Doc id is the state key, e.g. 'google_ads_sync'.
   APP_STATE: 'app_state',
+  // Run-history for the orchestrated /api/refresh endpoint. Each doc is one
+  // refresh attempt — captures step-by-step progress and final outcome so the
+  // UI can poll for live status from any Cloud Run instance. Doc id = uuidv7.
+  // Lifecycle: created when the lock is acquired in `refresh_state`, updated
+  // throughout the run, terminal status (`completed` / `failed`) is set at the
+  // end. Survives indefinitely (small docs, useful for audit).
+  REFRESH_RUNS: 'refresh_runs',
 } as const;
 
 export type CollectionName = (typeof COLLECTIONS)[keyof typeof COLLECTIONS];

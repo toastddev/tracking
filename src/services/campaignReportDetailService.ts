@@ -32,6 +32,10 @@ export interface CampaignDetailDailyPoint {
   spend: number;
   profit: number;
   roas: number;
+  gads_clicks: number;
+  gads_impressions: number;
+  gads_ctr: number;
+  gads_cpc: number;
 }
 
 export interface CampaignDetailSummary {
@@ -52,6 +56,10 @@ export interface CampaignDetailSummary {
   roas: number;
   roi: number;
   approval_rate: number;
+  gads_clicks: number;
+  gads_impressions: number;
+  gads_ctr: number;
+  gads_cpc: number;
 }
 
 export interface CampaignDetailDeltas {
@@ -156,6 +164,7 @@ function pctChange(curr: number, prev: number): number | null {
 function summariseRows(rows: CampaignReportDoc[]): CampaignDetailSummary {
   let clicks = 0, postbacks = 0, conversions = 0, unverified = 0;
   let approved = 0, pending = 0, rejected = 0, revenue = 0, spend = 0;
+  let gadsClicks = 0, gadsImpressions = 0;
   for (const r of rows) {
     clicks += r.clicks;
     postbacks += r.postbacks;
@@ -166,6 +175,8 @@ function summariseRows(rows: CampaignReportDoc[]): CampaignDetailSummary {
     rejected += r.rejected;
     revenue += r.revenue;
     spend += r.spend;
+    gadsClicks += r.gads_clicks ?? 0;
+    gadsImpressions += r.gads_impressions ?? 0;
   }
   const profit = revenue - spend;
   return {
@@ -186,6 +197,10 @@ function summariseRows(rows: CampaignReportDoc[]): CampaignDetailSummary {
     roas: safeDiv(revenue, spend),
     roi: spend > 0 ? (revenue - spend) / spend : 0,
     approval_rate: safeDiv(approved, conversions),
+    gads_clicks: gadsClicks,
+    gads_impressions: gadsImpressions,
+    gads_ctr: safeDiv(gadsClicks, gadsImpressions),
+    gads_cpc: safeDiv(spend, gadsClicks),
   };
 }
 
@@ -301,6 +316,10 @@ export const campaignReportDetailService = {
         spend: 0,
         profit: 0,
         roas: 0,
+        gads_clicks: 0,
+        gads_impressions: 0,
+        gads_ctr: 0,
+        gads_cpc: 0,
       });
     }
     for (const r of currentRows) {
@@ -317,6 +336,10 @@ export const campaignReportDetailService = {
       p.spend += r.spend;
       p.profit = p.revenue - p.spend;
       p.roas = safeDiv(p.revenue, p.spend);
+      p.gads_clicks += r.gads_clicks ?? 0;
+      p.gads_impressions += r.gads_impressions ?? 0;
+      p.gads_ctr = safeDiv(p.gads_clicks, p.gads_impressions);
+      p.gads_cpc = safeDiv(p.spend, p.gads_clicks);
     }
     const series = Array.from(seriesMap.values()).sort((a, b) => a.date.localeCompare(b.date));
 
@@ -433,6 +456,17 @@ export const campaignReportDetailService = {
   },
 };
 
+// Campaign reports are denominated in INR. Use a short formatter so flag
+// banners stay scannable; the frontend renders exact amounts with tooltips.
+function fmtInr(amount: number): string {
+  const sign = amount < 0 ? '-' : '';
+  const abs = Math.abs(amount);
+  if (abs >= 1_00_00_000) return `${sign}₹${(abs / 1_00_00_000).toFixed(2)} Cr`;
+  if (abs >= 1_00_000) return `${sign}₹${(abs / 1_00_000).toFixed(2)} L`;
+  if (abs >= 1_000) return `${sign}₹${abs.toLocaleString('en-IN', { maximumFractionDigits: 0 })}`;
+  return `${sign}₹${abs.toFixed(2)}`;
+}
+
 function buildFlags(input: {
   summary: CampaignDetailSummary;
   previous: CampaignDetailSummary;
@@ -462,8 +496,8 @@ function buildFlags(input: {
       severity: 'critical',
       title: `${losingDays.length} loss day${losingDays.length === 1 ? '' : 's'} in this window`,
       detail:
-        `Worst: ${worst.date} (lost $${(-worst.profit).toFixed(2)} on $${worst.spend.toFixed(2)} spend). ` +
-        `Total losses across the window: $${(-totalLoss).toFixed(2)}.`,
+        `Worst: ${worst.date} (lost ${fmtInr(-worst.profit)} on ${fmtInr(worst.spend)} spend). ` +
+        `Total losses across the window: ${fmtInr(-totalLoss)}.`,
     });
   }
 
