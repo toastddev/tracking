@@ -363,6 +363,45 @@ export const refreshService = {
     return hydrateRun(snap.data() as Record<string, unknown>);
   },
 
+  // Admin force-unlock. The auto-reaper only fires once the lease expires
+  // (default 30 min). When an operator knows the holding instance is dead
+  // (e.g. they killed their local dev server mid-refresh), this clears the
+  // lock immediately so the next refresh can start.
+  async forceUnlock(): Promise<{ ok: true; cleared_run_id: string | null }> {
+    const cleared = await db().runTransaction<string | null>(async (tx) => {
+      const snap = await tx.get(stateRef());
+      const data = (snap.data() as RefreshStateDoc | undefined) ?? {};
+      if (!data.active_run_id) return null;
+      const active_run_id = data.active_run_id;
+      tx.update(stateRef(), {
+        active_run_id: FieldValue.delete(),
+        active_holder: FieldValue.delete(),
+        active_lease_until: FieldValue.delete(),
+        updated_at: FieldValue.serverTimestamp(),
+      });
+      const runSnap = await tx.get(runRef(active_run_id));
+      if (runSnap.exists) {
+        const status = String((runSnap.data() as Record<string, unknown>).status ?? '');
+        if (status === 'pending' || status === 'running') {
+          tx.update(runRef(active_run_id), {
+            status: 'failed' as RefreshRunStatus,
+            phase: 'done' as RefreshPhase,
+            current_step: 'Aborted: admin force-unlocked',
+            errors: FieldValue.arrayUnion({
+              phase: 'finalising',
+              message: 'Refresh lock force-released by admin',
+              at: new Date().toISOString(),
+            }),
+            finished_at: FieldValue.serverTimestamp(),
+          });
+        }
+      }
+      return active_run_id;
+    });
+    logger.warn('refresh_force_unlocked', { run_id: cleared, holder: HOLDER });
+    return { ok: true, cleared_run_id: cleared };
+  },
+
   // ── Acquire-and-run ─────────────────────────────────────────────
   // Tries to take the lock and run a refresh. If the lock is held by another
   // instance, returns {ok:false, reason:'already_running', active_run_id}.

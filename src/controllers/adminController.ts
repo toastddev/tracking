@@ -808,6 +808,21 @@ export const adminController = {
     }
   },
 
+  // Admin force-unlock for the orchestrated refresh. Used when an operator
+  // killed the holder instance mid-run and doesn't want to wait for the
+  // 30-min lease to expire before another refresh can start.
+  async refreshUnlock(c: Context) {
+    try {
+      const result = await refreshService.forceUnlock();
+      return c.json(result);
+    } catch (err) {
+      logger.error('refresh_unlock_failed', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return c.json({ error: 'internal' }, 500);
+    }
+  },
+
   // ── settings / data reset ─────────────────────────────────────────
   async resetData(c: Context) {
     const body = await c.req.json().catch(() => ({})) as { confirm?: string };

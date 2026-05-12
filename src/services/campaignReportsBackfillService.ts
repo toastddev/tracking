@@ -230,6 +230,8 @@ export const campaignReportsBackfillService = {
     }
     {
       let cursor: Date | null = null;
+      let pages = 0;
+      const phaseStart = Date.now();
       // eslint-disable-next-line no-constant-condition
       while (true) {
         let q: FirebaseFirestore.Query = db()
@@ -257,16 +259,37 @@ export const campaignReportsBackfillService = {
             offer_id,
           });
         }
+        pages += 1;
+        // Heartbeat every ~5k clicks so a long scan is visibly progressing
+        // (was silent before — easily mistaken for a hang on big windows).
+        if (pages % 5 === 0) {
+          logger.info('campaign_reports_backfill_click_scan_progress', {
+            pages,
+            scanned: click_metadata_scanned,
+            with_campaign: clicks_with_campaign,
+            elapsed_ms: Date.now() - phaseStart,
+          });
+        }
         const last = snap.docs[snap.docs.length - 1]!;
         cursor = tsToDate((last.data() as Record<string, unknown>).created_at);
         if (snap.size < PAGE || !cursor) break;
       }
+      logger.info('campaign_reports_backfill_click_scan_done', {
+        pages,
+        scanned: click_metadata_scanned,
+        with_campaign: clicks_with_campaign,
+        elapsed_ms: Date.now() - phaseStart,
+      });
     }
 
     // ── 2. conversions ───────────────────────────────────────────────
     // For each conversion, we need the click's extra_params. Fast path: the
-    // in-memory map. Slow path: read the click doc once, capped at
+    // in-memory map. Slow path: read the click doc, capped at
     // CONVERSION_LOOKUP_CAP misses to bound runtime on huge datasets.
+    //
+    // Orphan lookups are BATCHED per page via Firestore getAll. Before this,
+    // each miss cost a sequential round-trip (50-200ms × up to 5000 = many
+    // minutes of silence — easily mistaken for a hang).
     let conversions_scanned = 0;
     let conversions_with_campaign = 0;
     let orphan_lookups = 0;
@@ -274,6 +297,8 @@ export const campaignReportsBackfillService = {
       const scanFrom = new Date(from.getTime() - BACKFILL_SCAN_PAD_BEFORE_MS);
       const scanTo = new Date(to.getTime() + BACKFILL_SCAN_PAD_AFTER_MS);
       let cursor: Date | null = null;
+      let pages = 0;
+      const phaseStart = Date.now();
       // eslint-disable-next-line no-constant-condition
       while (true) {
         if (conversions_scanned >= MAX_CONVERSIONS_SCAN) {
@@ -294,57 +319,75 @@ export const campaignReportsBackfillService = {
         if (cursor) q = q.startAfter(cursor);
         const snap = await q.get();
         if (snap.empty) break;
+
+        // Pass 1 — filter & collect orphan click_ids for batched fetch.
+        interface PageItem {
+          raw: Record<string, unknown>;
+          eventDay: string;
+          click_id: string;
+        }
+        const pageItems: PageItem[] = [];
+        const orphanIds = new Set<string>();
         for (const d of snap.docs) {
           const raw = d.data() as Record<string, unknown>;
-          // Skip shadow rows — audit-only postbacks for API-backed networks,
-          // same exclusion rule as the offer_reports backfill.
           if (raw.shadow === true) continue;
           const at = tsToDate(raw.created_at);
           if (!at) continue;
-          // Bucket on event-time so late API pulls land in the right day.
           const eventAt = eventDateFromRaw(at, raw.network_timestamp);
           const eventDay = dayKeyUTC(eventAt);
           if (eventDay < fromDay || eventDay > toDay) continue;
+          conversions_scanned += 1;
           const verified = Boolean(raw.verified);
           const click_id = (raw.click_id as string | undefined) || '';
-          conversions_scanned += 1;
-          // Unverified conversions have no click match → no campaign → skip.
           if (!verified || !click_id) continue;
+          pageItems.push({ raw, eventDay, click_id });
+          if (!clickMeta.has(click_id) && orphan_lookups + orphanIds.size < CONVERSION_LOOKUP_CAP) {
+            orphanIds.add(click_id);
+          }
+        }
 
-          let meta = clickMeta.get(click_id);
-          if (!meta && orphan_lookups < CONVERSION_LOOKUP_CAP) {
-            // Single-doc read for a click outside the window or evicted.
+        // Batched orphan lookup. getAll handles arbitrary fan-out under the
+        // hood, but chunk at 300 to bound latency on a single round-trip and
+        // surface a heartbeat between chunks.
+        if (orphanIds.size > 0) {
+          const ORPHAN_CHUNK = 300;
+          const ids = Array.from(orphanIds);
+          for (let i = 0; i < ids.length; i += ORPHAN_CHUNK) {
+            const chunk = ids.slice(i, i + ORPHAN_CHUNK);
+            const refs = chunk.map((id) => db().collection(COLLECTIONS.CLICKS).doc(id));
             try {
-              const cs = await db().collection(COLLECTIONS.CLICKS).doc(click_id).get();
-              orphan_lookups += 1;
-              if (cs.exists) {
+              const docs = await db().getAll(...refs);
+              for (const cs of docs) {
+                orphan_lookups += 1;
+                if (!cs.exists) continue;
                 const cdata = cs.data() as Record<string, unknown>;
                 const campaign = extractCampaign(cdata.extra_params);
                 if (campaign) {
-                  meta = {
+                  clickMeta.set(cs.id, {
                     campaign_id: campaign.campaign_id,
                     source: campaign.source,
                     offer_id: String(cdata.offer_id ?? ''),
-                  };
-                  // Cache so a second conversion for the same click doesn't
-                  // re-fetch.
-                  clickMeta.set(click_id, meta);
+                  });
                 }
               }
             } catch (err) {
-              logger.warn('campaign_backfill_click_lookup_failed', {
-                click_id,
+              logger.warn('campaign_backfill_batch_click_lookup_failed', {
+                chunk_size: chunk.length,
                 error: err instanceof Error ? err.message : String(err),
               });
             }
           }
+        }
+
+        // Pass 2 — attribute now that all click metadata for this page is in
+        // the cache.
+        for (const item of pageItems) {
+          const meta = clickMeta.get(item.click_id);
           if (!meta) continue;
-
-          const offer_id = (raw.offer_id as string | undefined) || meta.offer_id || 'unknown';
-          const payout = typeof raw.payout === 'number' ? (raw.payout as number) : 0;
-          const status = raw.status as string | undefined;
-
-          const b = bucketFor(meta.campaign_id, meta.source, eventDay);
+          const offer_id = (item.raw.offer_id as string | undefined) || meta.offer_id || 'unknown';
+          const payout = typeof item.raw.payout === 'number' ? (item.raw.payout as number) : 0;
+          const status = item.raw.status as string | undefined;
+          const b = bucketFor(meta.campaign_id, meta.source, item.eventDay);
           b.postbacks += 1;
           b.conversions += 1;
           if (Number.isFinite(payout)) b.revenue += payout;
@@ -352,10 +395,29 @@ export const campaignReportsBackfillService = {
           if (offer_id) b.offers.add(offer_id);
           conversions_with_campaign += 1;
         }
+
+        pages += 1;
+        // Heartbeat every page — was every 5 before, but orphan lookups can
+        // make a single page take seconds, so a per-page log keeps the
+        // operator from thinking the run hung.
+        logger.info('campaign_reports_backfill_conv_scan_progress', {
+          pages,
+          scanned: conversions_scanned,
+          with_campaign: conversions_with_campaign,
+          orphan_lookups,
+          elapsed_ms: Date.now() - phaseStart,
+        });
         const last = snap.docs[snap.docs.length - 1]!;
         cursor = tsToDate((last.data() as Record<string, unknown>).created_at);
         if (snap.size < PAGE || !cursor) break;
       }
+      logger.info('campaign_reports_backfill_conv_scan_done', {
+        pages,
+        scanned: conversions_scanned,
+        with_campaign: conversions_with_campaign,
+        orphan_lookups,
+        elapsed_ms: Date.now() - phaseStart,
+      });
     }
 
     // ── 3. flush ─────────────────────────────────────────────────────

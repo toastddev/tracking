@@ -75,6 +75,7 @@ adminRoutes.get('/api/affiliate-apis/:id/runs', (c) => affiliateApiController.ru
 // the run is in flight; works from any Cloud Run instance since state lives
 // in Firestore).
 adminRoutes.post('/api/refresh', (c) => adminController.refreshAll(c));
+adminRoutes.post('/api/refresh/unlock', (c) => adminController.refreshUnlock(c));
 adminRoutes.get('/api/refresh/status', (c) => adminController.refreshStatus(c));
 adminRoutes.get('/api/refresh/runs/:id', (c) => adminController.refreshRun(c));
 
