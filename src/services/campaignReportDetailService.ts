@@ -32,6 +32,11 @@ export interface CampaignDetailDailyPoint {
   spend: number;
   profit: number;
   roas: number;
+  // Google Ads native metrics
+  gads_clicks: number;
+  gads_impressions: number;
+  gads_ctr: number;
+  gads_cpc: number;
 }
 
 export interface CampaignDetailSummary {
@@ -52,6 +57,11 @@ export interface CampaignDetailSummary {
   roas: number;
   roi: number;
   approval_rate: number;
+  // Google Ads native metrics
+  gads_clicks: number;
+  gads_impressions: number;
+  gads_ctr: number;
+  gads_cpc: number;
 }
 
 export interface CampaignDetailDeltas {
@@ -156,6 +166,7 @@ function pctChange(curr: number, prev: number): number | null {
 function summariseRows(rows: CampaignReportDoc[]): CampaignDetailSummary {
   let clicks = 0, postbacks = 0, conversions = 0, unverified = 0;
   let approved = 0, pending = 0, rejected = 0, revenue = 0, spend = 0;
+  let gadsClicks = 0, gadsImpressions = 0;
   for (const r of rows) {
     clicks += r.clicks;
     postbacks += r.postbacks;
@@ -166,6 +177,8 @@ function summariseRows(rows: CampaignReportDoc[]): CampaignDetailSummary {
     rejected += r.rejected;
     revenue += r.revenue;
     spend += r.spend;
+    gadsClicks += r.gads_clicks;
+    gadsImpressions += r.gads_impressions;
   }
   const profit = revenue - spend;
   return {
@@ -186,6 +199,10 @@ function summariseRows(rows: CampaignReportDoc[]): CampaignDetailSummary {
     roas: safeDiv(revenue, spend),
     roi: spend > 0 ? (revenue - spend) / spend : 0,
     approval_rate: safeDiv(approved, conversions),
+    gads_clicks: gadsClicks,
+    gads_impressions: gadsImpressions,
+    gads_ctr: safeDiv(gadsClicks, gadsImpressions),
+    gads_cpc: gadsClicks > 0 ? spend / gadsClicks : 0,
   };
 }
 
@@ -301,6 +318,10 @@ export const campaignReportDetailService = {
         spend: 0,
         profit: 0,
         roas: 0,
+        gads_clicks: 0,
+        gads_impressions: 0,
+        gads_ctr: 0,
+        gads_cpc: 0,
       });
     }
     for (const r of currentRows) {
@@ -317,6 +338,10 @@ export const campaignReportDetailService = {
       p.spend += r.spend;
       p.profit = p.revenue - p.spend;
       p.roas = safeDiv(p.revenue, p.spend);
+      p.gads_clicks += r.gads_clicks;
+      p.gads_impressions += r.gads_impressions;
+      p.gads_ctr = safeDiv(p.gads_clicks, p.gads_impressions);
+      p.gads_cpc = r.gads_cpc;
     }
     const series = Array.from(seriesMap.values()).sort((a, b) => a.date.localeCompare(b.date));
 

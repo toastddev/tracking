@@ -14,6 +14,11 @@ export interface CampaignDailyPoint {
   revenue: number;
   spend: number;
   profit: number;          // revenue - spend
+  // Google Ads native metrics
+  gads_clicks: number;
+  gads_impressions: number;
+  gads_ctr: number;
+  gads_cpc: number;
 }
 
 export interface CampaignReportSummary {
@@ -40,6 +45,11 @@ export interface CampaignReportSummary {
   spend_coverage: number;  // share of active days that have spend recorded (0..1)
   offers: string[];        // distinct offer_ids seen
   series: CampaignDailyPoint[];
+  // Google Ads native metrics (aggregated from daily docs)
+  gads_clicks: number;
+  gads_impressions: number;
+  gads_ctr: number;        // weighted average: gads_clicks / gads_impressions
+  gads_cpc: number;        // weighted average: total gads spend / gads_clicks
 }
 
 // Top-level insight band — the operator's "what should I do today?" digest.
@@ -159,6 +169,10 @@ export const campaignReportsService = {
           revenue: 0,
           spend: 0,
           profit: 0,
+          gads_clicks: 0,
+          gads_impressions: 0,
+          gads_ctr: 0,
+          gads_cpc: 0,
         });
       }
 
@@ -176,6 +190,9 @@ export const campaignReportsService = {
       let campaign_name: string | undefined;
       let source = 'gad_campaignid';
       const offers = new Set<string>();
+      // Google Ads native aggregates
+      let gadsClicksTotal = 0;
+      let gadsImpressionsTotal = 0;
 
       for (const r of cRows) {
         clicks += r.clicks;
@@ -187,6 +204,8 @@ export const campaignReportsService = {
         rejected += r.rejected;
         revenue += r.revenue;
         spend += r.spend;
+        gadsClicksTotal += r.gads_clicks;
+        gadsImpressionsTotal += r.gads_impressions;
         if (r.campaign_name) campaign_name = r.campaign_name;
         if (r.source) source = r.source;
         for (const o of r.offers) offers.add(o);
@@ -198,6 +217,10 @@ export const campaignReportsService = {
           point.revenue += r.revenue;
           point.spend += r.spend;
           point.profit = point.revenue - point.spend;
+          point.gads_clicks += r.gads_clicks;
+          point.gads_impressions += r.gads_impressions;
+          point.gads_ctr = safeDiv(point.gads_clicks, point.gads_impressions);
+          point.gads_cpc = r.gads_cpc; // daily CPC from GADS
         }
         const isActive = r.clicks > 0 || r.postbacks > 0 || r.spend > 0;
         if (isActive) activeDays += 1;
@@ -235,6 +258,10 @@ export const campaignReportsService = {
         spend_coverage: safeDiv(daysWithSpend, Math.max(activeDays, 1)),
         offers: Array.from(offers).sort(),
         series: Array.from(seriesMap.values()).sort((a, b) => a.date.localeCompare(b.date)),
+        gads_clicks: gadsClicksTotal,
+        gads_impressions: gadsImpressionsTotal,
+        gads_ctr: safeDiv(gadsClicksTotal, gadsImpressionsTotal),
+        gads_cpc: gadsClicksTotal > 0 ? spend / gadsClicksTotal : 0,
       });
 
       totalClicks += clicks;

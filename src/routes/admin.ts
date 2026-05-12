@@ -5,8 +5,9 @@ import { requireAuth } from '../middleware/auth';
 
 export const adminRoutes = new Hono();
 
-// Public — login
+// Public — login and config
 adminRoutes.post('/api/auth/login', (c) => adminController.login(c));
+adminRoutes.get('/api/config', (c) => adminController.config(c));
 
 // Everything below is gated on a valid Bearer token.
 adminRoutes.use('/api/*', requireAuth);

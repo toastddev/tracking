@@ -31,6 +31,12 @@ export interface CampaignReportDoc {
   pending: number;
   rejected: number;
   offers: string[];        // distinct offers seen on this campaign-day
+  // Google Ads native metrics (set by syncCampaigns, separate from our tracking data)
+  gads_clicks: number;
+  gads_impressions: number;
+  gads_ctr: number;        // clicks / impressions (0..1)
+  gads_cpc: number;        // average CPC in display currency
+  gads_cost_micros: number; // raw cost_micros from Google Ads (in account currency)
   updated_at?: string;
 }
 
@@ -209,6 +215,35 @@ export const campaignReportRepository = {
     );
   },
 
+  // Persist Google Ads native metrics (clicks, impressions, CTR, CPC, cost_micros)
+  // alongside the spend on a campaign-day doc.
+  async updateGadsMetrics(input: {
+    campaign_id: string;
+    date: string;
+    spend: number;
+    gads_clicks: number;
+    gads_impressions: number;
+    gads_ctr: number;
+    gads_cpc: number;
+    gads_cost_micros: number;
+  }): Promise<void> {
+    const ref = db().collection(COLLECTIONS.CAMPAIGN_REPORTS).doc(docId(input.campaign_id, input.date));
+    await ref.set(
+      {
+        campaign_id: input.campaign_id,
+        date: input.date,
+        spend: input.spend,
+        gads_clicks: input.gads_clicks,
+        gads_impressions: input.gads_impressions,
+        gads_ctr: input.gads_ctr,
+        gads_cpc: input.gads_cpc,
+        gads_cost_micros: input.gads_cost_micros,
+        updated_at: FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+  },
+
   // Patch the human-readable name for a campaign. Stored on every doc for that
   // campaign so a single read of a date row carries the display name.
   async updateName(input: { campaign_id: string; campaign_name: string }): Promise<void> {
@@ -313,6 +348,11 @@ function hydrate(raw: Record<string, unknown>): CampaignReportDoc {
     pending: numOr0(raw.pending),
     rejected: numOr0(raw.rejected),
     offers: Array.isArray(raw.offers) ? (raw.offers as unknown[]).map(String) : [],
+    gads_clicks: numOr0(raw.gads_clicks),
+    gads_impressions: numOr0(raw.gads_impressions),
+    gads_ctr: numOr0(raw.gads_ctr),
+    gads_cpc: numOr0(raw.gads_cpc),
+    gads_cost_micros: numOr0(raw.gads_cost_micros),
     updated_at:
       raw.updated_at instanceof Timestamp
         ? (raw.updated_at as Timestamp).toDate().toISOString()

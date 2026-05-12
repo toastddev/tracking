@@ -7,6 +7,7 @@ import {
   BACKFILL_SCAN_PAD_BEFORE_MS,
   BACKFILL_SCAN_PAD_AFTER_MS,
 } from './eventTime';
+import { normalizePayout } from '../utils/fxRates';
 
 // Reconstructs conversion-side fields in offer_reports from source
 // conversions. Click counts are intentionally not recalculated here: they are
@@ -229,7 +230,9 @@ export const offerReportsBackfillService = {
           const eventAt = eventDateFromRaw(at, raw.network_timestamp);
           const eventDay = dayKeyUTC(eventAt);
           if (eventDay < fromDay || eventDay > toDay) continue;
-          const payout = typeof raw.payout === 'number' ? (raw.payout as number) : 0;
+          const rawPayout = typeof raw.payout === 'number' ? (raw.payout as number) : 0;
+          const currency = typeof raw.currency === 'string' ? raw.currency : undefined;
+          const payout = normalizePayout(rawPayout, currency) ?? 0;
           const status = raw.status as string | undefined;
           const network_id = (raw.network_id as string | undefined) || 'none';
           const verification_reason = raw.verification_reason as string | undefined;

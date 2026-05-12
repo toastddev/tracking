@@ -18,7 +18,7 @@ import { campaignReportsBackfillService } from '../services/campaignReportsBackf
 import { campaignReportRepository } from '../firestore';
 import { googleAdsSyncStateRepository } from '../firestore';
 import { googleAdsForwardingService } from '../services/googleAdsForwardingService';
-import { googleAdsCampaignSyncService } from '../services/googleAdsCampaignSyncService';
+import { googleAdsCampaignSyncService, displayCurrency } from '../services/googleAdsCampaignSyncService';
 
 import { dataResetService } from '../services/dataResetService';
 import { logger } from '../utils/logger';
@@ -123,6 +123,13 @@ export const adminController = {
   me(c: Context) {
     const email = c.get('admin_email' as never) as string | undefined;
     return c.json({ email: email ?? null });
+  },
+
+  // Expose client-visible configuration (display currency, etc.)
+  config(c: Context) {
+    return c.json({
+      display_currency: displayCurrency(),
+    });
   },
 
   // ── offers ────────────────────────────────────────────────────────

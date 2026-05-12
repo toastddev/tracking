@@ -8,6 +8,7 @@ import {
   BACKFILL_SCAN_PAD_BEFORE_MS,
   BACKFILL_SCAN_PAD_AFTER_MS,
 } from './eventTime';
+import { normalizePayout } from '../utils/fxRates';
 
 // Reconstructs conversion-side fields in campaign_reports from source
 // conversions. Click counts are intentionally not recalculated here: they are
@@ -341,7 +342,9 @@ export const campaignReportsBackfillService = {
           if (!meta) continue;
 
           const offer_id = (raw.offer_id as string | undefined) || meta.offer_id || 'unknown';
-          const payout = typeof raw.payout === 'number' ? (raw.payout as number) : 0;
+          const rawPayout = typeof raw.payout === 'number' ? (raw.payout as number) : 0;
+          const currency = typeof raw.currency === 'string' ? raw.currency : undefined;
+          const payout = normalizePayout(rawPayout, currency) ?? 0;
           const status = raw.status as string | undefined;
 
           const b = bucketFor(meta.campaign_id, meta.source, eventDay);

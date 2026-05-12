@@ -8,6 +8,7 @@ import {
   BACKFILL_SCAN_PAD_BEFORE_MS,
   BACKFILL_SCAN_PAD_AFTER_MS,
 } from './eventTime';
+import { normalizePayout } from '../utils/fxRates';
 import type { ClickRecord, ConversionRecord } from '../types';
 
 const PAGE = 1000;
@@ -208,7 +209,9 @@ export const drilldownsBackfillService = {
           const offer_id = (raw.offer_id as string | undefined) || 'unknown';
           const network_id = (raw.network_id as string | undefined) || '(unknown)';
           const verified = Boolean(raw.verified);
-          const payout = typeof raw.payout === 'number' ? raw.payout : 0;
+          const rawPayout = typeof raw.payout === 'number' ? raw.payout : 0;
+          const currency = typeof raw.currency === 'string' ? raw.currency : undefined;
+          const payout = normalizePayout(rawPayout, currency) ?? 0;
           const status = raw.status as string | undefined;
 
           // Process Offer Drilldown for Conversion

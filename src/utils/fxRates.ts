@@ -70,3 +70,15 @@ export function convertCurrency(
     currency: to,
   };
 }
+
+// Normalizes a payout amount into the global display currency.
+// Falls back to the original amount if the FX rate is missing.
+export function normalizePayout(
+  payout: number | undefined | null,
+  currency: string | undefined | null
+): number | undefined {
+  if (payout == null || !Number.isFinite(payout)) return undefined;
+  const display = (process.env.GOOGLE_ADS_UPLOAD_CURRENCY || 'USD').trim().toUpperCase();
+  const converted = convertCurrency(payout, currency || undefined, display);
+  return converted ? converted.amount : payout;
+}

@@ -13,6 +13,7 @@ import { networkService } from './networkService';
 import { googleAdsForwardingService } from './googleAdsForwardingService';
 import { eventDate } from './eventTime';
 import { retry } from '../utils/retry';
+import { normalizePayout } from '../utils/fxRates';
 import type { ConversionRecord, Network, VerificationReason } from '../types';
 
 export interface PostbackInput {
@@ -159,7 +160,7 @@ export const postbackService = {
             at: eventDate(conv),
             verified: conv.verified,
             status: conv.status,
-            payout: conv.payout,
+            payout: normalizePayout(conv.payout, conv.currency),
             verification_reason: conv.verification_reason,
           }),
         );
@@ -197,7 +198,7 @@ export const postbackService = {
             at: eventDate(conv),
             verified: conv.verified,
             status: conv.status,
-            payout: conv.payout,
+            payout: normalizePayout(conv.payout, conv.currency),
             offer_id: conv.offer_id,
           })
         ).catch((err: unknown) => {

@@ -17,6 +17,7 @@ import { generateConversionId } from '../utils/idGenerator';
 import { googleAdsForwardingService } from './googleAdsForwardingService';
 import { eventDate } from './eventTime';
 import { retry } from '../utils/retry';
+import { normalizePayout } from '../utils/fxRates';
 import type {
   AffiliateApi,
   AffiliateApiAuthConfig,
@@ -394,7 +395,7 @@ export async function runAffiliateApi(api: AffiliateApi, opts: RunOptions): Prom
             at: eventDate(b.conv),
             verified: !!b.conv.verified,
             status: b.conv.status,
-            payout: b.conv.payout,
+            payout: normalizePayout(b.conv.payout, b.conv.currency),
             verification_reason: b.conv.verification_reason,
           }));
         if (rollupRows.length > 0) {
@@ -422,7 +423,7 @@ export async function runAffiliateApi(api: AffiliateApi, opts: RunOptions): Prom
               at: eventDate(b.conv),
               verified: true,
               status: b.conv.status,
-              payout: b.conv.payout,
+              payout: normalizePayout(b.conv.payout, b.conv.currency),
               offer_id: b.conv.offer_id as string,
             };
           })
