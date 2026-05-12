@@ -109,6 +109,15 @@ function parseDate(v: string | undefined): Date | undefined {
   return Number.isNaN(d.getTime()) ? undefined : d;
 }
 
+// RFC-4180-ish CSV cell escape. Wrap in double-quotes when the value contains
+// a quote, comma, or newline; double up embedded quotes. Used by exportClicks.
+function csvEscape(v: unknown): string {
+  if (v == null) return '';
+  const s = typeof v === 'string' ? v : String(v);
+  if (/[",\r\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+  return s;
+}
+
 export const adminController = {
   // ── auth ──────────────────────────────────────────────────────────
   async login(c: Context) {
@@ -444,6 +453,103 @@ export const adminController = {
       limit: parseLimit(c),
     });
     return c.json(result);
+  },
+
+  // Single-shot CSV export of every click in the window — no cursor walking,
+  // one Firestore query, response streamed straight to the browser. The
+  // returned CSV expands sub_params / ad_ids / extra_params into dynamic
+  // columns built from the union of keys seen so the operator gets every
+  // dimension that exists in the data.
+  async exportClicks(c: Context) {
+    const from = parseDate(c.req.query('from'));
+    const to = parseDate(c.req.query('to'));
+    if (!from || !to) return c.json({ error: 'from_and_to_required' }, 400);
+    if (from.getTime() > to.getTime()) return c.json({ error: 'from_after_to' }, 400);
+
+    const MAX = Number(process.env.CLICK_EXPORT_MAX ?? 100_000);
+    const t0 = Date.now();
+    const rows = await clickRepository.fetchAllForExport({
+      from,
+      to,
+      offer_id: c.req.query('offer_id') || undefined,
+      aff_id: c.req.query('aff_id') || undefined,
+      max: MAX,
+    });
+
+    // Discover every sub_/ad_/extra_ key present in the result so the CSV
+    // has a column for each — no "extra_count" placeholder, the operator gets
+    // the raw values.
+    const subKeys = new Set<string>();
+    const adKeys = new Set<string>();
+    const extraKeys = new Set<string>();
+    for (const r of rows) {
+      for (const k of Object.keys(r.sub_params ?? {})) subKeys.add(k);
+      for (const k of Object.keys(r.ad_ids ?? {})) adKeys.add(k);
+      for (const k of Object.keys(r.extra_params ?? {})) extraKeys.add(k);
+    }
+    const subCols = Array.from(subKeys).sort();
+    const adCols = Array.from(adKeys).sort();
+    const extraCols = Array.from(extraKeys).sort();
+
+    const headers = [
+      'created_at',
+      'click_id',
+      'offer_id',
+      'aff_id',
+      'country',
+      'ip',
+      'user_agent',
+      'referrer',
+      'redirect_url',
+      ...subCols.map((k) => `sub_${k}`),
+      ...adCols.map((k) => `ad_${k}`),
+      ...extraCols.map((k) => `extra_${k}`),
+    ];
+
+    const out: string[] = [];
+    out.push(headers.map(csvEscape).join(','));
+    for (const r of rows) {
+      const sub = r.sub_params ?? {};
+      const ad = (r.ad_ids ?? {}) as Record<string, string | undefined>;
+      const extra = r.extra_params ?? {};
+      const row: string[] = [
+        r.created_at ?? '',
+        r.click_id ?? '',
+        r.offer_id ?? '',
+        r.aff_id ?? '',
+        r.country ?? '',
+        r.ip ?? '',
+        r.user_agent ?? '',
+        r.referrer ?? '',
+        r.redirect_url ?? '',
+        ...subCols.map((k) => sub[k] ?? ''),
+        ...adCols.map((k) => ad[k] ?? ''),
+        ...extraCols.map((k) => extra[k] ?? ''),
+      ];
+      out.push(row.map(csvEscape).join(','));
+    }
+    // UTF-8 BOM so Excel renders non-ASCII (₹, etc.) correctly on Windows.
+    const body = '﻿' + out.join('\r\n');
+    const stamp = new Date()
+      .toISOString()
+      .replace(/[-:]/g, '')
+      .replace(/\.\d+Z$/, 'Z');
+    logger.info('clicks_export', {
+      rows: rows.length,
+      max: MAX,
+      truncated: rows.length >= MAX,
+      duration_ms: Date.now() - t0,
+      from: from.toISOString(),
+      to: to.toISOString(),
+    });
+    c.header('Content-Type', 'text/csv; charset=utf-8');
+    c.header(
+      'Content-Disposition',
+      `attachment; filename="clicks_${stamp}.csv"`
+    );
+    c.header('X-Row-Count', String(rows.length));
+    if (rows.length >= MAX) c.header('X-Export-Truncated', '1');
+    return c.body(body);
   },
 
   // ── reports ───────────────────────────────────────────────────────

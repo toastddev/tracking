@@ -34,8 +34,10 @@ adminRoutes.get('/api/conversions', (c) => adminController.listAllConversions(c)
 // Conversion detail (with hydrated click for verified conversions)
 adminRoutes.get('/api/conversions/:id', (c) => adminController.getConversion(c));
 
-// Clicks list + detail (reports)
+// Clicks list + detail (reports). The /export endpoint streams the full window
+// as CSV in one Firestore query — must be declared before the :id catch-all.
 adminRoutes.get('/api/clicks', (c) => adminController.listClicks(c));
+adminRoutes.get('/api/clicks/export', (c) => adminController.exportClicks(c));
 adminRoutes.get('/api/clicks/:id', (c) => adminController.getClick(c));
 
 // Reports

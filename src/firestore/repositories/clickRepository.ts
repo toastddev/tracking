@@ -168,6 +168,40 @@ export const clickRepository = {
     });
   },
 
+  // Single Firestore query that returns every click in the window with all
+  // fields — used by the CSV export endpoint. No cursor pagination: the
+  // operator's date window is the cap. `max` is a hard ceiling so a
+  // misconfigured filter can't fan out into a million-doc scan.
+  async fetchAllForExport(opts: {
+    from: Date;
+    to: Date;
+    offer_id?: string;
+    aff_id?: string;
+    max: number;
+  }): Promise<ClickRecord[]> {
+    let query: FirebaseFirestore.Query = db().collection(COLLECTIONS.CLICKS);
+    if (opts.offer_id) query = query.where('offer_id', '==', opts.offer_id);
+    if (opts.aff_id) query = query.where('aff_id', '==', opts.aff_id);
+    query = query
+      .where('created_at', '>=', opts.from)
+      .where('created_at', '<=', opts.to)
+      .orderBy('created_at', 'desc')
+      .limit(opts.max);
+
+    const snap = await query.get();
+    return snap.docs.map((d) => {
+      const raw = d.data() as Record<string, unknown>;
+      return {
+        ...(raw as unknown as ClickRecord),
+        click_id: d.id,
+        created_at:
+          (raw.created_at as { toDate?: () => Date } | undefined)?.toDate?.()?.toISOString?.() ??
+          (raw.created_at as string | undefined) ??
+          '',
+      };
+    });
+  },
+
   async countRange(opts: { from: Date; to: Date; offer_id?: string; aff_id?: string }): Promise<number> {
     let query: FirebaseFirestore.Query = db().collection(COLLECTIONS.CLICKS);
     if (opts.offer_id) query = query.where('offer_id', '==', opts.offer_id);
