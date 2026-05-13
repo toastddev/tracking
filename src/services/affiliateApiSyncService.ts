@@ -414,10 +414,11 @@ export async function runAffiliateApi(api: AffiliateApi, opts: RunOptions): Prom
         const campaignRollupRows = newBatch
           .filter((b) => b.conv.offer_id && b.conv.verified && b.click)
           .map((b) => {
-            const c = extractCampaign(b.click!.extra_params);
+            const c = extractCampaign(b.click!);
             if (!c) return null;
             return {
               campaign_id: c.campaign_id,
+              campaign_name: c.campaign_name,
               source: c.source,
               at: eventDate(b.conv),
               verified: true,

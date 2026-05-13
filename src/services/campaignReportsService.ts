@@ -1,4 +1,6 @@
-import { campaignReportRepository, type CampaignReportDoc } from '../firestore';
+import { campaignReportRepository, offerReportRepository, type CampaignReportDoc } from '../firestore';
+import { toInr } from '../utils/fxRates';
+import { logger } from '../utils/logger';
 
 export interface CampaignReportsFilters {
   from: Date;
@@ -62,6 +64,21 @@ export interface CampaignInsight {
   campaign_id?: string;
 }
 
+// Per-day total INR revenue across ALL conversions (from offer_reports),
+// regardless of campaign attribution. Used by the campaigns dashboard to draw
+// the "total revenue" line alongside the campaign-attributed revenue area, so
+// the operator can see how much revenue is leaking out of the campaign rollup
+// (untagged traffic, conversions whose click wasn't matched, etc.).
+//
+// Conversion: offer_reports.revenue is stored raw in the conversion's native
+// currency. By system convention payouts are USD (see offer_reports docs), so
+// the value is run through `toInr(revenue, 'USD')`. Days where the FX rate is
+// missing are reported as `null` so the chart shows a gap rather than a 0.
+export interface CampaignDailyTotal {
+  date: string;
+  total_revenue_inr: number | null;
+}
+
 export interface CampaignReportsResponse {
   from: string;
   to: string;
@@ -87,7 +104,13 @@ export interface CampaignReportsResponse {
     gads_impressions: number;
     gads_ctr: number;
     gads_cpc: number;
+    // Total revenue across ALL conversions in the window (from offer_reports),
+    // converted to INR via `toInr(revenue, 'USD')`. May be 0 when the FX rate
+    // is missing — the daily_totals series carries `null` for those days so
+    // the chart shows a gap.
+    total_revenue_inr: number;
   };
+  daily_totals: CampaignDailyTotal[];
   insights: CampaignInsight[];
 }
 
@@ -128,11 +151,19 @@ function slope(values: number[]): number {
 
 export const campaignReportsService = {
   async perCampaignSummary(f: CampaignReportsFilters): Promise<CampaignReportsResponse> {
-    const rows = await campaignReportRepository.fetchRange({
-      from: f.from,
-      to: f.to,
-      campaign_ids: f.campaign_ids,
-    });
+    // Campaign rollup AND offer rollup fetched in parallel — the latter feeds
+    // the daily_totals series so the dashboard can overlay total revenue
+    // alongside campaign-attributed revenue.
+    const [rows, offerRows] = await Promise.all([
+      campaignReportRepository.fetchRange({
+        from: f.from,
+        to: f.to,
+        campaign_ids: f.campaign_ids,
+      }),
+      // offer_reports is NEVER restricted by campaign_ids — the whole point of
+      // this line is to show revenue that the campaign filter excludes.
+      offerReportRepository.fetchRange({ from: f.from, to: f.to }),
+    ]);
 
     const days = eachDayKeyUTC(f.from, f.to);
 
@@ -285,6 +316,42 @@ export const campaignReportsService = {
     // Highest revenue surfaces first — same convention as offer reports.
     summaries.sort((a, b) => b.revenue - a.revenue);
 
+    // ── daily totals from offer_reports (FX-converted to INR) ────────────
+    // Days where every offer_report row in scope has a missing FX rate are
+    // reported as `null` so the chart leaves a gap; days that are partly
+    // converted use the partial sum (warned once per currency).
+    const dailyRevenueByDate = new Map<string, { inr: number; fxMissing: boolean }>();
+    const fxWarnedCurrencies = new Set<string>();
+    let totalRevenueInr = 0;
+    for (const r of offerRows) {
+      // Default to USD per system convention — offer_reports.revenue is the
+      // raw sum of payouts, which are USD unless tagged otherwise. (Mixed-
+      // currency offer rows are an audit-trail surface, not a normalised one.)
+      const inr = toInr(r.revenue, 'USD');
+      const entry = dailyRevenueByDate.get(r.date) ?? { inr: 0, fxMissing: false };
+      if (inr == null) {
+        entry.fxMissing = true;
+        if (!fxWarnedCurrencies.has('USD')) {
+          fxWarnedCurrencies.add('USD');
+          logger.warn('campaign_reports_daily_total_fx_missing', {
+            hint: 'Set GOOGLE_ADS_FX_RATES env var (e.g. INR:93,EUR:100) for USD→INR conversion.',
+          });
+        }
+      } else {
+        entry.inr += inr;
+        totalRevenueInr += inr;
+      }
+      dailyRevenueByDate.set(r.date, entry);
+    }
+    const daily_totals: CampaignDailyTotal[] = days.map((date) => {
+      const entry = dailyRevenueByDate.get(date);
+      if (!entry) return { date, total_revenue_inr: 0 };
+      // Surface a gap (null) only when FX is missing AND we have nothing
+      // converted for the day — a partial-day total is still useful signal.
+      if (entry.fxMissing && entry.inr === 0) return { date, total_revenue_inr: null };
+      return { date, total_revenue_inr: entry.inr };
+    });
+
     const totalProfit = totalRevenue - totalSpend;
     const totals = {
       clicks: totalClicks,
@@ -306,6 +373,7 @@ export const campaignReportsService = {
       gads_impressions: totalGadsImpressions,
       gads_ctr: safeDiv(totalGadsClicks, totalGadsImpressions),
       gads_cpc: safeDiv(totalSpend, totalGadsClicks),
+      total_revenue_inr: totalRevenueInr,
     };
 
     const insights = buildInsights(summaries, totals);
@@ -315,6 +383,7 @@ export const campaignReportsService = {
       to: f.to.toISOString(),
       campaigns: summaries,
       totals,
+      daily_totals,
       insights,
     };
   },

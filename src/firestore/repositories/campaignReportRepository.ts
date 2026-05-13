@@ -71,6 +71,12 @@ export interface IncrementClickInput {
   source: CampaignSource;
   at: Date;
   offer_id?: string;
+  // Optional friendly name — set by the synthetic `gads_untagged` fallback
+  // (gclid-only clicks) so the campaigns table doesn't show the raw id.
+  // Real campaigns get their name from the Google Ads sync; passing
+  // campaign_name here is only meant for cases where no later sync will
+  // populate it.
+  campaign_name?: string;
 }
 
 export interface IncrementConversionInput {
@@ -88,6 +94,8 @@ export interface IncrementConversionInput {
   // would skip the conversion and leave raw USD in the INR field.
   currency?: string;
   offer_id?: string;
+  // Same semantics as IncrementClickInput.campaign_name — synthetic-fallback only.
+  campaign_name?: string;
 }
 
 export interface CampaignReportRangeOptions {
@@ -108,6 +116,7 @@ export const campaignReportRepository = {
       clicks: FieldValue.increment(1),
       updated_at: FieldValue.serverTimestamp(),
     };
+    if (input.campaign_name) patch.campaign_name = input.campaign_name;
     if (input.offer_id) {
       // arrayUnion is idempotent — repeat clicks for the same offer don't
       // bloat the array. Caps at a few-hundred distinct offers per campaign-
@@ -127,6 +136,7 @@ export const campaignReportRepository = {
       postbacks: FieldValue.increment(1),
       updated_at: FieldValue.serverTimestamp(),
     };
+    if (input.campaign_name) patch.campaign_name = input.campaign_name;
     if (input.verified) {
       patch.conversions = FieldValue.increment(1);
       if (typeof input.payout === 'number' && Number.isFinite(input.payout)) {
@@ -157,6 +167,7 @@ export const campaignReportRepository = {
       pending: number;
       rejected: number;
       offers: Set<string>;
+      campaign_name?: string;
     };
     const buckets = new Map<string, Bucket>();
     for (const r of rows) {
@@ -179,6 +190,7 @@ export const campaignReportRepository = {
         };
         buckets.set(key, b);
       }
+      if (r.campaign_name && !b.campaign_name) b.campaign_name = r.campaign_name;
       b.postbacks += 1;
       if (r.verified) {
         b.conversions += 1;
@@ -203,6 +215,7 @@ export const campaignReportRepository = {
         postbacks: FieldValue.increment(b.postbacks),
         updated_at: FieldValue.serverTimestamp(),
       };
+      if (b.campaign_name) patch.campaign_name = b.campaign_name;
       if (b.conversions) patch.conversions = FieldValue.increment(b.conversions);
       if (b.unverified) patch.unverified = FieldValue.increment(b.unverified);
       if (b.revenue) patch.revenue = FieldValue.increment(b.revenue);

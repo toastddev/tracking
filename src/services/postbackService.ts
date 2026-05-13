@@ -185,14 +185,17 @@ export const postbackService = {
         });
       });
 
-      // Campaign rollup. Only when the resolved click carries a campaign tag
-      // — unverified postbacks (no click match) can't be attributed to a
-      // campaign, so they're skipped entirely.
-      const campaign = click ? extractCampaign(click.extra_params) : null;
+      // Campaign rollup. Fed when the resolved click carries a campaign tag
+      // (gad_campaignid / utm_campaign) OR a Google Ads click identifier
+      // (gclid/gbraid/wbraid) that falls through to the synthetic
+      // `gads_untagged` campaign. Unverified postbacks (no click match) can't
+      // be attributed to a campaign, so they're skipped entirely.
+      const campaign = click ? extractCampaign(click) : null;
       if (campaign) {
         retry(() =>
           campaignReportRepository.incrementConversion({
             campaign_id: campaign.campaign_id,
+            campaign_name: campaign.campaign_name,
             source: campaign.source,
             at: eventDate(conv),
             verified: conv.verified,

@@ -48,12 +48,17 @@ interface Bucket {
   pending: number;
   rejected: number;
   offers: Set<string>;
+  // Only set for the synthetic `gads_untagged` fallback. Real campaigns get
+  // their name from the Google Ads sync; the flush leaves campaign_name
+  // alone for them so a rebuild can't clobber the canonical name.
+  campaign_name?: string;
 }
 
 interface ClickMeta {
   campaign_id: string;
   source: CampaignSource;
   offer_id: string;
+  campaign_name?: string;
 }
 
 function emptyBucket(campaign_id: string, source: CampaignSource, date: string): Bucket {
@@ -102,20 +107,46 @@ function tsToDate(v: unknown): Date | null {
   return null;
 }
 
-// Single shared rule for picking a campaign tag off a click's extra_params.
-// gad_campaignid wins; utm_campaign is the cross-platform fallback.
+// Single shared rule for picking a campaign tag off a click. Mirrors
+// `extractCampaign` in clickService.ts — gad_campaignid wins, then
+// utm_campaign, then a Google Ads click identifier on ad_ids falls through to
+// the synthetic `gads_untagged` campaign so real GAds revenue without a
+// campaign tag still shows up. Kept duplicated (not imported) because this
+// service runs against raw Firestore documents where extra_params / ad_ids
+// are `unknown`-typed and need their own validation.
+const GADS_UNTAGGED_CAMPAIGN_ID = 'gads_untagged';
+const GADS_UNTAGGED_CAMPAIGN_NAME = 'GAds (untagged)';
+
 function extractCampaign(
-  extra: unknown
-): { campaign_id: string; source: CampaignSource } | null {
-  if (!extra || typeof extra !== 'object') return null;
-  const e = extra as Record<string, unknown>;
-  const gad = e.gad_campaignid;
-  if (typeof gad === 'string' && gad.trim()) {
-    return { campaign_id: gad.trim(), source: 'gad_campaignid' };
+  rawClick: Record<string, unknown> | null | undefined
+): { campaign_id: string; source: CampaignSource; campaign_name?: string } | null {
+  if (!rawClick) return null;
+  const extra = rawClick.extra_params;
+  if (extra && typeof extra === 'object') {
+    const e = extra as Record<string, unknown>;
+    const gad = e.gad_campaignid;
+    if (typeof gad === 'string' && gad.trim()) {
+      return { campaign_id: gad.trim(), source: 'gad_campaignid' };
+    }
+    const utm = e.utm_campaign;
+    if (typeof utm === 'string' && utm.trim()) {
+      return { campaign_id: utm.trim(), source: 'utm_campaign' };
+    }
   }
-  const utm = e.utm_campaign;
-  if (typeof utm === 'string' && utm.trim()) {
-    return { campaign_id: utm.trim(), source: 'utm_campaign' };
+  const ad = rawClick.ad_ids;
+  if (ad && typeof ad === 'object') {
+    const a = ad as Record<string, unknown>;
+    if (
+      (typeof a.gclid === 'string' && a.gclid.trim()) ||
+      (typeof a.gbraid === 'string' && a.gbraid.trim()) ||
+      (typeof a.wbraid === 'string' && a.wbraid.trim())
+    ) {
+      return {
+        campaign_id: GADS_UNTAGGED_CAMPAIGN_ID,
+        source: 'gad_campaignid',
+        campaign_name: GADS_UNTAGGED_CAMPAIGN_NAME,
+      };
+    }
   }
   return null;
 }
@@ -251,7 +282,7 @@ export const campaignReportsBackfillService = {
           const offer_id = String(raw.offer_id ?? '');
           if (!at || !offer_id) continue;
           click_metadata_scanned += 1;
-          const campaign = extractCampaign(raw.extra_params);
+          const campaign = extractCampaign(raw);
           if (!campaign) continue;
           clicks_with_campaign += 1;
           // Remember for the conversions pass.
@@ -259,6 +290,7 @@ export const campaignReportsBackfillService = {
             campaign_id: campaign.campaign_id,
             source: campaign.source,
             offer_id,
+            campaign_name: campaign.campaign_name,
           });
         }
         pages += 1;
@@ -365,12 +397,13 @@ export const campaignReportsBackfillService = {
                 orphan_lookups += 1;
                 if (!cs.exists) continue;
                 const cdata = cs.data() as Record<string, unknown>;
-                const campaign = extractCampaign(cdata.extra_params);
+                const campaign = extractCampaign(cdata);
                 if (campaign) {
                   clickMeta.set(cs.id, {
                     campaign_id: campaign.campaign_id,
                     source: campaign.source,
                     offer_id: String(cdata.offer_id ?? ''),
+                    campaign_name: campaign.campaign_name,
                   });
                 }
               }
@@ -400,6 +433,7 @@ export const campaignReportsBackfillService = {
           const currency = currencyRaw.trim() || 'USD';
           const status = item.raw.status as string | undefined;
           const b = bucketFor(meta.campaign_id, meta.source, item.eventDay);
+          if (meta.campaign_name && !b.campaign_name) b.campaign_name = meta.campaign_name;
           b.postbacks += 1;
           b.conversions += 1;
           // Campaign revenue is canonically INR. Historical conversions may be
@@ -469,7 +503,7 @@ export const campaignReportsBackfillService = {
       writer.onWriteError((err) => err.failedAttempts < 5);
       for (const b of buckets.values()) {
         const ref = db().collection(COLLECTIONS.CAMPAIGN_REPORTS).doc(`${b.campaign_id}__${b.date}`);
-        writer.set(ref, {
+        const patch: Record<string, unknown> = {
           campaign_id: b.campaign_id,
           source: b.source,
           date: b.date,
@@ -483,11 +517,14 @@ export const campaignReportsBackfillService = {
           offers: Array.from(b.offers),
           updated_at: FieldValue.serverTimestamp(),
           backfilled_at: FieldValue.serverTimestamp(),
-          // NOTE: deliberately omitting `clicks`, `spend`, `campaign_name`,
-          // and all `gads_*` fields — the merge keeps the canonical values
-          // (Google Ads sync owns the gads_* fields and the spend/name fields
-          // are user/api-managed).
-        }, { merge: true }).catch(() => { /* surfaced via onWriteError */ });
+          // NOTE: deliberately omitting `clicks`, `spend`, and all `gads_*`
+          // fields — the merge keeps the canonical values (Google Ads sync
+          // owns the gads_* fields, spend is user/api-managed). `campaign_name`
+          // is set ONLY for the synthetic gclid-only fallback so real
+          // campaigns keep the name from the GAds sync.
+        };
+        if (b.campaign_name) patch.campaign_name = b.campaign_name;
+        writer.set(ref, patch, { merge: true }).catch(() => { /* surfaced via onWriteError */ });
         buckets_written += 1;
       }
       await writer.close();

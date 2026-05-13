@@ -11,20 +11,40 @@ import { googleAdsForwardingService } from './googleAdsForwardingService';
 import { retry } from '../utils/retry';
 import type { AdIds, ClickRecord, Offer } from '../types';
 
-// Pull a campaign id off the click's extra_params. `gad_campaignid` is the
-// canonical Google Ads tag; `utm_campaign` is the cross-platform fallback so
-// Facebook / TikTok / native / organic UTM-tagged clicks also feed the rollup.
+// Pull a campaign id off the click. `gad_campaignid` (extra_params) is the
+// canonical Google Ads tag; `utm_campaign` is the cross-platform fallback.
+// Final fallback: a click that carries a gclid/gbraid/wbraid (real Google Ads
+// click) but neither campaign tag is attributed to a synthetic
+// `gads_untagged` campaign — the conversion is real GAds revenue and would
+// otherwise vanish from campaign_reports entirely (offer_reports still has it
+// raw in USD). Source is reported as `gad_campaignid` so it groups under
+// Google Ads in the dashboard.
+export const GADS_UNTAGGED_CAMPAIGN_ID = 'gads_untagged';
+export const GADS_UNTAGGED_CAMPAIGN_NAME = 'GAds (untagged)';
+
 function extractCampaign(
-  extra_params: Record<string, string> | undefined
-): { campaign_id: string; source: 'gad_campaignid' | 'utm_campaign' } | null {
-  if (!extra_params) return null;
-  const gad = extra_params.gad_campaignid;
+  click: { extra_params?: Record<string, string>; ad_ids?: AdIds } | undefined
+): {
+  campaign_id: string;
+  source: 'gad_campaignid' | 'utm_campaign';
+  campaign_name?: string;
+} | null {
+  if (!click) return null;
+  const gad = click.extra_params?.gad_campaignid;
   if (typeof gad === 'string' && gad.trim()) {
     return { campaign_id: gad.trim(), source: 'gad_campaignid' };
   }
-  const utm = extra_params.utm_campaign;
+  const utm = click.extra_params?.utm_campaign;
   if (typeof utm === 'string' && utm.trim()) {
     return { campaign_id: utm.trim(), source: 'utm_campaign' };
+  }
+  const ad = click.ad_ids;
+  if (ad && (ad.gclid || ad.gbraid || ad.wbraid)) {
+    return {
+      campaign_id: GADS_UNTAGGED_CAMPAIGN_ID,
+      source: 'gad_campaignid',
+      campaign_name: GADS_UNTAGGED_CAMPAIGN_NAME,
+    };
   }
   return null;
 }
@@ -117,14 +137,16 @@ export const clickService = {
       });
     });
 
-    // Campaign rollup. Fed only when the click carries a Google Ads campaign
-    // id or a utm_campaign tag — non-tagged organic traffic doesn't produce
-    // a campaign row.
-    const campaign = extractCampaign(click.extra_params);
+    // Campaign rollup. Fed when the click carries a Google Ads campaign id,
+    // a utm_campaign tag, or any Google Ads click identifier (gclid/gbraid/
+    // wbraid) — the last falls through to the synthetic `gads_untagged`
+    // campaign so real GAds revenue without a campaign tag still shows up.
+    const campaign = extractCampaign(click);
     if (campaign) {
       retry(() =>
         campaignReportRepository.incrementClick({
           campaign_id: campaign.campaign_id,
+          campaign_name: campaign.campaign_name,
           source: campaign.source,
           at: new Date(click.created_at),
           offer_id: click.offer_id,
