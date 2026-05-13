@@ -83,7 +83,9 @@ export interface IncrementConversionInput {
   // Currency the `payout` arrived in (per the postback / affiliate API).
   // Campaign revenue is canonically INR, so the repository converts via
   // `fxRates.toInr` before the FieldValue.increment. Empty / unknown is
-  // treated as INR (operator default), matching the dashboard standard.
+  // treated as USD here — postback / affiliate-API payouts are USD by
+  // convention (offer_reports store them raw, in USD), and assuming INR
+  // would skip the conversion and leave raw USD in the INR field.
   currency?: string;
   offer_id?: string;
 }
@@ -395,18 +397,20 @@ function numOr0(v: unknown): number {
 const fxWarnCache = new Set<string>();
 
 // Converts a postback/API payout into INR for storage on campaign_reports.
-// Empty / missing currency is treated as INR — matches the dashboard default
-// and the operator's mental model. Conversions are dropped (returned null) only
-// when an explicit non-INR currency has no FX rate configured; the caller then
-// skips the increment so we don't silently mis-attribute USD as INR.
+// Postback/affiliate-API payouts are USD by system convention (offer_reports
+// store them raw, in USD). Campaign revenue is canonically INR, so an
+// empty / missing currency is treated as USD here — otherwise toInr would
+// short-circuit and leave the raw USD figure sitting in the INR-denominated
+// `revenue` field (the exact regression that bit us when the reconciler tick
+// kept reverting the field back to USD-as-INR).
 function payoutToInr(
   payout: number,
   currency: string | undefined,
   campaign_id: string,
 ): number | null {
-  const inr = toInr(payout, currency);
+  const code = (currency ?? '').toUpperCase().trim() || 'USD';
+  const inr = toInr(payout, code);
   if (inr == null) {
-    const code = (currency ?? '').toUpperCase().trim() || 'unknown';
     const key = `campaign_revenue_fx:${code}`;
     if (!fxWarnCache.has(key)) {
       fxWarnCache.add(key);

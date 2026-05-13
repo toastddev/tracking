@@ -390,7 +390,14 @@ export const campaignReportsBackfillService = {
           if (!meta) continue;
           const offer_id = (item.raw.offer_id as string | undefined) || meta.offer_id || 'unknown';
           const payout = typeof item.raw.payout === 'number' ? (item.raw.payout as number) : 0;
-          const currency = (item.raw.currency as string | undefined) || undefined;
+          // Empty / missing currency on a conversion means the postback /
+          // affiliate API didn't tag the row. By system convention raw payouts
+          // are USD (offer_reports store them raw, in USD), so default to USD
+          // when nothing else is set — otherwise toInr short-circuits and the
+          // raw USD figure ends up sitting in the INR-denominated revenue
+          // field, which is exactly the regression we just hit.
+          const currencyRaw = (item.raw.currency as string | undefined) || '';
+          const currency = currencyRaw.trim() || 'USD';
           const status = item.raw.status as string | undefined;
           const b = bucketFor(meta.campaign_id, meta.source, item.eventDay);
           b.postbacks += 1;

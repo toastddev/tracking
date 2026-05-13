@@ -5,6 +5,7 @@ import {
   offerRepository,
   type CampaignReportDoc,
 } from '../firestore';
+import { toInr } from '../utils/fxRates';
 
 // Caps copied from offerReportDetailService — same memory/latency envelope.
 const CLICK_FETCH_CAP = 20_000;
@@ -283,7 +284,14 @@ export const campaignReportDetailService = {
       }
       bucket.conversions += 1;
       if (typeof conv.payout === 'number' && Number.isFinite(conv.payout)) {
-        bucket.revenue += conv.payout;
+        // Campaign-level revenue (including the per-offer breakdown on the
+        // detail page) is canonically INR. Postback / API payouts are USD by
+        // convention when no explicit currency is tagged, so default empty
+        // currency to USD before converting; raw payouts must not leak into
+        // the INR-denominated revenue field.
+        const currency = (conv.currency || '').trim() || 'USD';
+        const inr = toInr(conv.payout, currency);
+        if (inr != null) bucket.revenue += inr;
       }
     }
 
