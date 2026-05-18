@@ -20,6 +20,7 @@ import { retry } from '../utils/retry';
 import type {
   AffiliateApi,
   AffiliateApiAuthConfig,
+  AffiliateApiHttpDebug,
   AffiliateApiPagination,
   AffiliateApiRunRecord,
   ClickRecord,
@@ -31,6 +32,28 @@ const DEFAULT_PAGE_SIZE = 100;
 const DEFAULT_MAX_PAGES = 50;
 const DEFAULT_MAX_RECORDS = 50_000;
 const DEDUPE_BATCH = 250;
+// Dry-run debug capture: how much of the raw body to keep, and how many
+// pages to capture. Enough to see a full error page or a JSON sample.
+const MAX_DEBUG_BODY = 20_000;
+const MAX_DEBUG_PAGES = 3;
+
+// Mask secret-looking query param values so the debug view never leaks a
+// full api_key / token. Keeps the first/last few chars so the user can still
+// tell whether the right credential is being sent.
+function redactUrl(rawUrl: string): string {
+  const SECRET_RE = /(api[_-]?key|secret|token|password|passwd|signature|^key$|^sig$|^auth$)/i;
+  try {
+    const u = new URL(rawUrl);
+    for (const k of [...u.searchParams.keys()]) {
+      if (!SECRET_RE.test(k)) continue;
+      const v = u.searchParams.get(k) ?? '';
+      u.searchParams.set(k, v.length > 8 ? `${v.slice(0, 3)}…${v.slice(-3)}` : '…');
+    }
+    return u.toString();
+  } catch {
+    return rawUrl;
+  }
+}
 
 // Dedupe doc id: deterministic SHA-1 of (api_id, external_id). Same external
 // id seen twice across runs collapses into a single conversion doc — the
@@ -142,34 +165,78 @@ async function fetchOnce(opts: {
   headers: Record<string, string>;
   body: string | undefined;
   signal?: AbortSignal;
+  // When present (dry runs), the raw exchange is appended here — including
+  // non-2xx responses — before any error is thrown.
+  debug?: { sink: AffiliateApiHttpDebug[]; page: number };
 }): Promise<FetchOnceResult> {
-  const { api, url, headers, body, signal } = opts;
+  const { api, url, headers, body, signal, debug } = opts;
   const method = api.kind === 'graphql' ? 'POST' : (api.request.http_method ?? 'GET');
+  const startedAt = Date.now();
   const res = await fetch(url, {
     method,
     headers,
     body: method === 'GET' ? undefined : body,
     signal,
   });
+  const ct = res.headers.get('content-type') ?? '';
+
+  // Non-2xx: body read tolerantly (it may be an HTML/plain error page). On a
+  // dry run it's captured for the debug view; the thrown error is unchanged.
   if (!res.ok) {
-    const errBody = await res.text().catch(() => '');
-    throw new Error(`http_${res.status}: ${errBody.slice(0, 200)}`);
+    const errText = await res.text().catch(() => '');
+    if (debug) {
+      debug.sink.push({
+        page: debug.page,
+        request_url: redactUrl(url),
+        http_method: method,
+        http_status: res.status,
+        ok: false,
+        content_type: ct,
+        duration_ms: Date.now() - startedAt,
+        body_snippet: errText.slice(0, MAX_DEBUG_BODY),
+        body_truncated: errText.length > MAX_DEBUG_BODY,
+      });
+    }
+    throw new Error(`http_${res.status}: ${errText.slice(0, 200)}`);
   }
 
   // undici (Node fetch) auto-decompresses gzip / deflate / brotli when the
   // upstream sets Content-Encoding correctly, which covers Kelkoo, Admedia,
   // and every other spec-compliant API.
   const text = await res.text();
-  const ct = res.headers.get('content-type') ?? '';
-  const data = parseResponseBody({
-    body: text,
-    contentType: ct,
-    format: api.kind === 'graphql' ? 'json' : (api.response_format ?? 'auto'),
-    itemsPath: api.mapping.items_path,
-  });
+
+  let dbg: AffiliateApiHttpDebug | undefined;
+  if (debug) {
+    dbg = {
+      page: debug.page,
+      request_url: redactUrl(url),
+      http_method: method,
+      http_status: res.status,
+      ok: true,
+      content_type: ct,
+      duration_ms: Date.now() - startedAt,
+      body_snippet: text.slice(0, MAX_DEBUG_BODY),
+      body_truncated: text.length > MAX_DEBUG_BODY,
+    };
+    debug.sink.push(dbg);
+  }
+
+  let data: unknown;
+  try {
+    data = parseResponseBody({
+      body: text,
+      contentType: ct,
+      format: api.kind === 'graphql' ? 'json' : (api.response_format ?? 'auto'),
+      itemsPath: api.mapping.items_path,
+    });
+  } catch (err) {
+    if (dbg) dbg.parse_error = err instanceof Error ? err.message : String(err);
+    throw err;
+  }
 
   const itemsRaw = getPath(data, api.mapping.items_path);
   const items = Array.isArray(itemsRaw) ? itemsRaw : itemsRaw != null ? [itemsRaw] : [];
+  if (dbg) dbg.items_found = items.length;
   const nextCursor =
     api.pagination.type === 'cursor' && api.pagination.next_cursor_path
       ? asString(getPath(data, api.pagination.next_cursor_path))
@@ -350,6 +417,8 @@ export async function runAffiliateApi(api: AffiliateApi, opts: RunOptions): Prom
   }
 
   const headers = buildHeaders(api);
+  // Dry runs capture the raw HTTP exchange (first few pages) for debugging.
+  const debugSink: AffiliateApiHttpDebug[] | undefined = opts.dryRun ? [] : undefined;
   const timeoutMs = api.timeout_ms ?? DEFAULT_TIMEOUT_MS;
   const maxPages = api.pagination.max_pages ?? DEFAULT_MAX_PAGES;
   const maxRecords = api.max_records_per_run ?? DEFAULT_MAX_RECORDS;
@@ -518,7 +587,17 @@ export async function runAffiliateApi(api: AffiliateApi, opts: RunOptions): Prom
       const timer = setTimeout(() => ctrl.abort(), timeoutMs);
       let result: FetchOnceResult;
       try {
-        result = await fetchOnce({ api, url, headers, body, signal: ctrl.signal });
+        result = await fetchOnce({
+          api,
+          url,
+          headers,
+          body,
+          signal: ctrl.signal,
+          debug:
+            debugSink && debugSink.length < MAX_DEBUG_PAGES
+              ? { sink: debugSink, page: i + 1 }
+              : undefined,
+        });
       } finally {
         clearTimeout(timer);
       }
@@ -621,6 +700,9 @@ export async function runAffiliateApi(api: AffiliateApi, opts: RunOptions): Prom
   const finished = new Date();
   run.finished_at = finished.toISOString();
   run.duration_ms = finished.getTime() - started.getTime();
+  // Dry-run only; never persisted (the run-doc writes below list fields
+  // explicitly, so this stays in the returned object for the test endpoint).
+  if (debugSink) run.debug = debugSink;
 
   if (!opts.dryRun) {
     await affiliateApiRunRepository.update(run_id, {

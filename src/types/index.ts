@@ -220,6 +220,23 @@ export interface AffiliateApi {
 
 export type AffiliateApiRunStatus = 'ok' | 'partial' | 'error' | 'running' | 'skipped' | 'gads_upload_error';
 
+// Per-page HTTP capture. Populated only on dry runs so the UI can show the
+// raw upstream exchange — including non-2xx responses — for debugging. Never
+// persisted to Firestore.
+export interface AffiliateApiHttpDebug {
+  page: number;
+  request_url: string;       // secret-looking query values redacted
+  http_method: string;
+  http_status: number;
+  ok: boolean;
+  content_type: string;
+  duration_ms: number;
+  body_snippet: string;      // capped — see MAX_DEBUG_BODY in the sync service
+  body_truncated: boolean;
+  parse_error?: string;      // set when the body could not be parsed
+  items_found?: number;      // count at mapping.items_path (only when parsed)
+}
+
 export interface AffiliateApiRunRecord {
   run_id: string;
   api_id: string;
@@ -246,4 +263,7 @@ export interface AffiliateApiRunRecord {
   gads_skipped?: number;
   gads_failed?: number;
   gads_errors?: string[];
+  // Dry-run only — raw HTTP request/response capture for debugging. Not
+  // written to Firestore (the run-doc writes list fields explicitly).
+  debug?: AffiliateApiHttpDebug[];
 }
