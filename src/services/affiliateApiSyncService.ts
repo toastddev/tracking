@@ -277,8 +277,18 @@ function buildUrlAndBody(
     }
     const inc = api.incremental;
     if (inc.enabled) {
-      if (inc.from_param && windowVars.from) url.searchParams.set(inc.from_param, windowVars.from);
-      if (inc.to_param && windowVars.to) url.searchParams.set(inc.to_param, windowVars.to);
+      if (inc.from_param && inc.from_param === inc.to_param) {
+        // Both bounds share one key (e.g. HasOffers
+        // `filters[Stat.date][values][]`, which BETWEEN reads as a 2-element
+        // array). .set() would collapse them to a single value — emit a
+        // repeated key with from first, then to.
+        url.searchParams.delete(inc.from_param);
+        if (windowVars.from) url.searchParams.append(inc.from_param, windowVars.from);
+        if (windowVars.to) url.searchParams.append(inc.from_param, windowVars.to);
+      } else {
+        if (inc.from_param && windowVars.from) url.searchParams.set(inc.from_param, windowVars.from);
+        if (inc.to_param && windowVars.to) url.searchParams.set(inc.to_param, windowVars.to);
+      }
     }
   }
 
