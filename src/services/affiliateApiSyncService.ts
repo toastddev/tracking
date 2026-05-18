@@ -186,9 +186,15 @@ function buildUrlAndBody(
   const headers: Record<string, string> = {};
   applyAuth(api.auth, headers, url.searchParams);
 
-  // Static query params (rendered).
+  // Static query params (rendered). An array value emits a repeated key
+  // (e.g. HasOffers `fields[]=a&fields[]=b`) — .set() would collapse it.
   for (const [k, v] of Object.entries(api.request.query_params ?? {})) {
-    url.searchParams.set(k, renderTemplate(v, windowVars));
+    if (Array.isArray(v)) {
+      url.searchParams.delete(k);
+      for (const item of v) url.searchParams.append(k, renderTemplate(item, windowVars));
+    } else {
+      url.searchParams.set(k, renderTemplate(v, windowVars));
+    }
   }
   // Pagination + incremental query injection (REST only).
   if (api.kind === 'rest') {

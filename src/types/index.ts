@@ -182,7 +182,9 @@ export interface AffiliateApiSchedule {
 export interface AffiliateApiRequestConfig {
   // REST:
   http_method?: 'GET' | 'POST';
-  query_params?: Record<string, string>;
+  // A value may be an array to emit a repeated query key (e.g. HasOffers
+  // `fields[]=a&fields[]=b`). Plain strings still mean a single param.
+  query_params?: Record<string, string | string[]>;
   body_template?: string | null;        // raw JSON template; supports {{from}} {{to}} {{page}} placeholders
   headers?: Record<string, string>;     // non-secret headers
   // GraphQL:

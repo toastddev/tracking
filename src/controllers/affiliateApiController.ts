@@ -52,6 +52,23 @@ function asMap(v: unknown): Record<string, string> | undefined {
   return out;
 }
 
+// Like asMap, but a value may be a string[] — that survives the round-trip so
+// the request can emit a repeated query key (e.g. HasOffers `fields[]`).
+function asQueryParams(v: unknown): Record<string, string | string[]> | undefined {
+  if (v == null || typeof v !== 'object' || Array.isArray(v)) return undefined;
+  const out: Record<string, string | string[]> = {};
+  for (const [k, val] of Object.entries(v as Record<string, unknown>)) {
+    if (typeof val === 'string') {
+      out[k] = val;
+    } else if (Array.isArray(val)) {
+      const arr = val.filter((x): x is string => typeof x === 'string');
+      if (arr.length === 1) out[k] = arr[0]!;
+      else if (arr.length > 1) out[k] = arr;
+    }
+  }
+  return out;
+}
+
 type ParsedAuth =
   | { ok: true; value: AffiliateApiAuthConfig }
   | { ok: false; error: string };
@@ -180,7 +197,7 @@ function parseRequest(raw: unknown, kind: AffiliateApiKind): AffiliateApiRequest
   }
   return {
     http_method: r.http_method === 'POST' ? 'POST' : 'GET',
-    query_params: asMap(r.query_params),
+    query_params: asQueryParams(r.query_params),
     body_template: asString(r.body_template),
     headers: asMap(r.headers),
   };
