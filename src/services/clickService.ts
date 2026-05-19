@@ -63,6 +63,21 @@ export interface BuildClickInput {
   country?: string;
 }
 
+// A click rejected by the referer blocklist. No `offer` is needed — the block
+// fires before the offer fetch — so this carries only what the request itself
+// provided.
+export interface BuildBlockedClickInput {
+  offer_id: string;
+  aff_id: string;
+  sub_params: Record<string, string>;
+  ad_ids: AdIds;
+  extra_params: Record<string, string>;
+  ip?: string;
+  user_agent?: string;
+  referrer?: string;
+  country?: string;
+}
+
 export const clickService = {
   build(input: BuildClickInput): ClickRecord {
     const click_id = generateClickId();
@@ -98,6 +113,41 @@ export const clickService = {
       redirect_url,
       created_at: new Date().toISOString(),
     };
+  },
+
+  // Builds a ClickRecord for a request stopped by the referer blocklist.
+  // redirect_url is empty (the user was never redirected) and `blocked` is set
+  // so reporting can distinguish it from a real click.
+  buildBlocked(input: BuildBlockedClickInput): ClickRecord {
+    return {
+      click_id: generateClickId(),
+      offer_id: input.offer_id,
+      aff_id: input.aff_id,
+      sub_params: input.sub_params,
+      ad_ids: input.ad_ids,
+      extra_params: input.extra_params,
+      ip: input.ip,
+      user_agent: input.user_agent,
+      referrer: input.referrer,
+      country: input.country,
+      redirect_url: '',
+      blocked: true,
+      created_at: new Date().toISOString(),
+    };
+  },
+
+  // Fire-and-forget persist for a blocked click. Unlike persistAsync this
+  // writes ONLY the clicks document — blocked traffic must never feed the
+  // offer/campaign/drilldown rollups, or report totals would be inflated by
+  // requests that were never redirected.
+  persistBlockedAsync(click: ClickRecord): void {
+    retry(() => clickRepository.insert(click)).catch((err: unknown) => {
+      logger.error('blocked_click_persist_failed', {
+        click_id: click.click_id,
+        offer_id: click.offer_id,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    });
   },
 
   // Fire-and-forget. Requirement: redirect must be fast and never block on the

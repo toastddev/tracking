@@ -34,10 +34,29 @@ export const trackController = {
     }
 
     // Referer blocklist: in-memory Set lookup, no I/O. Checked before the
-    // offer fetch so blocked traffic never touches Firestore.
+    // offer fetch so blocked traffic never touches Firestore for the offer.
     const referrer = c.req.header('referer');
     if (isRefererBlocked(referrer)) {
-      logger.info('click_blocked_referer', { offer_id, referrer });
+      // Record the blocked click for later review. Fire-and-forget — the 403
+      // returns immediately and never waits on the DB write.
+      const blockedClick = clickService.buildBlocked({
+        offer_id: offer_id!,
+        aff_id,
+        sub_params: extractSubParams(query),
+        ad_ids: extractAdIds(query),
+        extra_params: extractExtraParams(query),
+        ip: clientIp(c),
+        user_agent: c.req.header('user-agent'),
+        referrer,
+        country: c.req.header('cf-ipcountry'),
+      });
+      clickService.persistBlockedAsync(blockedClick);
+
+      logger.info('click_blocked_referer', {
+        click_id: blockedClick.click_id,
+        offer_id,
+        referrer,
+      });
       return c.html(BLOCKED_REFERER_HTML, 403);
     }
 

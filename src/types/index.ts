@@ -33,6 +33,10 @@ export interface ClickRecord {
   referrer?: string;
   country?: string;
   redirect_url: string;
+  // Set on clicks rejected by the referer blocklist. Such a click was NOT
+  // redirected (redirect_url is empty) and is deliberately excluded from the
+  // offer/campaign/drilldown rollups so report totals stay accurate.
+  blocked?: boolean;
   created_at: string;
 }
 
