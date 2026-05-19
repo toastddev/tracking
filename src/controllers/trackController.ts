@@ -3,6 +3,7 @@ import { extractAdIds, extractExtraParams, extractSubParams } from '../utils/par
 import { requireParams } from '../utils/validator';
 import { offerService } from '../services/offerService';
 import { clickService } from '../services/clickService';
+import { isRefererBlocked, BLOCKED_REFERER_HTML } from '../utils/refererBlocklist';
 import { logger } from '../utils/logger';
 
 function headerGetter(c: Context) {
@@ -32,6 +33,14 @@ export const trackController = {
       return c.json({ error: 'missing_params', missing: check.missing }, 400);
     }
 
+    // Referer blocklist: in-memory Set lookup, no I/O. Checked before the
+    // offer fetch so blocked traffic never touches Firestore.
+    const referrer = c.req.header('referer');
+    if (isRefererBlocked(referrer)) {
+      logger.info('click_blocked_referer', { offer_id, referrer });
+      return c.html(BLOCKED_REFERER_HTML, 403);
+    }
+
     const offer = await offerService.fetch(offer_id!);
     if (!offer) return c.json({ error: 'offer_not_found' }, 404);
     if (offer.status !== 'active') return c.json({ error: 'offer_inactive' }, 410);
@@ -44,7 +53,7 @@ export const trackController = {
       extra_params: extractExtraParams(query),
       ip: clientIp(c),
       user_agent: c.req.header('user-agent'),
-      referrer: c.req.header('referer'),
+      referrer,
       country: c.req.header('cf-ipcountry'),
     });
 

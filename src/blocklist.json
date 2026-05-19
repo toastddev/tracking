@@ -1,0 +1,8 @@
+{
+  "_comment": "Referer blocklist for the /click redirect endpoint. If an incoming click's Referer header resolves to one of these domains (or ANY subdomain of it, e.g. m.facebook.com matches facebook.com), the user is NOT redirected to the affiliate and an error page is shown instead. List the main domain only — every subdomain is matched automatically. This file is read once at process startup; editing it requires a restart.",
+  "blockedReferrerDomains": [
+    "facebook.com",
+    "fb.com",
+    "google.com"
+  ]
+}
