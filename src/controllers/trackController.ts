@@ -24,7 +24,10 @@ export const trackController = {
     const offer_id = c.req.param('offer_id');
     const query = c.req.query();
 
-    const check = requireParams({ offer_id, ...query }, ['offer_id', 'aff_id']);
+    // Always use the URL slug as aff_id, ignore any query param
+    const aff_id = offer_id;
+
+    const check = requireParams({ offer_id, aff_id }, ['offer_id', 'aff_id']);
     if (!check.ok) {
       return c.json({ error: 'missing_params', missing: check.missing }, 400);
     }
@@ -35,7 +38,7 @@ export const trackController = {
 
     const click = clickService.build({
       offer,
-      aff_id: query.aff_id!,
+      aff_id: aff_id,
       sub_params: extractSubParams(query),
       ad_ids: extractAdIds(query),
       extra_params: extractExtraParams(query),
