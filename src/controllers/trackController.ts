@@ -25,7 +25,7 @@ export const trackController = {
     const query = c.req.query();
 
     // Always use the URL slug as aff_id, ignore any query param
-    const aff_id = offer_id;
+    const aff_id = offer_id!;
 
     const check = requireParams({ offer_id, aff_id }, ['offer_id', 'aff_id']);
     if (!check.ok) {
