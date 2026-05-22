@@ -3,6 +3,8 @@ import {
   buildRouteId,
   clickRepository,
   conversionRepository,
+  COLLECTIONS,
+  db,
   googleAdsConnectionRepository,
   googleAdsMccChildrenRepository,
   googleAdsRouteRepository,
@@ -10,6 +12,8 @@ import {
   networkRepository,
   offerRepository,
 } from '../firestore';
+import type { ClickRecord, ConversionRecord } from '../types';
+import { __campaignFromExtra } from '../services/clickService';
 import { generateConversionId } from '../utils/idGenerator';
 import { encryptSecret } from '../utils/crypto';
 import { logger } from '../utils/logger';
@@ -527,6 +531,58 @@ export const googleAdsController = {
       max: MAX,
     });
 
+    // Batch-fetch the conversion + click each upload row was built from so the
+    // operator can tell which offer/value/network produced each push and why
+    // GAds may have rejected it. Chunked at 300 to keep round-trips bounded.
+    const ENRICH_CHUNK = 300;
+    const conversionIds = new Set<string>();
+    const clickIds = new Set<string>();
+    for (const r of rows) {
+      if (r.conversion_id) conversionIds.add(r.conversion_id);
+      if (r.click_id) clickIds.add(r.click_id);
+    }
+
+    const conversionsById = new Map<string, ConversionRecord>();
+    const convIdsArr = Array.from(conversionIds);
+    for (let i = 0; i < convIdsArr.length; i += ENRICH_CHUNK) {
+      const chunk = convIdsArr.slice(i, i + ENRICH_CHUNK);
+      const refs = chunk.map((id) => db().collection(COLLECTIONS.CONVERSIONS).doc(id));
+      const docs = await db().getAll(...refs);
+      for (const d of docs) {
+        if (!d.exists) continue;
+        const raw = d.data() as Record<string, unknown>;
+        const created_at =
+          (raw.created_at as { toDate?: () => Date } | undefined)?.toDate?.()?.toISOString?.() ??
+          (raw.created_at as string | undefined) ??
+          '';
+        conversionsById.set(d.id, {
+          ...(raw as unknown as ConversionRecord),
+          conversion_id: d.id,
+          created_at,
+        });
+        // Pick up the click referenced by the conversion in case the upload
+        // row only carried conversion_id (some skip paths do).
+        const clickFromConv = (raw.click_id as string | undefined) ?? '';
+        if (clickFromConv) clickIds.add(clickFromConv);
+      }
+    }
+
+    const clicksById = new Map<string, ClickRecord>();
+    const clickIdsArr = Array.from(clickIds);
+    for (let i = 0; i < clickIdsArr.length; i += ENRICH_CHUNK) {
+      const chunk = clickIdsArr.slice(i, i + ENRICH_CHUNK);
+      const refs = chunk.map((id) => db().collection(COLLECTIONS.CLICKS).doc(id));
+      const docs = await db().getAll(...refs);
+      for (const d of docs) {
+        if (!d.exists) continue;
+        const raw = d.data() as Record<string, unknown>;
+        clicksById.set(d.id, {
+          ...(raw as unknown as ClickRecord),
+          click_id: d.id,
+        });
+      }
+    }
+
     const headers = [
       'created_at',
       'sent_at',
@@ -543,11 +599,30 @@ export const googleAdsController = {
       'attempts',
       'skip_reason',
       'last_error',
+      // ── Conversion join ─────────────────────────────────────────
+      'conv_created_at',
+      'conv_network_timestamp',
+      'conv_payout',
+      'conv_currency',
+      'conv_status',
+      'conv_txn_id',
+      'network_id',
+      // ── Click / offer / campaign ────────────────────────────────
+      'offer_id',
+      'aff_id',
+      'campaign_id',
+      'click_country',
     ];
 
     const out: string[] = [];
     out.push(headers.map(csvEscape).join(','));
     for (const r of rows) {
+      const conv = r.conversion_id ? conversionsById.get(r.conversion_id) : undefined;
+      const clickIdForRow = r.click_id ?? conv?.click_id ?? '';
+      const click = clickIdForRow ? clicksById.get(clickIdForRow) : undefined;
+      const campaign = __campaignFromExtra(click);
+      const offer_id = conv?.offer_id ?? click?.offer_id ?? '';
+
       const row: string[] = [
         r.created_at ?? '',
         r.sent_at ?? '',
@@ -564,6 +639,19 @@ export const googleAdsController = {
         typeof r.attempts === 'number' ? String(r.attempts) : '',
         r.skip_reason ?? '',
         r.last_error ?? '',
+        // conversion join
+        conv?.created_at ?? '',
+        conv?.network_timestamp ?? '',
+        typeof conv?.payout === 'number' ? String(conv.payout) : '',
+        conv?.currency ?? '',
+        conv?.status ?? '',
+        conv?.txn_id ?? '',
+        conv?.network_id ?? '',
+        // click / offer / campaign
+        offer_id,
+        click?.aff_id ?? '',
+        campaign?.campaign_id ?? '',
+        click?.country ?? '',
       ];
       out.push(row.map(csvEscape).join(','));
     }
@@ -583,6 +671,8 @@ export const googleAdsController = {
       truncated: rows.length >= MAX,
       kind: kind ?? 'all',
       status: status ?? 'all',
+      enriched_conversions: conversionsById.size,
+      enriched_clicks: clicksById.size,
       duration_ms: Date.now() - t0,
       from: fromDate.toISOString(),
       to: toDate.toISOString(),
