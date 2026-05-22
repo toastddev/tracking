@@ -76,4 +76,34 @@ export const googleAdsUploadRepository = {
     const snap = await q.limit(50).get();
     return snap.docs.map((d) => fromDoc(d.id, d.data()));
   },
+
+  // Materialise every upload row in a [from, to] window for the CSV export.
+  // Date range is enforced in Firestore (single composite-index-free path —
+  // `created_at` is the only `where` clause), kind/status are filtered
+  // in-memory afterwards. Keeps us off the composite-index treadmill while
+  // gads_uploads stays bounded by gclid-bearing traffic. `max` is a hard
+  // ceiling so a misconfigured window can't fan out to millions of docs.
+  async fetchAllForExport(opts: {
+    from: Date;
+    to: Date;
+    kind?: GoogleAdsUploadKind;
+    status?: GoogleAdsUpload['status'];
+    max: number;
+  }): Promise<GoogleAdsUpload[]> {
+    const snap = await db()
+      .collection(COLLECTIONS.GOOGLE_ADS_UPLOADS)
+      .where('created_at', '>=', opts.from)
+      .where('created_at', '<=', opts.to)
+      .orderBy('created_at', 'desc')
+      .limit(opts.max)
+      .get();
+
+    const rows = snap.docs.map((d) => fromDoc(d.id, d.data()));
+    if (!opts.kind && !opts.status) return rows;
+    return rows.filter(
+      (r) =>
+        (!opts.kind || r.kind === opts.kind) &&
+        (!opts.status || r.status === opts.status)
+    );
+  },
 };

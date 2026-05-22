@@ -35,4 +35,5 @@ integrationsRoutes.delete(`${base}/routes/:route_id`, (c) => googleAdsController
 
 // Upload audit / manual retry
 integrationsRoutes.get(`${base}/uploads`,                       (c) => googleAdsController.listUploadsForSource(c));
+integrationsRoutes.get(`${base}/uploads/export`,                (c) => googleAdsController.exportUploads(c));
 integrationsRoutes.post(`${base}/uploads/:conversion_id/retry`, (c) => googleAdsController.retryUpload(c));

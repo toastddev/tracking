@@ -13,6 +13,7 @@ import {
 import { generateConversionId } from '../utils/idGenerator';
 import { encryptSecret } from '../utils/crypto';
 import { logger } from '../utils/logger';
+import { csvEscape } from '../utils/csv';
 import { googleAdsOauthService } from '../services/googleAdsOauthService';
 import { googleAdsAccountService } from '../services/googleAdsAccountService';
 import { googleAdsForwardingService } from '../services/googleAdsForwardingService';
@@ -485,5 +486,115 @@ export const googleAdsController = {
     const click = conv.click_id ? await clickRepository.getById(conv.click_id) : null;
     await googleAdsForwardingService.dispatchConversion({ conversion: conv, click });
     return c.json({ ok: true });
+  },
+
+  // CSV export of the Google Ads upload audit trail. Covers every push the
+  // forwarder made — conversion forwards, click forwards, successes, partial
+  // failures, hard failures, and skips with reason. The operator filters by
+  // kind/status in Excel after download (or via the optional query params).
+  //
+  // Same shape as /api/clicks/export: one Firestore range scan, in-memory CSV
+  // build, UTF-8 BOM, attachment disposition, X-Row-Count / X-Export-Truncated
+  // headers. Kept hand-rolled (no csv lib) to match the existing pattern.
+  async exportUploads(c: Context) {
+    const from = c.req.query('from');
+    const to = c.req.query('to');
+    if (!from || !to) return c.json({ error: 'from_and_to_required' }, 400);
+    const fromDate = new Date(from);
+    const toDate = new Date(to);
+    if (Number.isNaN(fromDate.getTime()) || Number.isNaN(toDate.getTime())) {
+      return c.json({ error: 'invalid_date' }, 400);
+    }
+    if (fromDate.getTime() > toDate.getTime()) {
+      return c.json({ error: 'from_after_to' }, 400);
+    }
+
+    const kindRaw = c.req.query('kind');
+    const statusRaw = c.req.query('status');
+    const kind = kindRaw === 'conversion' || kindRaw === 'click' ? kindRaw : undefined;
+    const allowedStatuses = ['pending', 'sent', 'partial_failure', 'failed', 'skipped'] as const;
+    const status = allowedStatuses.includes(statusRaw as (typeof allowedStatuses)[number])
+      ? (statusRaw as (typeof allowedStatuses)[number])
+      : undefined;
+
+    const MAX = Number(process.env.GADS_UPLOADS_EXPORT_MAX ?? 100_000);
+    const t0 = Date.now();
+    const rows = await googleAdsUploadRepository.fetchAllForExport({
+      from: fromDate,
+      to: toDate,
+      kind,
+      status,
+      max: MAX,
+    });
+
+    const headers = [
+      'created_at',
+      'sent_at',
+      'kind',
+      'status',
+      'source_id',
+      'conversion_id',
+      'click_id',
+      'connection_id',
+      'customer_id',
+      'identifier_type',
+      'identifier_value',
+      'conversion_action_resource',
+      'attempts',
+      'skip_reason',
+      'last_error',
+    ];
+
+    const out: string[] = [];
+    out.push(headers.map(csvEscape).join(','));
+    for (const r of rows) {
+      const row: string[] = [
+        r.created_at ?? '',
+        r.sent_at ?? '',
+        r.kind ?? '',
+        r.status ?? '',
+        r.source_id ?? '',
+        r.conversion_id ?? '',
+        r.click_id ?? '',
+        r.connection_id ?? '',
+        r.customer_id ?? '',
+        r.identifier_type ?? '',
+        r.identifier_value ?? '',
+        r.conversion_action_resource ?? '',
+        typeof r.attempts === 'number' ? String(r.attempts) : '',
+        r.skip_reason ?? '',
+        r.last_error ?? '',
+      ];
+      out.push(row.map(csvEscape).join(','));
+    }
+
+    // UTF-8 BOM so Excel on Windows renders any non-ASCII bytes in error
+    // messages correctly (Google's API echoes UTF-8 customer names back in
+    // some failure paths).
+    const body = '﻿' + out.join('\r\n');
+    const stamp = new Date()
+      .toISOString()
+      .replace(/[-:]/g, '')
+      .replace(/\.\d+Z$/, 'Z');
+
+    logger.info('gads_uploads_export', {
+      rows: rows.length,
+      max: MAX,
+      truncated: rows.length >= MAX,
+      kind: kind ?? 'all',
+      status: status ?? 'all',
+      duration_ms: Date.now() - t0,
+      from: fromDate.toISOString(),
+      to: toDate.toISOString(),
+    });
+
+    c.header('Content-Type', 'text/csv; charset=utf-8');
+    c.header(
+      'Content-Disposition',
+      `attachment; filename="gads_uploads_${stamp}.csv"`
+    );
+    c.header('X-Row-Count', String(rows.length));
+    if (rows.length >= MAX) c.header('X-Export-Truncated', '1');
+    return c.body(body);
   },
 };

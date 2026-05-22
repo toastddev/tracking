@@ -23,6 +23,7 @@ import { refreshService } from '../services/refreshService';
 
 import { dataResetService } from '../services/dataResetService';
 import { logger } from '../utils/logger';
+import { csvEscape } from '../utils/csv';
 
 // Campaign IDs are external (Google Ads, UTM tags) so they can contain a
 // wider set of characters than our internal isValidId regex allows. Restrict
@@ -109,14 +110,6 @@ function parseDate(v: string | undefined): Date | undefined {
   return Number.isNaN(d.getTime()) ? undefined : d;
 }
 
-// RFC-4180-ish CSV cell escape. Wrap in double-quotes when the value contains
-// a quote, comma, or newline; double up embedded quotes. Used by exportClicks.
-function csvEscape(v: unknown): string {
-  if (v == null) return '';
-  const s = typeof v === 'string' ? v : String(v);
-  if (/[",\r\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
-  return s;
-}
 
 export const adminController = {
   // ── auth ──────────────────────────────────────────────────────────
