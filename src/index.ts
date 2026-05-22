@@ -2,6 +2,7 @@ import { serve } from '@hono/node-server';
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { trackRoutes } from './routes/track';
+import { pixelRoutes } from './routes/pixel';
 import { postbackRoutes } from './routes/postback';
 import { healthRoutes } from './routes/health';
 import { adminRoutes } from './routes/admin';
@@ -48,6 +49,7 @@ app.use(
 
 app.route('/', healthRoutes);
 app.route('/', trackRoutes);
+app.route('/', pixelRoutes);
 app.route('/', postbackRoutes);
 app.route('/', adminRoutes);
 app.route('/', integrationsRoutes);

@@ -93,9 +93,19 @@ export const postbackService = {
     // Click verification: look the click_id up in Firestore. Even when it
     // doesn't resolve we still persist the conversion (verified: false) so
     // the audit trail captures every postback the network sent us.
+    //
+    // Pixel-tracked clicks whose offer_id was never mapped get a third path:
+    // the click row exists (so the postback's click_id matches) but we can't
+    // attribute the conversion to a real offer, so it stays unverified with a
+    // distinct reason. The rollup logic below already routes unverified rows
+    // to the 'unknown' offer bucket, so reports stay honest about the gap.
     const click = await clickRepository.getById(mapped.click_id);
-    const verified = click !== null;
-    const verification_reason: VerificationReason = verified ? 'click_found' : 'unknown_click_id';
+    let verified = click !== null;
+    let verification_reason: VerificationReason = verified ? 'click_found' : 'unknown_click_id';
+    if (click && click.offer_unmapped) {
+      verified = false;
+      verification_reason = 'click_found_offer_unmapped';
+    }
 
     // If the network is mapped to an affiliate API and that API is active,
     // the API pull is the source of truth — the postback becomes audit-only

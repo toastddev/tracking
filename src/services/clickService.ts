@@ -78,6 +78,26 @@ export interface BuildBlockedClickInput {
   country?: string;
 }
 
+// Pixel-tracked click. The frontend has already redirected the user and
+// supplies BOTH the click_id (it needed it to substitute into the affiliate
+// URL) and the redirect_url (the affiliate URL it actually sent the user to).
+// `offer` is optional — when the frontend's offer_id doesn't resolve, the
+// click is still recorded with `offer_unmapped` so no tracking is lost.
+export interface BuildPixelClickInput {
+  click_id: string;
+  offer_id: string;            // may be '' when the frontend never sent one
+  aff_id: string;
+  offer: Offer | null;         // null when the offer_id didn't resolve
+  redirect_url: string;        // the affiliate URL the user was redirected to
+  sub_params: Record<string, string>;
+  ad_ids: AdIds;
+  extra_params: Record<string, string>;
+  ip?: string;
+  user_agent?: string;
+  referrer?: string;
+  country?: string;
+}
+
 export const clickService = {
   build(input: BuildClickInput): ClickRecord {
     const click_id = generateClickId();
@@ -215,5 +235,114 @@ export const clickService = {
     if (click.ad_ids?.gclid || click.ad_ids?.gbraid || click.ad_ids?.wbraid) {
       googleAdsForwardingService.forgetClick({ click });
     }
+  },
+
+  // Builds a click record for the pixel flow. Key differences vs. `build()`:
+  //   - click_id comes from the frontend (so the same UUID can be baked into
+  //     the affiliate URL's {click_id} placeholder before navigation)
+  //   - redirect_url is whatever the frontend actually sent the user to —
+  //     NOT a server-rendered template. The DB stores the URL the user really
+  //     visited, which is what matters for debugging "where did this click go"
+  //   - offer is optional; missing/unresolved offer flags the click as
+  //     `offer_unmapped` so the dashboard can surface it for the operator
+  buildPixel(input: BuildPixelClickInput): ClickRecord {
+    const offerMapped = input.offer !== null && input.offer_id !== '';
+    return {
+      click_id: input.click_id,
+      offer_id: input.offer_id,
+      aff_id: input.aff_id,
+      sub_params: input.sub_params,
+      ad_ids: input.ad_ids,
+      extra_params: input.extra_params,
+      ip: input.ip,
+      user_agent: input.user_agent,
+      referrer: input.referrer,
+      country: input.country,
+      redirect_url: input.redirect_url,
+      source: 'pixel',
+      offer_unmapped: !offerMapped,
+      warning: offerMapped
+        ? undefined
+        : input.offer_id === ''
+          ? 'offer_id missing on pixel call — add it in the frontend DIRECT_AFFILIATES entry'
+          : `offer_id "${input.offer_id}" not found in tracking offers`,
+      created_at: new Date().toISOString(),
+    };
+  },
+
+  // Fire-and-forget persist for pixel clicks. Uses `insertIfAbsent` because
+  // the frontend may double-fire (sendBeacon races with image fallback, or
+  // a user smashes the button) and we MUST NOT double-count rollups.
+  //
+  // When the offer is unmapped we still persist the click — the visit is
+  // real — but we skip the offer/drilldown/campaign rollups. Those tables
+  // are keyed by offer_id; writing a row under an empty/orphan offer_id
+  // pollutes the dashboard. The yellow "Unmapped" badge in the clicks list
+  // is how the operator sees these and fixes the mapping. Google Ads
+  // forwarding runs regardless — gclid attribution doesn't need our
+  // internal offer schema.
+  persistPixelAsync(click: ClickRecord): void {
+    retry(() => clickRepository.insertIfAbsent(click))
+      .then((inserted) => {
+        if (!inserted) {
+          logger.info('pixel_click_duplicate', {
+            click_id: click.click_id,
+            offer_id: click.offer_id,
+          });
+          return;
+        }
+
+        if (!click.offer_unmapped) {
+          retry(() =>
+            offerReportRepository.incrementClick({
+              offer_id: click.offer_id,
+              at: new Date(click.created_at),
+            })
+          ).catch((err: unknown) => {
+            logger.warn('offer_report_click_increment_failed', {
+              click_id: click.click_id,
+              offer_id: click.offer_id,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          });
+
+          retry(() => drilldownRepository.incrementOfferClick(click)).catch((err: unknown) => {
+            logger.warn('drilldown_offer_click_increment_failed', {
+              click_id: click.click_id,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          });
+
+          const campaign = extractCampaign(click);
+          if (campaign) {
+            retry(() =>
+              campaignReportRepository.incrementClick({
+                campaign_id: campaign.campaign_id,
+                campaign_name: campaign.campaign_name,
+                source: campaign.source,
+                at: new Date(click.created_at),
+                offer_id: click.offer_id,
+              })
+            ).catch((err: unknown) => {
+              logger.warn('campaign_report_click_increment_failed', {
+                click_id: click.click_id,
+                campaign_id: campaign.campaign_id,
+                error: err instanceof Error ? err.message : String(err),
+              });
+            });
+          }
+        }
+
+        if (click.ad_ids?.gclid || click.ad_ids?.gbraid || click.ad_ids?.wbraid) {
+          googleAdsForwardingService.forgetClick({ click });
+        }
+      })
+      .catch((err: unknown) => {
+        logger.error('pixel_click_persist_failed', {
+          click_id: click.click_id,
+          offer_id: click.offer_id,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
   },
 };

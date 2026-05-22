@@ -37,6 +37,29 @@ export const clickRepository = {
       });
   },
 
+  // Atomic insert — returns false if the click_id already exists. Used by the
+  // pixel endpoint where the frontend supplies the click_id; a retried ping
+  // (sendBeacon racing fetch, button double-click) must not double-count the
+  // rollups. `create()` is the Firestore primitive that fails if the doc
+  // exists; we treat ALREADY_EXISTS (gRPC code 6) as a soft "duplicate".
+  async insertIfAbsent(click: ClickRecord): Promise<boolean> {
+    try {
+      await db()
+        .collection(COLLECTIONS.CLICKS)
+        .doc(click.click_id)
+        .create({
+          ...click,
+          created_at: FieldValue.serverTimestamp(),
+        });
+      return true;
+    } catch (err: unknown) {
+      if (typeof err === 'object' && err !== null && (err as { code?: number }).code === 6) {
+        return false;
+      }
+      throw err;
+    }
+  },
+
   async getById(click_id: string): Promise<ClickRecord | null> {
     const snap = await db().collection(COLLECTIONS.CLICKS).doc(click_id).get();
     if (!snap.exists) return null;

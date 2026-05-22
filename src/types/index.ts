@@ -37,6 +37,19 @@ export interface ClickRecord {
   // redirected (redirect_url is empty) and is deliberately excluded from the
   // offer/campaign/drilldown rollups so report totals stay accurate.
   blocked?: boolean;
+  // Set on pixel-tracked clicks where the supplied offer_id was missing or
+  // doesn't resolve to a real offer. The click is still persisted (the user
+  // already navigated to the affiliate URL) but rollups are skipped — there's
+  // no offer to attribute the row to. The dashboard renders these in yellow
+  // so the operator can fix the frontend mapping.
+  offer_unmapped?: boolean;
+  // Human-readable issue surfaced in the clicks table when offer_unmapped is
+  // true. Kept short — used as the badge tooltip.
+  warning?: string;
+  // Set on pixel-tracked clicks. Lets the dashboard tell pixel clicks from
+  // the server-redirected ones at a glance, and lets reports segment by
+  // tracking method later if needed.
+  source?: 'redirect' | 'pixel';
   created_at: string;
 }
 
@@ -75,7 +88,12 @@ export interface Network {
 
 export type VerificationReason =
   | 'click_found'
-  | 'unknown_click_id';
+  | 'unknown_click_id'
+  // Pixel-tracked click where the click row exists but its offer_id was never
+  // mapped. The click_id matches a real click, but reporting can't attribute
+  // the conversion to a concrete offer — so it stays unverified until the
+  // operator fixes the frontend mapping.
+  | 'click_found_offer_unmapped';
 
 export type ConversionSource = 'postback' | 'api';
 

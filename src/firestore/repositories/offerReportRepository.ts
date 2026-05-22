@@ -2,6 +2,7 @@ import { FieldValue, Timestamp } from 'firebase-admin/firestore';
 import { db } from '../config';
 import { COLLECTIONS } from '../schema';
 import { TTLCache } from '../../utils/ttlCache';
+import type { VerificationReason } from '../../types';
 
 // 60s read-through cache for fetchRange. The /reports page fires multiple
 // overlapping calls per load; this collapses them to one Firestore scan per
@@ -73,7 +74,10 @@ export interface IncrementConversionInput {
   // When 'unknown_click_id', the row is counted toward
   // unknown_click_conversions / unknown_click_revenue (in addition to the
   // existing `unverified` counter) so reports can call it out distinctly.
-  verification_reason?: 'click_found' | 'unknown_click_id';
+  // Other reasons ('click_found', 'click_found_offer_unmapped') only feed the
+  // generic `unverified` counter — the click was found, so it's not an
+  // "unknown click" bucket.
+  verification_reason?: VerificationReason;
 }
 
 export interface OfferReportRangeOptions {
