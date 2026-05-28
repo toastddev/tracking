@@ -16,7 +16,8 @@
       "Bash(npx tsx *)",
       "Bash(echo \"exit=$?\")",
       "Bash(xargs -0 sed -i 's/dark:\\\\\\([a-z]*\\\\\\)-slate-/dark:\\\\1-neutral-/g')",
-      "Bash(xargs -0 sed -i -E 's/\\(dark:[^[:space:]\"'\\\\'']*-\\)slate-/\\\\1neutral-/g')"
+      "Bash(xargs -0 sed -i -E 's/\\(dark:[^[:space:]\"'\\\\'']*-\\)slate-/\\\\1neutral-/g')",
+      "Bash(npm run *)"
     ]
   }
 }
