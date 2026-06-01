@@ -12,15 +12,29 @@ import { logger } from './utils/logger';
 import { affiliateApiScheduler } from './services/affiliateApiScheduler';
 import { offerReportsReconciliationScheduler } from './services/offerReportsReconciliationScheduler';
 
+// Catch errors that escape Hono's request scope (scheduler ticks, async
+// fire-and-forget, Firestore client internals). Without this they vanish
+// into Node's default handler and we lose the alert signal.
+process.on('uncaughtException', (err) => {
+  logger.critical('uncaught_exception', { error: err });
+  // Let the process die — Cloud Run will replace the instance. Continuing
+  // after an uncaught exception leaves Node in an undefined state.
+  setTimeout(() => process.exit(1), 100).unref();
+});
+
+process.on('unhandledRejection', (reason) => {
+  logger.critical('unhandled_rejection', { error: reason });
+});
+
 try {
   initFirestore();
   logger.info('firestore_ready');
   affiliateApiScheduler.start();
   offerReportsReconciliationScheduler.start();
 } catch (err) {
-  logger.warn('firestore_init_skipped', {
-    error: err instanceof Error ? err.message : String(err),
-  });
+  // Firestore unreachable means clicks/postbacks can't persist and schedulers
+  // never start — the app is half-dead and a human must look at it.
+  logger.critical('firestore_init_failed', { error: err });
 }
 
 const allowedOrigins = (process.env.ADMIN_CORS_ORIGINS ?? 'http://localhost:5173')
@@ -58,9 +72,10 @@ app.notFound((c) => c.json({ error: 'not_found' }, 404));
 
 app.onError((err, c) => {
   logger.error('unhandled_error', {
-    error: err.message,
-    stack: err.stack,
+    error: err,
+    method: c.req.method,
     path: c.req.path,
+    status: 500,
   });
   return c.json({ error: 'internal' }, 500);
 });

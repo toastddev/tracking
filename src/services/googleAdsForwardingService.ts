@@ -278,15 +278,20 @@ async function persistAttempt(args: {
       attempts: 1,
       last_error: result.error.slice(0, 4000),
     });
-    if (/UNAUTHENTICATED|invalid_grant|PERMISSION_DENIED|UNAUTHORIZED/i.test(result.error)) {
+    const isAuthError = /UNAUTHENTICATED|invalid_grant|PERMISSION_DENIED|UNAUTHORIZED/i.test(result.error);
+    if (isAuthError) {
       await googleAdsConnectionRepository.update(connection.connection_id, {
         status: 'error',
         last_error: result.error.slice(0, 4000),
       });
     }
-    logger.error('gads_upload_failed', {
+    // Auth-class failures are CRITICAL: the connection is now dead and every
+    // future upload silently fails until the user re-authorizes. Generic upload
+    // failures stay ERROR (transient, will retry on next conversion).
+    logger[isAuthError ? 'critical' : 'error']('gads_upload_failed', {
       kind: ctx.kind, source_id: ctx.source_id,
       connection_id: connection.connection_id,
+      auth_error: isAuthError,
       error: result.error,
     });
     return;
@@ -726,14 +731,18 @@ export const googleAdsForwardingService = {
         stats.errors.push(
           `failed[${connection.connection_id}]: ${errMsg.slice(0, 500)}`
         );
-        logger.error('gads_batch_failed', {
+        const isAuthError = /UNAUTHENTICATED|invalid_grant|PERMISSION_DENIED|UNAUTHORIZED/i.test(errMsg);
+        // Auth-class batch failures are CRITICAL — see gads_upload_failed for
+        // the same rationale: dead connection means silent data loss until
+        // re-auth.
+        logger[isAuthError ? 'critical' : 'error']('gads_batch_failed', {
           connection_id: connection.connection_id,
           count: payloads.length,
+          auth_error: isAuthError,
           error: errMsg,
         });
 
-        // Check for auth errors and mark connection as errored.
-        if (/UNAUTHENTICATED|invalid_grant|PERMISSION_DENIED|UNAUTHORIZED/i.test(errMsg)) {
+        if (isAuthError) {
           await googleAdsConnectionRepository
             .update(connection.connection_id, {
               status: 'error',

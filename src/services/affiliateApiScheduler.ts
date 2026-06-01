@@ -7,6 +7,14 @@ import { logger } from '../utils/logger';
 const TICK_MS = Number(process.env.AFF_API_TICK_MS ?? 60_000);            // 1 min
 const MAX_PER_TICK = Number(process.env.AFF_API_MAX_PER_TICK ?? 25);
 const CONCURRENCY = Number(process.env.AFF_API_CONCURRENCY ?? 4);
+// Number of consecutive failures of a single api_id that escalates the log to
+// CRITICAL (which fans out to email + Telegram via Cloud Monitoring). Reset on
+// success. Counts are per-instance — multi-instance Cloud Run will reset on
+// each cold start, which is fine: 3 in a row from the same instance is enough
+// signal that this API is genuinely broken and not just flaking.
+const CONSECUTIVE_FAILURE_ALERT_THRESHOLD = Number(
+  process.env.AFF_API_CONSECUTIVE_FAILURE_ALERT_THRESHOLD ?? 3,
+);
 // Lease covers the upper bound of one run: max_pages × per-call timeout.
 // Defaults: 50 pages × 30s = 25 min worst case, so 1 hour gives breathing
 // room. Crashed runners auto-unblock once the lease expires.
@@ -26,8 +34,17 @@ const HOLDER = `${hostname()}#${process.pid}#${randomBytes(3).toString('hex')}`;
 let timer: NodeJS.Timeout | null = null;
 let inFlight = 0;
 const running = new Set<string>();
+// Per-api consecutive-failure counter. Reset to 0 on success. Used to
+// escalate aff_api_scheduled_run_threw from ERROR to CRITICAL after N hits.
+const consecutiveFailures = new Map<string, number>();
 
 async function tick(): Promise<void> {
+  // Heartbeat: Cloud Monitoring tracks this via a log-based metric and fires
+  // a CRITICAL alert if absent for > 3× TICK_MS. This is the only signal that
+  // catches a fully-dead scheduler loop (uncaught throw outside our try/catch,
+  // event-loop wedge, Node deadlock).
+  logger.info('scheduler_heartbeat', { scheduler: 'aff_api', tick_ms: TICK_MS });
+
   let due;
   try {
     due = await affiliateApiRepository.listDue(new Date(), MAX_PER_TICK);
@@ -65,10 +82,15 @@ async function tick(): Promise<void> {
           failed: run.records_failed,
           http_calls: run.http_calls,
         });
+        consecutiveFailures.delete(api.api_id);
       } catch (err) {
-        logger.error('aff_api_scheduled_run_threw', {
+        const count = (consecutiveFailures.get(api.api_id) ?? 0) + 1;
+        consecutiveFailures.set(api.api_id, count);
+        const level = count >= CONSECUTIVE_FAILURE_ALERT_THRESHOLD ? 'critical' : 'error';
+        logger[level]('aff_api_scheduled_run_threw', {
           api_id: api.api_id,
-          error: err instanceof Error ? err.message : String(err),
+          consecutive_failures: count,
+          error: err,
         });
         // Best-effort: mark the orphaned run doc so it doesn't stay stuck
         // at 'running' forever and block future "Run now" requests.

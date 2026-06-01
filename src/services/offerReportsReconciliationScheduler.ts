@@ -71,6 +71,15 @@ let fastTimer: NodeJS.Timeout | null = null;
 let slowTimer: NodeJS.Timeout | null = null;
 let fastStartedAt = 0;
 let slowStartedAt = 0;
+// Consecutive-failure counters. Promote from ERROR to CRITICAL after N hits
+// in a row — one-off rebuild failures are noisy and self-heal next tick, but
+// repeated failures mean the conversion/revenue rollup is drifting and the
+// dashboard numbers are getting wrong.
+const CONSECUTIVE_FAILURE_ALERT_THRESHOLD = Number(
+  process.env.OFFER_REPORTS_RECON_CONSECUTIVE_FAILURE_THRESHOLD ?? 3,
+);
+let fastConsecutiveFailures = 0;
+let slowConsecutiveFailures = 0;
 
 // Reset an in-flight flag if it's been stuck for more than TICK_TIMEOUT_MS.
 // Defends against the rare case where the rebuild() promise hangs (gRPC
@@ -81,6 +90,10 @@ function tickStale(startedAt: number): boolean {
 }
 
 async function runFastTick(): Promise<void> {
+  logger.info('scheduler_heartbeat', {
+    scheduler: 'offer_reports_recon_fast',
+    tick_ms: FAST_INTERVAL_MS,
+  });
   if (fastInFlight && !tickStale(fastStartedAt)) {
     logger.info('offer_reports_recon_fast_skipped_in_flight');
     return;
@@ -94,6 +107,7 @@ async function runFastTick(): Promise<void> {
   fastStartedAt = Date.now();
   const now = new Date();
   const from = new Date(now.getTime() - FAST_LOOKBACK_MS);
+  let tickHadFailure = false;
   try {
     const result = await offerReportsBackfillService.rebuild({ from, to: now });
     logger.info('offer_reports_recon_fast_done', {
@@ -108,8 +122,12 @@ async function runFastTick(): Promise<void> {
       truncated_reason: result.truncated_reason,
     });
   } catch (err) {
-    logger.error('offer_reports_recon_fast_failed', {
-      error: err instanceof Error ? err.message : String(err),
+    tickHadFailure = true;
+    const count = fastConsecutiveFailures + 1;
+    const level = count >= CONSECUTIVE_FAILURE_ALERT_THRESHOLD ? 'critical' : 'error';
+    logger[level]('offer_reports_recon_fast_failed', {
+      consecutive_failures: count,
+      error: err,
     });
   }
   try {
@@ -128,16 +146,25 @@ async function runFastTick(): Promise<void> {
       truncated_reason: result.truncated_reason,
     });
   } catch (err) {
-    logger.error('campaign_reports_recon_fast_failed', {
-      error: err instanceof Error ? err.message : String(err),
+    tickHadFailure = true;
+    const count = fastConsecutiveFailures + 1;
+    const level = count >= CONSECUTIVE_FAILURE_ALERT_THRESHOLD ? 'critical' : 'error';
+    logger[level]('campaign_reports_recon_fast_failed', {
+      consecutive_failures: count,
+      error: err,
     });
   } finally {
+    fastConsecutiveFailures = tickHadFailure ? fastConsecutiveFailures + 1 : 0;
     fastInFlight = false;
     fastStartedAt = 0;
   }
 }
 
 async function runSlowTick(): Promise<void> {
+  logger.info('scheduler_heartbeat', {
+    scheduler: 'offer_reports_recon_slow',
+    tick_ms: SLOW_INTERVAL_MS,
+  });
   if (slowInFlight && !tickStale(slowStartedAt)) {
     logger.info('offer_reports_recon_slow_skipped_in_flight');
     return;
@@ -151,6 +178,7 @@ async function runSlowTick(): Promise<void> {
   slowStartedAt = Date.now();
   const now = new Date();
   const from = new Date(now.getTime() - SLOW_LOOKBACK_MS);
+  let tickHadFailure = false;
   try {
     const result = await offerReportsBackfillService.rebuild({ from, to: now });
     logger.info('offer_reports_recon_slow_done', {
@@ -165,8 +193,12 @@ async function runSlowTick(): Promise<void> {
       truncated_reason: result.truncated_reason,
     });
   } catch (err) {
-    logger.error('offer_reports_recon_slow_failed', {
-      error: err instanceof Error ? err.message : String(err),
+    tickHadFailure = true;
+    const count = slowConsecutiveFailures + 1;
+    const level = count >= CONSECUTIVE_FAILURE_ALERT_THRESHOLD ? 'critical' : 'error';
+    logger[level]('offer_reports_recon_slow_failed', {
+      consecutive_failures: count,
+      error: err,
     });
   }
   try {
@@ -185,10 +217,15 @@ async function runSlowTick(): Promise<void> {
       truncated_reason: result.truncated_reason,
     });
   } catch (err) {
-    logger.error('campaign_reports_recon_slow_failed', {
-      error: err instanceof Error ? err.message : String(err),
+    tickHadFailure = true;
+    const count = slowConsecutiveFailures + 1;
+    const level = count >= CONSECUTIVE_FAILURE_ALERT_THRESHOLD ? 'critical' : 'error';
+    logger[level]('campaign_reports_recon_slow_failed', {
+      consecutive_failures: count,
+      error: err,
     });
   } finally {
+    slowConsecutiveFailures = tickHadFailure ? slowConsecutiveFailures + 1 : 0;
     slowInFlight = false;
     slowStartedAt = 0;
   }
