@@ -14,10 +14,28 @@ facebookIntegrationsRoutes.use('/api/fb-campaign-reports/*', requireAuth);
 
 const base = '/api/integrations/facebook';
 
+// ── PUBLIC OAuth callback ───────────────────────────────────────────
+// This is what Meta redirects the user-agent to after consent. NOT under
+// /api/integrations/*, so the requireAuth middleware above does NOT fire.
+// That's the whole point: when Meta redirects a user back to our domain,
+// any in-app auth cookie may not survive the cross-site hop, and an outer
+// SPA auth guard (e.g. pennywise-admin) would bounce the URL to /login and
+// kill the ?code & ?state params. The backend exchanges code → token here,
+// stashes the result in a 5-min Firestore session, then 302s the browser
+// to the frontend Connections page with ?fb_oauth_session=<id>.
+facebookIntegrationsRoutes.get('/oauth/facebook/callback', (c) => facebookController.handleCallback(c));
+
 // OAuth handshake
 facebookIntegrationsRoutes.post(`${base}/oauth/start`,    (c) => facebookController.oauthStart(c));
 facebookIntegrationsRoutes.post(`${base}/oauth/exchange`, (c) => facebookController.oauthExchange(c));
 facebookIntegrationsRoutes.post(`${base}/finalize`,       (c) => facebookController.finalize(c));
+
+// PROTECTED — frontend consumes the OAuth session that handleCallback stashed.
+// Returns candidates + grant_token, then the modal flow continues unchanged.
+facebookIntegrationsRoutes.get(
+  `${base}/oauth/consume-session/:session_id`,
+  (c) => facebookController.consumeSession(c)
+);
 
 // Connections
 facebookIntegrationsRoutes.get(`${base}/connections`,        (c) => facebookController.listConnections(c));

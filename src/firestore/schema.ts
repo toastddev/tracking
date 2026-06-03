@@ -143,6 +143,16 @@ export const COLLECTIONS = {
   FACEBOOK_ROUTES: 'facebook_routes',
   FACEBOOK_UPLOADS: 'facebook_uploads',
   FACEBOOK_CAMPAIGN_REPORTS: 'facebook_campaign_reports',
+  // Short-lived (5 min TTL) holding pen for OAuth callback state. The
+  // backend's PUBLIC /oauth/facebook/callback endpoint receives Meta's
+  // redirect, exchanges the code, stashes the result here keyed by a random
+  // session_id, then 302s the browser to the frontend Connections page with
+  // ?fb_oauth_session=<session_id>. The frontend (still logged in, no
+  // pennywise-admin auth guard bouncing) calls a PROTECTED endpoint to
+  // consume the session. This sidesteps the issue where Meta's cross-site
+  // redirect lands the user on a route the SPA's outer auth guard refuses
+  // to render, killing the in-flight OAuth params.
+  FACEBOOK_OAUTH_SESSIONS: 'facebook_oauth_sessions',
   AFFILIATE_APIS: 'affiliate_apis',
   AFFILIATE_API_RUNS: 'affiliate_api_runs',
   // Pre-aggregated daily metrics per offer. Survives the 90-day TTL on

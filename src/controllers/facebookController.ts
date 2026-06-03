@@ -10,9 +10,12 @@ import {
   facebookRouteRepository,
   facebookUploadRepository,
   facebookSyncStateRepository,
+  facebookOauthSessionRepository,
   networkRepository,
   offerRepository,
 } from '../firestore';
+import { generateClickId } from '../utils/idGenerator';
+import { verifyFbOauthState } from '../utils/facebookOauthState';
 import type { ClickRecord, ConversionRecord } from '../types';
 import { extractFbCampaign } from '../services/facebookCampaignExtractor';
 import { generateConversionId } from '../utils/idGenerator';
@@ -101,6 +104,151 @@ export const facebookController = {
       logger.error('fb_oauth_start_failed', { error: err instanceof Error ? err.message : String(err) });
       return c.json({ error: 'oauth_misconfigured' }, 500);
     }
+  },
+
+  // PUBLIC route — receives Meta's redirect after the user approves consent.
+  // No auth required: Meta's user-agent gets here via a cross-site browser
+  // redirect, so any cookie-based auth on the frontend doesn't survive the
+  // hop (and pennywise-admin's auth guard would bounce the URL to /login,
+  // killing the in-flight ?code & ?state params).
+  //
+  // Flow:
+  //   1. Receive ?code & ?state from Meta
+  //   2. Verify state JWT (proves the request originated from our /oauth/start)
+  //   3. Exchange code for long-lived token (server-to-server, no auth needed)
+  //   4. Discover candidates (BMs + ad accounts)
+  //   5. Stash everything in a 5-min session doc keyed by random session_id
+  //   6. 302 the browser to FRONTEND/connections?fb_oauth_session=<id>
+  //
+  // The frontend Connections page (which the user IS authenticated for via
+  // their existing localStorage / cookie session, since it's a normal in-app
+  // navigation) detects the URL param and calls consumeSession to fetch the
+  // candidates + grant_token, then opens the picker modal.
+  async handleCallback(c: Context) {
+    const code = c.req.query('code');
+    const state = c.req.query('state');
+    const oauthError = c.req.query('error');
+    const oauthErrorDesc = c.req.query('error_description');
+
+    const frontendBase = (process.env.META_FRONTEND_BASE_URL || '').replace(/\/+$/, '');
+    if (!frontendBase) {
+      logger.error('fb_oauth_callback_no_frontend_base');
+      return c.text('META_FRONTEND_BASE_URL is not configured', 500);
+    }
+
+    function frontendError(reason: string, message?: string): Response {
+      const url = new URL(`${frontendBase}/connections`);
+      url.searchParams.set('fb_oauth_error', reason);
+      if (message) url.searchParams.set('fb_oauth_error_message', message.slice(0, 200));
+      return c.redirect(url.toString(), 302);
+    }
+
+    if (oauthError) {
+      logger.warn('fb_oauth_callback_user_denied', { error: oauthError, desc: oauthErrorDesc });
+      return frontendError(oauthError, oauthErrorDesc ?? undefined);
+    }
+    if (!code || !state) {
+      logger.warn('fb_oauth_callback_missing_params', { has_code: !!code, has_state: !!state });
+      return frontendError('missing_params');
+    }
+
+    // State JWT is self-signed — we don't need a user session to verify it.
+    // The signature proves the state was minted by our /oauth/start endpoint,
+    // and the admin_email inside the JWT tells us who started the flow.
+    const payload = await verifyFbOauthState(state);
+    if (!payload) {
+      logger.warn('fb_oauth_callback_invalid_state');
+      return frontendError('invalid_state');
+    }
+
+    let exchanged;
+    try {
+      exchanged = await facebookOauthService.exchangeCode(code);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.error('fb_oauth_callback_exchange_failed', { error: msg });
+      return frontendError('exchange_failed', msg);
+    }
+
+    const access_token_enc = encryptSecret(exchanged.access_token_long_lived);
+
+    let candidates: FacebookCandidate[];
+    try {
+      candidates = await facebookAccountService.listAccessibleFromGrant(access_token_enc);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.error('fb_oauth_callback_list_accessible_failed', { error: msg });
+      return frontendError('list_accessible_failed', msg);
+    }
+    if (candidates.length === 0) {
+      return frontendError('no_accessible_accounts');
+    }
+
+    const session_id = generateClickId();   // uuidv7 — short, urlsafe, time-ordered
+    try {
+      await facebookOauthSessionRepository.create(session_id, {
+        admin_email: payload.admin_email,
+        access_token_enc,
+        access_token_expires_at: exchanged.expires_at_iso,
+        meta_user_email: exchanged.meta_user_email,
+        scopes: exchanged.scopes,
+        type: payload.type,
+        candidates,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.error('fb_oauth_callback_session_store_failed', { error: msg });
+      return frontendError('session_store_failed', msg);
+    }
+
+    logger.info('fb_oauth_callback_succeeded', {
+      session_id,
+      admin_email: payload.admin_email,
+      candidates_count: candidates.length,
+    });
+
+    const successUrl = new URL(`${frontendBase}/connections`);
+    successUrl.searchParams.set('fb_oauth_session', session_id);
+    return c.redirect(successUrl.toString(), 302);
+  },
+
+  // PROTECTED route — the frontend calls this to exchange the session_id for
+  // the actual candidates + grant_token. requireAuth runs first, so we can
+  // trust the admin_email in context.
+  async consumeSession(c: Context) {
+    const session_id = c.req.param('session_id');
+    if (!session_id) return c.json({ error: 'invalid_session_id' }, 400);
+
+    const adminEmail = getAdminEmail(c);
+    if (!adminEmail) return c.json({ error: 'unauthorized' }, 401);
+
+    let session;
+    try {
+      session = await facebookOauthSessionRepository.consume(session_id, adminEmail);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.warn('fb_oauth_session_consume_failed', { session_id, admin_email: adminEmail, reason: msg });
+      const status = msg === 'session_not_found' || msg === 'session_expired' ? 410 : 403;
+      return c.json({ error: msg }, status);
+    }
+
+    // Mint the same grant_token the legacy /oauth/exchange path returns, so
+    // the existing AccountsModal → finalize flow works unchanged.
+    const grant_token = await signFbGrantToken({
+      access_token_enc: session.access_token_enc,
+      access_token_expires_at: session.access_token_expires_at,
+      meta_user_email: session.meta_user_email,
+      scopes: session.scopes,
+      type: session.type,
+    });
+
+    return c.json({
+      grant_token,
+      type: session.type,
+      meta_user_email: session.meta_user_email,
+      access_token_expires_at: session.access_token_expires_at,
+      candidates: session.candidates,
+    });
   },
 
   async oauthExchange(c: Context) {

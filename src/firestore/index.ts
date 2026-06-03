@@ -22,6 +22,8 @@ export { facebookRouteRepository, buildFbRouteId } from './repositories/facebook
 export { facebookUploadRepository } from './repositories/facebookUploadRepository';
 export { facebookSyncStateRepository } from './repositories/facebookSyncStateRepository';
 export type { FacebookSyncState } from './repositories/facebookSyncStateRepository';
+export { facebookOauthSessionRepository } from './repositories/facebookOauthSessionRepository';
+export type { FacebookOauthSessionDoc } from './repositories/facebookOauthSessionRepository';
 export { facebookCampaignReportRepository } from './repositories/facebookCampaignReportRepository';
 export type {
   FacebookCampaignReportDoc,
