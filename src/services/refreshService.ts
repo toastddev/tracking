@@ -5,9 +5,7 @@ import { db } from '../firestore/config';
 import { COLLECTIONS } from '../firestore/schema';
 import { affiliateApiRepository } from '../firestore';
 import { affiliateApiScheduler } from './affiliateApiScheduler';
-import { offerReportsBackfillService } from './offerReportsBackfillService';
-import { campaignReportsBackfillService } from './campaignReportsBackfillService';
-import { facebookCampaignReportsBackfillService } from './facebookCampaignReportsBackfillService';
+import { unifiedReconciler } from './reconciler/unifiedReconciler';
 import { facebookCampaignSyncService } from './facebookCampaignSyncService';
 import { generateConversionId } from '../utils/idGenerator';
 import { logger } from '../utils/logger';
@@ -572,75 +570,71 @@ export const refreshService = {
     if (backfillFrom < minFrom) backfillFrom = minFrom;
     const backfillTo = new Date();
 
+    // ── 2. Unified reconciler — ONE scan, all three handlers ─────
+    // Replaces three sequential backfills (offer + GAds campaign + FB campaign)
+    // each with their own clicks+conversions scan. Now the single
+    // unifiedReconciler.runAll() scans both collections once and dispatches
+    // every doc to every handler. See services/reconciler/unifiedReconciler.ts
+    // for the per-tick read cost analysis.
     await patchRun(run_id, {
       phase: 'backfill_offers' as RefreshPhase,
-      current_step: `Backfilling offer reports (${backfillFrom.toISOString().slice(0, 10)} → ${backfillTo.toISOString().slice(0, 10)})`,
+      current_step: `Reconciling rollups (${backfillFrom.toISOString().slice(0, 10)} → ${backfillTo.toISOString().slice(0, 10)})`,
       backfill_from: backfillFrom.toISOString(),
       backfill_to: backfillTo.toISOString(),
     });
 
     let offerOk = false;
-    let offerStep: RefreshStep;
-    try {
-      const r = await offerReportsBackfillService.rebuild({ from: backfillFrom, to: backfillTo });
-      offerOk = true;
-      offerStep = {
-        kind: 'backfill_offers',
-        ok: true,
-        conversions_scanned: r.conversions_scanned,
-        buckets_written: r.buckets_written,
-        duration_ms: r.duration_ms,
-        ...(r.truncated ? { truncated: r.truncated, truncated_reason: r.truncated_reason } : {}),
-      };
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      offerStep = { kind: 'backfill_offers', ok: false, error: message };
-      await appendError(run_id, 'backfill_offers', message);
-      logger.error('refresh_offer_backfill_failed', { run_id, error: message });
-    }
-    await appendStep(run_id, offerStep);
-
-    await patchRun(run_id, {
-      phase: 'backfill_campaigns' as RefreshPhase,
-      current_step: `Backfilling campaign reports (${backfillFrom.toISOString().slice(0, 10)} → ${backfillTo.toISOString().slice(0, 10)})`,
-    });
-
     let campaignOk = false;
+    let offerStep: RefreshStep;
     let campaignStep: RefreshStep;
-    try {
-      const r = await campaignReportsBackfillService.rebuild({ from: backfillFrom, to: backfillTo });
-      campaignOk = true;
-      campaignStep = {
-        kind: 'backfill_campaigns',
-        ok: true,
-        conversions_scanned: r.conversions_scanned,
-        buckets_written: r.buckets_written,
-        duration_ms: r.duration_ms,
-        ...(r.truncated ? { truncated: r.truncated, truncated_reason: r.truncated_reason } : {}),
-        campaign_spends_updated: r.campaign_spends?.length ?? 0,
-      };
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      campaignStep = { kind: 'backfill_campaigns', ok: false, error: message };
-      await appendError(run_id, 'backfill_campaigns', message);
-      logger.error('refresh_campaign_backfill_failed', { run_id, error: message });
-    }
-    await appendStep(run_id, campaignStep);
-
-    // ── 2c. Facebook campaign backfill + spend sync ────────────────
-    // Reuses the same window. Failure here is recorded but does NOT cause the
-    // overall refresh to flip to 'failed' — FB is an additive integration and
-    // a token expiry / Graph outage shouldn't tank the rest of the refresh.
-    // The operator still sees the failure in the run-doc's `errors` array.
-    await patchRun(run_id, {
-      phase: 'backfill_fb_campaigns' as RefreshPhase,
-      current_step: `Backfilling Facebook campaigns (${backfillFrom.toISOString().slice(0, 10)} → ${backfillTo.toISOString().slice(0, 10)})`,
-    });
-
     let fbCampaignStep: RefreshStep;
     try {
-      const r = await facebookCampaignReportsBackfillService.rebuild({ from: backfillFrom, to: backfillTo });
-      // Spend pull runs AFTER the backfill so the next window is consistent.
+      const result = await unifiedReconciler.runAll({ from: backfillFrom, to: backfillTo });
+
+      const offerHandler = result.handlers.find((h) => h.name === 'offer_reports');
+      const gadsHandler = result.handlers.find((h) => h.name === 'campaign_reports');
+      const fbHandler = result.handlers.find((h) => h.name === 'facebook_campaign_reports');
+
+      offerOk = offerHandler?.ok === true;
+      offerStep = offerHandler
+        ? {
+            kind: 'backfill_offers',
+            ok: offerHandler.ok,
+            conversions_scanned: offerHandler.conversions_scanned,
+            buckets_written: offerHandler.buckets_written,
+            duration_ms: offerHandler.duration_ms,
+            ...(offerHandler.truncated ? { truncated: offerHandler.truncated, truncated_reason: offerHandler.truncated_reason } : {}),
+            ...(offerHandler.error ? { error: offerHandler.error } : {}),
+          }
+        : { kind: 'backfill_offers', ok: false, error: 'handler_missing' };
+      if (!offerOk && offerHandler?.error) {
+        await appendError(run_id, 'backfill_offers', offerHandler.error);
+      }
+
+      campaignOk = gadsHandler?.ok === true;
+      campaignStep = gadsHandler
+        ? {
+            kind: 'backfill_campaigns',
+            ok: gadsHandler.ok,
+            conversions_scanned: gadsHandler.conversions_scanned,
+            buckets_written: gadsHandler.buckets_written,
+            duration_ms: gadsHandler.duration_ms,
+            ...(gadsHandler.truncated ? { truncated: gadsHandler.truncated, truncated_reason: gadsHandler.truncated_reason } : {}),
+            ...(gadsHandler.error ? { error: gadsHandler.error } : {}),
+          }
+        : { kind: 'backfill_campaigns', ok: false, error: 'handler_missing' };
+      if (!campaignOk && gadsHandler?.error) {
+        await appendError(run_id, 'backfill_campaigns', gadsHandler.error);
+      }
+
+      // Switch the visible phase to FB and run the Meta Insights spend sync
+      // (separate from the reconciler — it pulls spend FROM Meta, doesn't
+      // need our raw clicks/conversions). Sync failure is recorded but does
+      // not flip the overall refresh to 'failed'.
+      await patchRun(run_id, {
+        phase: 'backfill_fb_campaigns' as RefreshPhase,
+        current_step: `Pulling Facebook Insights spend (${backfillFrom.toISOString().slice(0, 10)} → ${backfillTo.toISOString().slice(0, 10)})`,
+      });
       let totalSpendInr = 0;
       let campaignsUpdated = 0;
       try {
@@ -652,22 +646,34 @@ export const refreshService = {
         await appendError(run_id, 'backfill_fb_campaigns', `fb_spend_sync: ${msg}`);
         logger.warn('refresh_fb_spend_sync_failed', { run_id, error: msg });
       }
-      fbCampaignStep = {
-        kind: 'backfill_fb_campaigns',
-        ok: true,
-        conversions_scanned: r.conversions_scanned,
-        buckets_written: r.buckets_written,
-        duration_ms: r.duration_ms,
-        ...(r.truncated ? { truncated: r.truncated, truncated_reason: r.truncated_reason } : {}),
-        fb_spend_inr: totalSpendInr,
-        fb_campaigns_updated: campaignsUpdated,
-      };
+      fbCampaignStep = fbHandler
+        ? {
+            kind: 'backfill_fb_campaigns',
+            ok: fbHandler.ok,
+            conversions_scanned: fbHandler.conversions_scanned,
+            buckets_written: fbHandler.buckets_written,
+            duration_ms: fbHandler.duration_ms,
+            ...(fbHandler.truncated ? { truncated: fbHandler.truncated, truncated_reason: fbHandler.truncated_reason } : {}),
+            ...(fbHandler.error ? { error: fbHandler.error } : {}),
+            fb_spend_inr: totalSpendInr,
+            fb_campaigns_updated: campaignsUpdated,
+          }
+        : { kind: 'backfill_fb_campaigns', ok: false, error: 'handler_missing' };
+      if (fbHandler?.error) {
+        await appendError(run_id, 'backfill_fb_campaigns', fbHandler.error);
+      }
     } catch (err) {
+      // Catastrophic — the entire reconciler threw before any handler reported.
+      // Stamp all three steps as failed so the UI shows the explosion clearly.
       const message = err instanceof Error ? err.message : String(err);
+      offerStep = { kind: 'backfill_offers', ok: false, error: message };
+      campaignStep = { kind: 'backfill_campaigns', ok: false, error: message };
       fbCampaignStep = { kind: 'backfill_fb_campaigns', ok: false, error: message };
-      await appendError(run_id, 'backfill_fb_campaigns', message);
-      logger.error('refresh_fb_campaign_backfill_failed', { run_id, error: message });
+      await appendError(run_id, 'backfill_offers', message);
+      logger.error('refresh_unified_reconciler_failed', { run_id, error: message });
     }
+    await appendStep(run_id, offerStep);
+    await appendStep(run_id, campaignStep);
     await appendStep(run_id, fbCampaignStep);
 
     // ── 3. Finalise ──────────────────────────────────────────────

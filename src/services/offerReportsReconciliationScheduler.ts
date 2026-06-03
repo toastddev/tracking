@@ -1,69 +1,45 @@
-// Periodic, in-process reconciliation of the offer_reports rollup against the
-// raw clicks/conversions collections.
+// Periodic, in-process reconciliation of the rollup tables (offer_reports,
+// campaign_reports, facebook_campaign_reports) against the raw clicks /
+// conversions collections.
 //
-// Why this exists:
-//   The hot-path rollup writes (postbackService, affiliateApiSyncService) use
-//   FieldValue.increment which is non-idempotent: a flaky write that retries
-//   over-counts, a flaky write with no retry under-counts. In production the
-//   net effect was ~10-15 conversions/day going missing and a sporadic
-//   over-count from manual backfills. This scheduler is the safety net that
-//   makes the rollup *eventually correct* regardless of hot-path behaviour.
+// Single-scan design: one tick scans clicks once + conversions once and
+// dispatches every doc to every platform handler. With three handlers today
+// (offer, GAds campaign, FB campaign) that's a 3× Firestore-read reduction
+// per tick vs the old per-platform schedulers. Adding a 4th platform costs
+// no extra Firestore reads — see ./reconciler/unifiedReconciler.ts.
 //
-// Design:
-//   - Two cadences:
-//       FAST_INTERVAL_MS  → rebuild "last 24h"  (catches recent drift quickly)
-//       SLOW_INTERVAL_MS  → rebuild "last 7d"   (corrects mid-tail and lets a
-//                                                 daily run heal anything that
-//                                                 hot-path missed earlier)
-//   - Single-flight: a tick that takes longer than the interval is allowed to
-//     finish; the next tick is scheduled relative to its end, not start.
-//   - Safe to run alongside live writes. Backfill `set()`s — see
-//     offerReportsBackfillService for the race trade-off (it warns).
-//   - Disabled via OFFER_REPORTS_RECON_DISABLED=1 (ops kill-switch).
+// Cadences:
+//   FAST_INTERVAL_MS  → rebuild "last 24h"  (catches recent drift quickly)
+//   SLOW_INTERVAL_MS  → rebuild "last 7d"   (twice-daily safety net for the
+//                                            long tail)
 //
-// Cost on Cloud Run / Firestore (at $0.06 per 100k reads):
-//   At a measured volume of ~600 clicks/day + ~200 conversions/day, defaults
-//   below come out to ≈ $0.30/month. Hard scan caps in
-//   offerReportsBackfillService make sure a 100× traffic spike still tops
-//   out at a few dollars/month rather than running away.
-//   Multi-instance Cloud Run will run the scheduler on every instance — that's
-//   safe (set() is last-writer-wins on identical data) but multiplies reads
-//   linearly. If you have N instances always-on, expect N× the cost above.
-//   To squeeze cost when scaling out, raise OFFER_REPORTS_RECON_FAST_MS or
-//   set OFFER_REPORTS_RECON_DISABLED=1 on all but one instance.
+// Single-flight: a tick that overruns the interval is allowed to finish; the
+// next tick is scheduled relative to its end. Stale flag-detection (
+// TICK_TIMEOUT_MS) defends against a hung rebuild promise.
+//
+// Safe to run alongside live writes. Handlers `set(..., {merge:true})` —
+// last-writer-wins on identical data. Multi-instance Cloud Run will run the
+// scheduler on every instance; that's safe but multiplies reads linearly.
+// Combine this with a Firestore lease lock (see refreshService.ts pattern) if
+// you scale beyond 1 instance and want to avoid the multiplier.
+//
+// Kill-switch: OFFER_REPORTS_RECON_DISABLED=1
 
-import { offerReportsBackfillService } from './offerReportsBackfillService';
-import { campaignReportsBackfillService } from './campaignReportsBackfillService';
+import { unifiedReconciler } from './reconciler/unifiedReconciler';
 import { logger } from '../utils/logger';
 
-// Defaults are deliberately conservative because the hot path now has
-// `retry()` on every write. The reconciler is a conversion/revenue backstop:
-// it never recalculates click counts from raw clicks.
-//
-// Cadence trade-off:
-//   FAST every 1h x 24h lookback -> rebuilds the full UTC days touched by the
-//                                   last 24h, usually today + yesterday.
-//   SLOW every 12h x 7d lookback -> twice-daily safety net for the long tail.
-//
-// Override these via env if traffic grows or your reporting needs are tighter:
-//   OFFER_REPORTS_RECON_FAST_MS=1800000  (30 min — old default)
-//   OFFER_REPORTS_RECON_FAST_LOOKBACK_MS=86400000  (24h)
 const FAST_INTERVAL_MS = Number(process.env.OFFER_REPORTS_RECON_FAST_MS ?? 60 * 60_000);   // 1 h
 const SLOW_INTERVAL_MS = Number(process.env.OFFER_REPORTS_RECON_SLOW_MS ?? 12 * 60 * 60_000); // 12 h
 
-const FAST_LOOKBACK_MS = Number(process.env.OFFER_REPORTS_RECON_FAST_LOOKBACK_MS ?? 24 * 60 * 60_000); // last 24 h
-const SLOW_LOOKBACK_MS = Number(process.env.OFFER_REPORTS_RECON_SLOW_LOOKBACK_MS ?? 7 * 24 * 60 * 60_000); // last 7 d
+const FAST_LOOKBACK_MS = Number(process.env.OFFER_REPORTS_RECON_FAST_LOOKBACK_MS ?? 24 * 60 * 60_000);
+const SLOW_LOOKBACK_MS = Number(process.env.OFFER_REPORTS_RECON_SLOW_LOOKBACK_MS ?? 7 * 24 * 60 * 60_000);
 
-// Cap on a single tick's wallclock duration. If a tick is still running at the
-// next interval, the scheduler logs a warning and the tick continues, but we
-// also refuse to start additional ticks for this many ms after a tick begins
-// (single-flight). This prevents a slow run + future deadline accumulation.
-const TICK_TIMEOUT_MS = Number(process.env.OFFER_REPORTS_RECON_TICK_TIMEOUT_MS ?? 10 * 60_000); // 10 min
+const TICK_TIMEOUT_MS = Number(process.env.OFFER_REPORTS_RECON_TICK_TIMEOUT_MS ?? 10 * 60_000);
+const FIRST_TICK_DELAY_MS = Number(process.env.OFFER_REPORTS_RECON_FIRST_DELAY_MS ?? 90_000);
 
-// Initial delay before the first FAST tick. Lets the server boot complete and
-// avoids running at the same instant as the affiliate API scheduler's first
-// tick (which fires immediately on boot).
-const FIRST_TICK_DELAY_MS = Number(process.env.OFFER_REPORTS_RECON_FIRST_DELAY_MS ?? 90_000); // 90 s
+const CONSECUTIVE_FAILURE_ALERT_THRESHOLD = Number(
+  process.env.OFFER_REPORTS_RECON_CONSECUTIVE_FAILURE_THRESHOLD ?? 3,
+);
 
 let fastInFlight = false;
 let slowInFlight = false;
@@ -71,35 +47,24 @@ let fastTimer: NodeJS.Timeout | null = null;
 let slowTimer: NodeJS.Timeout | null = null;
 let fastStartedAt = 0;
 let slowStartedAt = 0;
-// Consecutive-failure counters. Promote from ERROR to CRITICAL after N hits
-// in a row — one-off rebuild failures are noisy and self-heal next tick, but
-// repeated failures mean the conversion/revenue rollup is drifting and the
-// dashboard numbers are getting wrong.
-const CONSECUTIVE_FAILURE_ALERT_THRESHOLD = Number(
-  process.env.OFFER_REPORTS_RECON_CONSECUTIVE_FAILURE_THRESHOLD ?? 3,
-);
 let fastConsecutiveFailures = 0;
 let slowConsecutiveFailures = 0;
 
-// Reset an in-flight flag if it's been stuck for more than TICK_TIMEOUT_MS.
-// Defends against the rare case where the rebuild() promise hangs (gRPC
-// deadlock / Firestore stream stall) and never resolves — without this the
-// flag would stay 'true' forever and the scheduler would never tick again.
 function tickStale(startedAt: number): boolean {
   return startedAt > 0 && Date.now() - startedAt > TICK_TIMEOUT_MS;
 }
 
 async function runFastTick(): Promise<void> {
   logger.info('scheduler_heartbeat', {
-    scheduler: 'offer_reports_recon_fast',
+    scheduler: 'reports_recon_fast',
     tick_ms: FAST_INTERVAL_MS,
   });
   if (fastInFlight && !tickStale(fastStartedAt)) {
-    logger.info('offer_reports_recon_fast_skipped_in_flight');
+    logger.info('reports_recon_fast_skipped_in_flight');
     return;
   }
   if (fastInFlight && tickStale(fastStartedAt)) {
-    logger.warn('offer_reports_recon_fast_force_unblock', {
+    logger.warn('reports_recon_fast_force_unblock', {
       stuck_for_ms: Date.now() - fastStartedAt,
     });
   }
@@ -109,47 +74,27 @@ async function runFastTick(): Promise<void> {
   const from = new Date(now.getTime() - FAST_LOOKBACK_MS);
   let tickHadFailure = false;
   try {
-    const result = await offerReportsBackfillService.rebuild({ from, to: now });
-    logger.info('offer_reports_recon_fast_done', {
-      from: result.from,
-      to: result.to,
-      clicks_untouched: result.clicks_untouched,
-      existing_buckets_scanned: result.existing_buckets_scanned,
+    // ONE scan, all handlers. Result includes per-handler stats so any single
+    // handler's failure is surfaced separately without aborting the others.
+    const result = await unifiedReconciler.runAll({ from, to: now });
+    logger.info('reports_recon_fast_done', {
+      from: result.from, to: result.to,
+      clicks_scanned: result.clicks_scanned,
       conversions_scanned: result.conversions_scanned,
-      buckets_written: result.buckets_written,
+      orphan_clicks_fetched: result.orphan_clicks_fetched,
       duration_ms: result.duration_ms,
-      truncated: result.truncated,
-      truncated_reason: result.truncated_reason,
+      handlers: result.handlers.map((h) => ({
+        name: h.name, ok: h.ok, buckets_written: h.buckets_written,
+        truncated: h.truncated,
+      })),
     });
+    // If ANY handler failed, count as tick failure for the alert escalation.
+    if (result.handlers.some((h) => !h.ok)) tickHadFailure = true;
   } catch (err) {
     tickHadFailure = true;
     const count = fastConsecutiveFailures + 1;
     const level = count >= CONSECUTIVE_FAILURE_ALERT_THRESHOLD ? 'critical' : 'error';
-    logger[level]('offer_reports_recon_fast_failed', {
-      consecutive_failures: count,
-      error: err,
-    });
-  }
-  try {
-    const result = await campaignReportsBackfillService.rebuild({ from, to: now });
-    logger.info('campaign_reports_recon_fast_done', {
-      from: result.from,
-      to: result.to,
-      clicks_untouched: result.clicks_untouched,
-      click_metadata_scanned: result.click_metadata_scanned,
-      existing_buckets_scanned: result.existing_buckets_scanned,
-      conversions_scanned: result.conversions_scanned,
-      conversions_with_campaign: result.conversions_with_campaign,
-      buckets_written: result.buckets_written,
-      duration_ms: result.duration_ms,
-      truncated: result.truncated,
-      truncated_reason: result.truncated_reason,
-    });
-  } catch (err) {
-    tickHadFailure = true;
-    const count = fastConsecutiveFailures + 1;
-    const level = count >= CONSECUTIVE_FAILURE_ALERT_THRESHOLD ? 'critical' : 'error';
-    logger[level]('campaign_reports_recon_fast_failed', {
+    logger[level]('reports_recon_fast_failed', {
       consecutive_failures: count,
       error: err,
     });
@@ -162,15 +107,15 @@ async function runFastTick(): Promise<void> {
 
 async function runSlowTick(): Promise<void> {
   logger.info('scheduler_heartbeat', {
-    scheduler: 'offer_reports_recon_slow',
+    scheduler: 'reports_recon_slow',
     tick_ms: SLOW_INTERVAL_MS,
   });
   if (slowInFlight && !tickStale(slowStartedAt)) {
-    logger.info('offer_reports_recon_slow_skipped_in_flight');
+    logger.info('reports_recon_slow_skipped_in_flight');
     return;
   }
   if (slowInFlight && tickStale(slowStartedAt)) {
-    logger.warn('offer_reports_recon_slow_force_unblock', {
+    logger.warn('reports_recon_slow_force_unblock', {
       stuck_for_ms: Date.now() - slowStartedAt,
     });
   }
@@ -180,47 +125,24 @@ async function runSlowTick(): Promise<void> {
   const from = new Date(now.getTime() - SLOW_LOOKBACK_MS);
   let tickHadFailure = false;
   try {
-    const result = await offerReportsBackfillService.rebuild({ from, to: now });
-    logger.info('offer_reports_recon_slow_done', {
-      from: result.from,
-      to: result.to,
-      clicks_untouched: result.clicks_untouched,
-      existing_buckets_scanned: result.existing_buckets_scanned,
+    const result = await unifiedReconciler.runAll({ from, to: now });
+    logger.info('reports_recon_slow_done', {
+      from: result.from, to: result.to,
+      clicks_scanned: result.clicks_scanned,
       conversions_scanned: result.conversions_scanned,
-      buckets_written: result.buckets_written,
+      orphan_clicks_fetched: result.orphan_clicks_fetched,
       duration_ms: result.duration_ms,
-      truncated: result.truncated,
-      truncated_reason: result.truncated_reason,
+      handlers: result.handlers.map((h) => ({
+        name: h.name, ok: h.ok, buckets_written: h.buckets_written,
+        truncated: h.truncated,
+      })),
     });
+    if (result.handlers.some((h) => !h.ok)) tickHadFailure = true;
   } catch (err) {
     tickHadFailure = true;
     const count = slowConsecutiveFailures + 1;
     const level = count >= CONSECUTIVE_FAILURE_ALERT_THRESHOLD ? 'critical' : 'error';
-    logger[level]('offer_reports_recon_slow_failed', {
-      consecutive_failures: count,
-      error: err,
-    });
-  }
-  try {
-    const result = await campaignReportsBackfillService.rebuild({ from, to: now });
-    logger.info('campaign_reports_recon_slow_done', {
-      from: result.from,
-      to: result.to,
-      clicks_untouched: result.clicks_untouched,
-      click_metadata_scanned: result.click_metadata_scanned,
-      existing_buckets_scanned: result.existing_buckets_scanned,
-      conversions_scanned: result.conversions_scanned,
-      conversions_with_campaign: result.conversions_with_campaign,
-      buckets_written: result.buckets_written,
-      duration_ms: result.duration_ms,
-      truncated: result.truncated,
-      truncated_reason: result.truncated_reason,
-    });
-  } catch (err) {
-    tickHadFailure = true;
-    const count = slowConsecutiveFailures + 1;
-    const level = count >= CONSECUTIVE_FAILURE_ALERT_THRESHOLD ? 'critical' : 'error';
-    logger[level]('campaign_reports_recon_slow_failed', {
+    logger[level]('reports_recon_slow_failed', {
       consecutive_failures: count,
       error: err,
     });
@@ -234,22 +156,19 @@ async function runSlowTick(): Promise<void> {
 export const offerReportsReconciliationScheduler = {
   start(): void {
     if (process.env.OFFER_REPORTS_RECON_DISABLED === '1') {
-      logger.info('offer_reports_recon_disabled');
+      logger.info('reports_recon_disabled');
       return;
     }
     if (fastTimer || slowTimer) return;
-    logger.info('offer_reports_recon_start', {
+    logger.info('reports_recon_start', {
       fast_interval_ms: FAST_INTERVAL_MS,
       slow_interval_ms: SLOW_INTERVAL_MS,
       fast_lookback_ms: FAST_LOOKBACK_MS,
       slow_lookback_ms: SLOW_LOOKBACK_MS,
     });
-    // Stagger the first runs so they don't pile on at boot.
     setTimeout(() => void runFastTick(), FIRST_TICK_DELAY_MS).unref?.();
     fastTimer = setInterval(() => void runFastTick(), FAST_INTERVAL_MS);
     fastTimer.unref?.();
-    // Slow tick fires for the first time after one full SLOW_INTERVAL_MS —
-    // FAST_INTERVAL handles initial post-deploy heal.
     slowTimer = setInterval(() => void runSlowTick(), SLOW_INTERVAL_MS);
     slowTimer.unref?.();
   },
@@ -261,12 +180,6 @@ export const offerReportsReconciliationScheduler = {
     slowTimer = null;
   },
 
-  // Exposed for ops/tests — forces a fast tick immediately.
-  async runFastNow(): Promise<void> {
-    return runFastTick();
-  },
-
-  async runSlowNow(): Promise<void> {
-    return runSlowTick();
-  },
+  async runFastNow(): Promise<void> { return runFastTick(); },
+  async runSlowNow(): Promise<void> { return runSlowTick(); },
 };

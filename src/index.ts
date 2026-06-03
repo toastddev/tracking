@@ -12,7 +12,6 @@ import { initFirestore } from './firestore';
 import { logger } from './utils/logger';
 import { affiliateApiScheduler } from './services/affiliateApiScheduler';
 import { offerReportsReconciliationScheduler } from './services/offerReportsReconciliationScheduler';
-import { facebookReportsReconciliationScheduler } from './services/facebookReportsReconciliationScheduler';
 
 // Catch errors that escape Hono's request scope (scheduler ticks, async
 // fire-and-forget, Firestore client internals). Without this they vanish
@@ -32,11 +31,9 @@ try {
   initFirestore();
   logger.info('firestore_ready');
   affiliateApiScheduler.start();
+  // Single reconciler covers offer_reports + campaign_reports + facebook_campaign_reports
+  // in one shared scan per tick — see services/reconciler/unifiedReconciler.ts.
   offerReportsReconciliationScheduler.start();
-  // FB campaign rollup reconciler — separate timers, separate kill-switch
-  // (FB_CAMPAIGN_REPORTS_RECON_DISABLED=1). Staggered to fire its first tick
-  // 30s after the GAds reconciler so they don't pile on at boot.
-  facebookReportsReconciliationScheduler.start();
 } catch (err) {
   // Firestore unreachable means clicks/postbacks can't persist and schedulers
   // never start — the app is half-dead and a human must look at it.
@@ -98,7 +95,6 @@ for (const sig of ['SIGTERM', 'SIGINT'] as const) {
     logger.info('shutdown_signal', { signal: sig });
     affiliateApiScheduler.stop();
     offerReportsReconciliationScheduler.stop();
-    facebookReportsReconciliationScheduler.stop();
     server.close(() => process.exit(0));
   });
 }
