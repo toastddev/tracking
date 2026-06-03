@@ -7,10 +7,13 @@ import {
   offerReportRepository,
   drilldownRepository,
   campaignReportRepository,
+  facebookCampaignReportRepository,
 } from '../firestore';
 import { __campaignFromExtra as extractCampaign } from './clickService';
+import { extractFbCampaign } from './facebookCampaignExtractor';
 import { networkService } from './networkService';
 import { googleAdsForwardingService } from './googleAdsForwardingService';
+import { facebookForwardingService } from './facebookForwardingService';
 import { eventDate } from './eventTime';
 import { retry } from '../utils/retry';
 import type { ConversionRecord, Network, VerificationReason } from '../types';
@@ -222,6 +225,31 @@ export const postbackService = {
           });
         });
       }
+
+      // Facebook campaign rollup — separate facebook_campaign_reports table.
+      // Strictly additive; never replaces the GAds increment above.
+      const fbCampaign = click ? extractFbCampaign(click) : null;
+      if (fbCampaign) {
+        retry(() =>
+          facebookCampaignReportRepository.incrementConversion({
+            campaign_id: fbCampaign.campaign_id,
+            campaign_name: fbCampaign.campaign_name,
+            source: fbCampaign.source,
+            at: eventDate(conv),
+            verified: conv.verified,
+            status: conv.status,
+            payout: conv.payout,
+            currency: conv.currency,
+            offer_id: conv.offer_id,
+          })
+        ).catch((err: unknown) => {
+          logger.warn('fb_campaign_report_conversion_increment_failed', {
+            conversion_id: conv.conversion_id,
+            campaign_id: fbCampaign.campaign_id,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        });
+      }
     }
 
     // Fan out to Google Ads in the background. Never block or fail the
@@ -231,6 +259,9 @@ export const postbackService = {
     // run will trigger the forward instead so we don't double-upload.
     if (!shadow) {
       googleAdsForwardingService.forgetConversion({ conversion: conv, click, postback_timezone: network.postback_timezone });
+      // Facebook CAPI fan-out — parallel to the GAds dispatch above. Same
+      // shadow guard, same fire-and-forget contract.
+      facebookForwardingService.forgetConversion({ conversion: conv, click, postback_timezone: network.postback_timezone });
     }
 
     return { ok: true, conversion_id: conv.conversion_id, verified, verification_reason };

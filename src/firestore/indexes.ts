@@ -58,4 +58,7 @@ export const INDEXES = [
   // Pre-aggregated campaign metrics — same pattern as offer_reports.
   { collection: 'campaign_reports', fields: ['campaign_id ASC', 'date ASC'] },
   { collection: 'campaign_reports', fields: ['date ASC'] },
+  // Facebook campaign rollup — separate collection; same query pattern.
+  { collection: 'facebook_campaign_reports', fields: ['campaign_id ASC', 'date ASC'] },
+  { collection: 'facebook_campaign_reports', fields: ['date ASC'] },
 ] as const;

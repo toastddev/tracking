@@ -130,6 +130,19 @@ export const COLLECTIONS = {
   GOOGLE_ADS_MCC_CHILDREN: 'google_ads_mcc_children',
   GOOGLE_ADS_ROUTES: 'google_ads_routes',
   GOOGLE_ADS_UPLOADS: 'google_ads_uploads',
+  // Facebook (Meta) integration — separate collections from GAds; the click /
+  // postback hot path runs both forwarders side-by-side so neither integration
+  // can regress the other. Shape mirrors the GAds collections above.
+  //   facebook_connections        ≈ google_ads_connections
+  //   facebook_business_children  ≈ google_ads_mcc_children
+  //   facebook_routes             ≈ google_ads_routes
+  //   facebook_uploads            ≈ google_ads_uploads (CAPI audit trail)
+  //   facebook_campaign_reports   separate from campaign_reports — per-tab UI
+  FACEBOOK_CONNECTIONS: 'facebook_connections',
+  FACEBOOK_BUSINESS_CHILDREN: 'facebook_business_children',
+  FACEBOOK_ROUTES: 'facebook_routes',
+  FACEBOOK_UPLOADS: 'facebook_uploads',
+  FACEBOOK_CAMPAIGN_REPORTS: 'facebook_campaign_reports',
   AFFILIATE_APIS: 'affiliate_apis',
   AFFILIATE_API_RUNS: 'affiliate_api_runs',
   // Pre-aggregated daily metrics per offer. Survives the 90-day TTL on

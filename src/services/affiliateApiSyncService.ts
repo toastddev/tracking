@@ -10,11 +10,14 @@ import {
   offerReportRepository,
   drilldownRepository,
   campaignReportRepository,
+  facebookCampaignReportRepository,
   networkRepository,
 } from '../firestore';
 import { __campaignFromExtra as extractCampaign } from './clickService';
+import { extractFbCampaign } from './facebookCampaignExtractor';
 import { generateConversionId } from '../utils/idGenerator';
 import { googleAdsForwardingService } from './googleAdsForwardingService';
+import { facebookForwardingService } from './facebookForwardingService';
 import { eventDate } from './eventTime';
 import { retry } from '../utils/retry';
 import type {
@@ -443,6 +446,8 @@ export async function runAffiliateApi(api: AffiliateApi, opts: RunOptions): Prom
   const buffer: Array<{ conv: ConversionRecord; click: ClickRecord | null }> = [];
   // Accumulate Google Ads batch upload stats across all flush() calls.
   const gadsStats = { sent: 0, skipped: 0, failed: 0, errors: [] as string[] };
+  // Facebook CAPI batch upload stats — parallel to gadsStats. Never collide.
+  const fbStats = { sent: 0, skipped: 0, failed: 0, errors: [] as string[] };
 
   async function flush(): Promise<void> {
     if (buffer.length === 0) return;
@@ -525,6 +530,38 @@ export async function runAffiliateApi(api: AffiliateApi, opts: RunOptions): Prom
           }
         }
 
+        // Facebook campaign rollup — separate `facebook_campaign_reports` table.
+        // Derives campaign_id via extractFbCampaign. Strictly parallel to the
+        // GAds rollup above; the two never share state.
+        const fbCampaignRollupRows = newBatch
+          .filter((b) => b.conv.offer_id && b.conv.verified && b.click)
+          .map((b) => {
+            const c = extractFbCampaign(b.click!);
+            if (!c) return null;
+            return {
+              campaign_id: c.campaign_id,
+              campaign_name: c.campaign_name,
+              source: c.source,
+              at: eventDate(b.conv),
+              verified: true,
+              status: b.conv.status,
+              payout: b.conv.payout,
+              currency: b.conv.currency,
+              offer_id: b.conv.offer_id as string,
+            };
+          })
+          .filter((r): r is NonNullable<typeof r> => r !== null);
+        if (fbCampaignRollupRows.length > 0) {
+          try {
+            await retry(() => facebookCampaignReportRepository.incrementConversionsBulk(fbCampaignRollupRows));
+          } catch (err) {
+            logger.warn('fb_campaign_report_aff_api_rollup_failed', {
+              api_id: api.api_id,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
+        }
+
         for (const { conv, click } of newBatch) {
           retry(() => drilldownRepository.incrementOfferConversion(conv, click)).catch((err: unknown) => {
             logger.warn('drilldown_offer_conversion_aff_api_failed', {
@@ -568,6 +605,26 @@ export async function runAffiliateApi(api: AffiliateApi, opts: RunOptions): Prom
             gadsStats.failed += verifiedBatch.length;
             gadsStats.errors.push(err instanceof Error ? err.message : String(err));
             logger.warn('gads_batch_dispatch_failed', {
+              api_id: api.api_id,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
+
+          // Facebook CAPI batch dispatch — strictly parallel to the GAds batch
+          // above. The two services never share state; one platform's failure
+          // does not affect the other.
+          try {
+            const fbResult = await facebookForwardingService.dispatchConversionsBatch(
+              verifiedBatch.map((b) => ({ conversion: b.conv, click: b.click!, postback_timezone }))
+            );
+            fbStats.sent += fbResult.sent;
+            fbStats.skipped += fbResult.skipped;
+            fbStats.failed += fbResult.failed;
+            fbStats.errors.push(...fbResult.errors);
+          } catch (err) {
+            fbStats.failed += verifiedBatch.length;
+            fbStats.errors.push(err instanceof Error ? err.message : String(err));
+            logger.warn('fb_batch_dispatch_failed', {
               api_id: api.api_id,
               error: err instanceof Error ? err.message : String(err),
             });
@@ -731,6 +788,10 @@ export async function runAffiliateApi(api: AffiliateApi, opts: RunOptions): Prom
       gads_skipped: gadsStats.skipped,
       gads_failed: gadsStats.failed,
       gads_errors: gadsStats.errors.length > 0 ? gadsStats.errors.slice(0, 10) : undefined,
+      fb_sent: fbStats.sent,
+      fb_skipped: fbStats.skipped,
+      fb_failed: fbStats.failed,
+      fb_errors: fbStats.errors.length > 0 ? fbStats.errors.slice(0, 10) : undefined,
     }).catch((err) => {
       logger.warn('aff_api_run_update_failed', { api_id: api.api_id, run_id, error: String(err) });
     });

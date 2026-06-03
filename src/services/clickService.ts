@@ -6,8 +6,11 @@ import {
   offerReportRepository,
   drilldownRepository,
   campaignReportRepository,
+  facebookCampaignReportRepository,
 } from '../firestore';
 import { googleAdsForwardingService } from './googleAdsForwardingService';
+import { facebookForwardingService } from './facebookForwardingService';
+import { extractFbCampaign } from './facebookCampaignExtractor';
 import { retry } from '../utils/retry';
 import type { AdIds, ClickRecord, Offer } from '../types';
 
@@ -57,6 +60,9 @@ export interface BuildClickInput {
   sub_params: Record<string, string>;
   ad_ids: AdIds;
   extra_params: Record<string, string>;
+  // Meta (Facebook) user-data cookies — fbc / fbp. Captured by the controller
+  // from the Cookie header (or synthesised from URL fbclid).
+  meta_ids?: { fbc?: string; fbp?: string };
   ip?: string;
   user_agent?: string;
   referrer?: string;
@@ -72,6 +78,7 @@ export interface BuildBlockedClickInput {
   sub_params: Record<string, string>;
   ad_ids: AdIds;
   extra_params: Record<string, string>;
+  meta_ids?: { fbc?: string; fbp?: string };
   ip?: string;
   user_agent?: string;
   referrer?: string;
@@ -92,6 +99,7 @@ export interface BuildPixelClickInput {
   sub_params: Record<string, string>;
   ad_ids: AdIds;
   extra_params: Record<string, string>;
+  meta_ids?: { fbc?: string; fbp?: string };
   ip?: string;
   user_agent?: string;
   referrer?: string;
@@ -125,6 +133,7 @@ export const clickService = {
       aff_id,
       sub_params,
       ad_ids,
+      meta_ids: input.meta_ids,
       extra_params,
       ip: input.ip,
       user_agent: input.user_agent,
@@ -145,6 +154,7 @@ export const clickService = {
       aff_id: input.aff_id,
       sub_params: input.sub_params,
       ad_ids: input.ad_ids,
+      meta_ids: input.meta_ids,
       extra_params: input.extra_params,
       ip: input.ip,
       user_agent: input.user_agent,
@@ -235,6 +245,35 @@ export const clickService = {
     if (click.ad_ids?.gclid || click.ad_ids?.gbraid || click.ad_ids?.wbraid) {
       googleAdsForwardingService.forgetClick({ click });
     }
+
+    // Facebook campaign rollup — separate `facebook_campaign_reports` table.
+    // Mirrors the GAds extractCampaign block above; runs alongside, never
+    // replaces it. fb_untagged synthetic campaign covers clicks with
+    // fbclid/fbc/fbp but no campaign tag.
+    const fbCampaign = extractFbCampaign(click);
+    if (fbCampaign) {
+      retry(() =>
+        facebookCampaignReportRepository.incrementClick({
+          campaign_id: fbCampaign.campaign_id,
+          campaign_name: fbCampaign.campaign_name,
+          source: fbCampaign.source,
+          at: new Date(click.created_at),
+          offer_id: click.offer_id,
+        })
+      ).catch((err: unknown) => {
+        logger.warn('fb_campaign_report_click_increment_failed', {
+          click_id: click.click_id,
+          campaign_id: fbCampaign.campaign_id,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
+    }
+
+    // Facebook CAPI fan-out — fire only when the click carries a Facebook
+    // identifier. Parallel to the GAds dispatch above; never gated by it.
+    if (click.ad_ids?.fbclid || click.meta_ids?.fbc || click.meta_ids?.fbp) {
+      facebookForwardingService.forgetClick({ click });
+    }
   },
 
   // Builds a click record for the pixel flow. Key differences vs. `build()`:
@@ -253,6 +292,7 @@ export const clickService = {
       aff_id: input.aff_id,
       sub_params: input.sub_params,
       ad_ids: input.ad_ids,
+      meta_ids: input.meta_ids,
       extra_params: input.extra_params,
       ip: input.ip,
       user_agent: input.user_agent,
@@ -335,6 +375,35 @@ export const clickService = {
 
         if (click.ad_ids?.gclid || click.ad_ids?.gbraid || click.ad_ids?.wbraid) {
           googleAdsForwardingService.forgetClick({ click });
+        }
+
+        // Facebook campaign rollup (skipped when offer is unmapped, same as
+        // the GAds rollup just above — keeps reports keyed by a real offer_id).
+        if (!click.offer_unmapped) {
+          const fbCampaign = extractFbCampaign(click);
+          if (fbCampaign) {
+            retry(() =>
+              facebookCampaignReportRepository.incrementClick({
+                campaign_id: fbCampaign.campaign_id,
+                campaign_name: fbCampaign.campaign_name,
+                source: fbCampaign.source,
+                at: new Date(click.created_at),
+                offer_id: click.offer_id,
+              })
+            ).catch((err: unknown) => {
+              logger.warn('fb_campaign_report_click_increment_failed', {
+                click_id: click.click_id,
+                campaign_id: fbCampaign.campaign_id,
+                error: err instanceof Error ? err.message : String(err),
+              });
+            });
+          }
+        }
+
+        // Facebook CAPI fan-out — same rule as GAds: only when there's a
+        // Facebook identifier. Runs alongside GAds, not gated by it.
+        if (click.ad_ids?.fbclid || click.meta_ids?.fbc || click.meta_ids?.fbp) {
+          facebookForwardingService.forgetClick({ click });
         }
       })
       .catch((err: unknown) => {

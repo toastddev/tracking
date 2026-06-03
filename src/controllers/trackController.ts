@@ -1,10 +1,31 @@
 import type { Context } from 'hono';
-import { extractAdIds, extractExtraParams, extractSubParams } from '../utils/paramExtractor';
+import { extractAdIds, extractExtraParams, extractMetaIds, extractSubParams } from '../utils/paramExtractor';
 import { requireParams } from '../utils/validator';
 import { offerService } from '../services/offerService';
 import { clickService } from '../services/clickService';
 import { isRefererBlocked, BLOCKED_REFERER_HTML } from '../utils/refererBlocklist';
 import { logger } from '../utils/logger';
+
+// Round-trip Meta's `_fbc` / `_fbp` cookies on the redirect response so the
+// synthesised value survives the next visit. Domain defaults to the request
+// host; operators serving multi-subdomain trackers set META_COOKIE_DOMAIN to
+// the apex (e.g. `.example.com`).
+function setMetaCookies(c: Context, cookies: Array<{ name: string; value: string }>) {
+  if (cookies.length === 0) return;
+  const ttlDays = Math.max(1, Number(process.env.META_COOKIE_TTL_DAYS ?? 90));
+  const maxAge = ttlDays * 24 * 60 * 60;
+  const domain = process.env.META_COOKIE_DOMAIN || '';
+  for (const ck of cookies) {
+    const parts = [
+      `${ck.name}=${encodeURIComponent(ck.value)}`,
+      `Max-Age=${maxAge}`,
+      'Path=/',
+      'SameSite=Lax',
+    ];
+    if (domain) parts.push(`Domain=${domain}`);
+    c.header('Set-Cookie', parts.join('; '), { append: true });
+  }
+}
 
 function headerGetter(c: Context) {
   return { get: (k: string) => c.req.header(k) ?? undefined };
@@ -33,6 +54,12 @@ export const trackController = {
       return c.json({ error: 'missing_params', missing: check.missing }, 400);
     }
 
+    // Pull Meta identifiers (fbc/fbp cookies + URL fbclid) up front so both
+    // the blocked-click path and the redirect path persist them. Cookies the
+    // client doesn't yet have are queued for Set-Cookie on the response.
+    const cookieHeader = c.req.header('cookie');
+    const metaIdResult = extractMetaIds(query, cookieHeader);
+
     // Referer blocklist: in-memory Set lookup, no I/O. Checked before the
     // offer fetch so blocked traffic never touches Firestore for the offer.
     const referrer = c.req.header('referer');
@@ -45,6 +72,7 @@ export const trackController = {
         sub_params: extractSubParams(query),
         ad_ids: extractAdIds(query),
         extra_params: extractExtraParams(query),
+        meta_ids: metaIdResult.meta_ids,
         ip: clientIp(c),
         user_agent: c.req.header('user-agent'),
         referrer,
@@ -70,6 +98,7 @@ export const trackController = {
       sub_params: extractSubParams(query),
       ad_ids: extractAdIds(query),
       extra_params: extractExtraParams(query),
+      meta_ids: metaIdResult.meta_ids,
       ip: clientIp(c),
       user_agent: c.req.header('user-agent'),
       referrer,
@@ -79,6 +108,8 @@ export const trackController = {
     // Critical: do not await. The redirect must return immediately; persistence
     // is best-effort and failures are logged inside persistAsync.
     clickService.persistAsync(click);
+
+    setMetaCookies(c, metaIdResult.set_cookies);
 
     logger.info('click_redirect', {
       click_id: click.click_id,

@@ -24,6 +24,12 @@ export interface ClickRecord {
   aff_id: string;
   sub_params: Record<string, string>;
   ad_ids: AdIds;
+  // Meta (Facebook) user-data identifiers. `fbc` is the canonical cookie form
+  // `fb.1.<ms>.<fbclid>`; `fbp` is the browser pixel cookie. Captured from
+  // request cookies (or synthesised from `fbclid` for `fbc`). Used by the
+  // Facebook CAPI forwarder — independent of ad_ids.fbclid which is the raw
+  // URL param.
+  meta_ids?: { fbc?: string; fbp?: string };
   // Anything else passed on the click URL — utm_*, partner-specific keys,
   // custom campaign tags. Captured so reports are complete and so offer URL
   // templates can reference them via {{utm_source}}-style placeholders.
@@ -285,6 +291,12 @@ export interface AffiliateApiRunRecord {
   gads_skipped?: number;
   gads_failed?: number;
   gads_errors?: string[];
+  // Facebook (Meta) CAPI batch upload stats — populated after the run completes.
+  // Strictly parallel to gads_* above; FB never overwrites GAds counters.
+  fb_sent?: number;
+  fb_skipped?: number;
+  fb_failed?: number;
+  fb_errors?: string[];
   // Dry-run only — raw HTTP request/response capture for debugging. Not
   // written to Firestore (the run-doc writes list fields explicitly).
   debug?: AffiliateApiHttpDebug[];

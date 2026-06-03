@@ -7,6 +7,8 @@ import { affiliateApiRepository } from '../firestore';
 import { affiliateApiScheduler } from './affiliateApiScheduler';
 import { offerReportsBackfillService } from './offerReportsBackfillService';
 import { campaignReportsBackfillService } from './campaignReportsBackfillService';
+import { facebookCampaignReportsBackfillService } from './facebookCampaignReportsBackfillService';
+import { facebookCampaignSyncService } from './facebookCampaignSyncService';
 import { generateConversionId } from '../utils/idGenerator';
 import { logger } from '../utils/logger';
 
@@ -57,7 +59,8 @@ export type RefreshStep =
   | { kind: 'init'; label: string }
   | { kind: 'api'; api_id: string; name: string; ok: boolean; run_id?: string; reason?: string; duration_ms: number }
   | { kind: 'backfill_offers'; ok: boolean; conversions_scanned?: number; buckets_written?: number; duration_ms?: number; error?: string; truncated?: boolean; truncated_reason?: string }
-  | { kind: 'backfill_campaigns'; ok: boolean; conversions_scanned?: number; buckets_written?: number; duration_ms?: number; error?: string; truncated?: boolean; truncated_reason?: string; campaign_spends_updated?: number };
+  | { kind: 'backfill_campaigns'; ok: boolean; conversions_scanned?: number; buckets_written?: number; duration_ms?: number; error?: string; truncated?: boolean; truncated_reason?: string; campaign_spends_updated?: number }
+  | { kind: 'backfill_fb_campaigns'; ok: boolean; conversions_scanned?: number; buckets_written?: number; duration_ms?: number; error?: string; truncated?: boolean; truncated_reason?: string; fb_spend_inr?: number; fb_campaigns_updated?: number };
 
 export type RefreshRunStatus = 'pending' | 'running' | 'completed' | 'failed';
 export type RefreshPhase =
@@ -65,6 +68,7 @@ export type RefreshPhase =
   | 'apis'
   | 'backfill_offers'
   | 'backfill_campaigns'
+  | 'backfill_fb_campaigns'
   | 'finalising'
   | 'done';
 
@@ -623,12 +627,57 @@ export const refreshService = {
     }
     await appendStep(run_id, campaignStep);
 
+    // ── 2c. Facebook campaign backfill + spend sync ────────────────
+    // Reuses the same window. Failure here is recorded but does NOT cause the
+    // overall refresh to flip to 'failed' — FB is an additive integration and
+    // a token expiry / Graph outage shouldn't tank the rest of the refresh.
+    // The operator still sees the failure in the run-doc's `errors` array.
+    await patchRun(run_id, {
+      phase: 'backfill_fb_campaigns' as RefreshPhase,
+      current_step: `Backfilling Facebook campaigns (${backfillFrom.toISOString().slice(0, 10)} → ${backfillTo.toISOString().slice(0, 10)})`,
+    });
+
+    let fbCampaignStep: RefreshStep;
+    try {
+      const r = await facebookCampaignReportsBackfillService.rebuild({ from: backfillFrom, to: backfillTo });
+      // Spend pull runs AFTER the backfill so the next window is consistent.
+      let totalSpendInr = 0;
+      let campaignsUpdated = 0;
+      try {
+        const sync = await facebookCampaignSyncService.syncCampaigns({ from: backfillFrom, to: backfillTo });
+        totalSpendInr = sync.total_spend_inr;
+        campaignsUpdated = sync.campaigns_updated;
+      } catch (syncErr) {
+        const msg = syncErr instanceof Error ? syncErr.message : String(syncErr);
+        await appendError(run_id, 'backfill_fb_campaigns', `fb_spend_sync: ${msg}`);
+        logger.warn('refresh_fb_spend_sync_failed', { run_id, error: msg });
+      }
+      fbCampaignStep = {
+        kind: 'backfill_fb_campaigns',
+        ok: true,
+        conversions_scanned: r.conversions_scanned,
+        buckets_written: r.buckets_written,
+        duration_ms: r.duration_ms,
+        ...(r.truncated ? { truncated: r.truncated, truncated_reason: r.truncated_reason } : {}),
+        fb_spend_inr: totalSpendInr,
+        fb_campaigns_updated: campaignsUpdated,
+      };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      fbCampaignStep = { kind: 'backfill_fb_campaigns', ok: false, error: message };
+      await appendError(run_id, 'backfill_fb_campaigns', message);
+      logger.error('refresh_fb_campaign_backfill_failed', { run_id, error: message });
+    }
+    await appendStep(run_id, fbCampaignStep);
+
     // ── 3. Finalise ──────────────────────────────────────────────
     await patchRun(run_id, {
       phase: 'finalising' as RefreshPhase,
       current_step: 'Releasing lock',
     });
 
+    // FB backfill outcome is logged but does not gate `success`: the overall
+    // refresh stays green when only the FB phase failed (additive integration).
     const success = offerOk && campaignOk;
     const finished = new Date();
     await releaseLock(run_id, success);

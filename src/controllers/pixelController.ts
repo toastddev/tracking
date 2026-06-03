@@ -1,9 +1,26 @@
 import type { Context } from 'hono';
-import { extractAdIds, extractExtraParams, extractSubParams } from '../utils/paramExtractor';
+import { extractAdIds, extractExtraParams, extractMetaIds, extractSubParams } from '../utils/paramExtractor';
 import { offerService } from '../services/offerService';
 import { clickService } from '../services/clickService';
 import { isRefererBlocked } from '../utils/refererBlocklist';
 import { logger } from '../utils/logger';
+
+function setMetaCookies(c: Context, cookies: Array<{ name: string; value: string }>) {
+  if (cookies.length === 0) return;
+  const ttlDays = Math.max(1, Number(process.env.META_COOKIE_TTL_DAYS ?? 90));
+  const maxAge = ttlDays * 24 * 60 * 60;
+  const domain = process.env.META_COOKIE_DOMAIN || '';
+  for (const ck of cookies) {
+    const parts = [
+      `${ck.name}=${encodeURIComponent(ck.value)}`,
+      `Max-Age=${maxAge}`,
+      'Path=/',
+      'SameSite=Lax',
+    ];
+    if (domain) parts.push(`Domain=${domain}`);
+    c.header('Set-Cookie', parts.join('; '), { append: true });
+  }
+}
 
 // Loose UUID check — we accept any UUID (not just v7) so the endpoint stays
 // flexible, but we reject obvious junk so the docs collection doesn't fill
@@ -58,6 +75,9 @@ export const pixelController = {
     const aff_id = (query.aff_id ?? '').trim() || offer_id;
     const redirect_url = (query.redirect_url ?? '').trim();
 
+    const cookieHeader = c.req.header('cookie');
+    const metaIdResult = extractMetaIds(trackingQuery(query), cookieHeader);
+
     // Referer blocklist runs even though the user has already navigated —
     // botnets that scrape the page and replay the pixel still get filtered
     // out of reporting. Persisted as a blocked click for the audit trail.
@@ -69,6 +89,7 @@ export const pixelController = {
         sub_params: extractSubParams(trackingQuery(query)),
         ad_ids: extractAdIds(trackingQuery(query)),
         extra_params: extractExtraParams(trackingQuery(query)),
+        meta_ids: metaIdResult.meta_ids,
         ip: clientIp(c),
         user_agent: c.req.header('user-agent'),
         referrer,
@@ -99,6 +120,7 @@ export const pixelController = {
       sub_params: extractSubParams(trackingQuery(query)),
       ad_ids: extractAdIds(trackingQuery(query)),
       extra_params: extractExtraParams(trackingQuery(query)),
+      meta_ids: metaIdResult.meta_ids,
       ip: clientIp(c),
       user_agent: c.req.header('user-agent'),
       referrer,
@@ -109,6 +131,8 @@ export const pixelController = {
     // wait here just consumes server capacity. Persistence is idempotent on
     // click_id so retried pings collapse into a single click record.
     clickService.persistPixelAsync(click);
+
+    setMetaCookies(c, metaIdResult.set_cookies);
 
     logger.info('pixel_click_recorded', {
       click_id: click.click_id,

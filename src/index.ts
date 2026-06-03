@@ -7,10 +7,12 @@ import { postbackRoutes } from './routes/postback';
 import { healthRoutes } from './routes/health';
 import { adminRoutes } from './routes/admin';
 import { integrationsRoutes } from './routes/integrations';
+import { facebookIntegrationsRoutes } from './routes/facebookIntegrations';
 import { initFirestore } from './firestore';
 import { logger } from './utils/logger';
 import { affiliateApiScheduler } from './services/affiliateApiScheduler';
 import { offerReportsReconciliationScheduler } from './services/offerReportsReconciliationScheduler';
+import { facebookReportsReconciliationScheduler } from './services/facebookReportsReconciliationScheduler';
 
 // Catch errors that escape Hono's request scope (scheduler ticks, async
 // fire-and-forget, Firestore client internals). Without this they vanish
@@ -31,6 +33,10 @@ try {
   logger.info('firestore_ready');
   affiliateApiScheduler.start();
   offerReportsReconciliationScheduler.start();
+  // FB campaign rollup reconciler — separate timers, separate kill-switch
+  // (FB_CAMPAIGN_REPORTS_RECON_DISABLED=1). Staggered to fire its first tick
+  // 30s after the GAds reconciler so they don't pile on at boot.
+  facebookReportsReconciliationScheduler.start();
 } catch (err) {
   // Firestore unreachable means clicks/postbacks can't persist and schedulers
   // never start — the app is half-dead and a human must look at it.
@@ -67,6 +73,7 @@ app.route('/', pixelRoutes);
 app.route('/', postbackRoutes);
 app.route('/', adminRoutes);
 app.route('/', integrationsRoutes);
+app.route('/', facebookIntegrationsRoutes);
 
 app.notFound((c) => c.json({ error: 'not_found' }, 404));
 
@@ -91,6 +98,7 @@ for (const sig of ['SIGTERM', 'SIGINT'] as const) {
     logger.info('shutdown_signal', { signal: sig });
     affiliateApiScheduler.stop();
     offerReportsReconciliationScheduler.stop();
+    facebookReportsReconciliationScheduler.stop();
     server.close(() => process.exit(0));
   });
 }

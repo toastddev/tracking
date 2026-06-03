@@ -15,6 +15,20 @@ export { googleAdsRouteRepository, buildRouteId } from './repositories/googleAds
 export { googleAdsUploadRepository } from './repositories/googleAdsUploadRepository';
 export { googleAdsSyncStateRepository } from './repositories/googleAdsSyncStateRepository';
 export type { GoogleAdsSyncState } from './repositories/googleAdsSyncStateRepository';
+// Facebook (Meta) integration repositories — parallel to the GAds repos above.
+export { facebookConnectionRepository } from './repositories/facebookConnectionRepository';
+export { facebookBusinessChildrenRepository, buildFbChildId } from './repositories/facebookBusinessChildrenRepository';
+export { facebookRouteRepository, buildFbRouteId } from './repositories/facebookRouteRepository';
+export { facebookUploadRepository } from './repositories/facebookUploadRepository';
+export { facebookSyncStateRepository } from './repositories/facebookSyncStateRepository';
+export type { FacebookSyncState } from './repositories/facebookSyncStateRepository';
+export { facebookCampaignReportRepository } from './repositories/facebookCampaignReportRepository';
+export type {
+  FacebookCampaignReportDoc,
+  FacebookCampaignSource,
+  FbIncrementClickInput,
+  FbIncrementConversionInput,
+} from './repositories/facebookCampaignReportRepository';
 export {
   affiliateApiRepository,
   affiliateApiRunRepository,
