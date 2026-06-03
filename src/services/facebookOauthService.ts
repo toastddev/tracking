@@ -24,16 +24,36 @@ export interface FbExchangeResult {
 }
 
 function buildAuthUrl(state: string): string {
-  // Note: Meta's authorize endpoint lives on www.facebook.com, NOT graph.
-  // It also wants `display=page` for desktop browsers — defaults to popup.
+  // Meta's authorize endpoint lives on www.facebook.com, NOT graph.
+  // `display=page` forces full-page redirect instead of the popup default.
   const base = (process.env.META_AUTH_BASE_URL || 'https://www.facebook.com').replace(/\/+$/, '');
   const url = new URL(`${base}/${META.apiVersion()}/dialog/oauth`);
   url.searchParams.set('client_id', META.appId());
   url.searchParams.set('redirect_uri', META.redirectUri());
   url.searchParams.set('state', state);
-  url.searchParams.set('scope', SCOPES.join(','));
   url.searchParams.set('response_type', 'code');
   url.searchParams.set('display', 'page');
+
+  // Permissions are delivered one of two ways depending on the app type:
+  //
+  //  - "Facebook Login for Business" apps (the default for any app created
+  //    after the 2024 migration): permissions are bundled into a
+  //    Configuration in the App Dashboard. The OAuth URL references that
+  //    bundle by config_id. The legacy `scope=` parameter is rejected with
+  //    "invalid scope" even for innocent names like `email`.
+  //
+  //  - Older "Consumer" / pre-migration apps: scope works the legacy way.
+  //
+  // We auto-pick based on whether META_FB_LOGIN_CONFIG_ID is set. Newly
+  // registered apps almost always need the config_id approach; set the env
+  // var to the value Meta gave you in Facebook Login for Business →
+  // Configurations.
+  const configId = (process.env.META_FB_LOGIN_CONFIG_ID || '').trim();
+  if (configId) {
+    url.searchParams.set('config_id', configId);
+  } else {
+    url.searchParams.set('scope', SCOPES.join(','));
+  }
   return url.toString();
 }
 
