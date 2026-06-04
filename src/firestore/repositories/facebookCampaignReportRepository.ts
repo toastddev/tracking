@@ -60,7 +60,16 @@ function dayKeyUTC(d: Date): string {
   return d.toISOString().slice(0, 10);
 }
 
-export type FacebookCampaignSource = 'fb_campaign_id' | 'utm_id' | 'utm_campaign';
+// `no_match` is the grey-bucket source: clicks with utm_* but no fbclid and no
+// gclid/gbraid/wbraid that didn't resolve to a real FB or GAds campaign. Lives
+// in this collection for convenience (one less repository), but the read-side
+// service strips it out of `totals` so neither dashboard inflates from it.
+export type FacebookCampaignSource = 'fb_campaign_id' | 'utm_id' | 'utm_campaign' | 'no_match';
+
+// Synthetic campaign id for the grey bucket. Kept here next to the type so the
+// extractor, reconciler, and read-side filter all share one source of truth.
+export const NO_MATCH_CAMPAIGN_ID = 'no_match_no_fbclid_or_gclid';
+export const NO_MATCH_CAMPAIGN_NAME = 'No match (no fbclid / gclid)';
 
 export interface FbIncrementClickInput {
   campaign_id: string;

@@ -23,6 +23,11 @@ const MAX_BUCKETS_FLUSH = Number(process.env.CAMPAIGN_REPORTS_BACKFILL_MAX_BUCKE
 const GADS_UNTAGGED_CAMPAIGN_ID = 'gads_untagged';
 const GADS_UNTAGGED_CAMPAIGN_NAME = 'GAds (untagged)';
 
+// Only `gad_campaignid` is emitted now — utm_* is never claimed as Google. The
+// stored docs may still carry `source: 'utm_campaign'` from legacy hot-path
+// writes (those will be aged out as the reconciler overwrites buckets), so the
+// type stays a union for back-compat reads in prepare(); writes only ever set
+// 'gad_campaignid'.
 type CampaignSource = 'gad_campaignid' | 'utm_campaign';
 
 interface Bucket {
@@ -56,9 +61,11 @@ function emptyBucket(campaign_id: string, source: CampaignSource, date: string):
   };
 }
 
-// Operates on the raw Firestore doc (unknown-typed) — same shape as the click
-// service's extractCampaign but tolerant of missing/garbage fields.
-function extractCampaign(
+// Mirror of clickService.extractCampaign for the reconciler. Strict — only
+// `gad_campaignid` or a Google click identifier (gclid/gbraid/wbraid) qualifies.
+// utm_campaign is intentionally NOT a fallback (it leaked FB/other traffic into
+// the GAds rollup). Raw-doc tolerant.
+export function extractCampaign(
   rawClick: Record<string, unknown> | null | undefined
 ): { campaign_id: string; source: CampaignSource; campaign_name?: string } | null {
   if (!rawClick) return null;
@@ -68,10 +75,6 @@ function extractCampaign(
     const gad = e.gad_campaignid;
     if (typeof gad === 'string' && gad.trim()) {
       return { campaign_id: gad.trim(), source: 'gad_campaignid' };
-    }
-    const utm = e.utm_campaign;
-    if (typeof utm === 'string' && utm.trim()) {
-      return { campaign_id: utm.trim(), source: 'utm_campaign' };
     }
   }
   const ad = rawClick.ad_ids;

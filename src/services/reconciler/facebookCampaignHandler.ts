@@ -1,9 +1,12 @@
 import { FieldValue } from 'firebase-admin/firestore';
 import { db } from '../../firestore/config';
 import { COLLECTIONS } from '../../firestore/schema';
+import { NO_MATCH_CAMPAIGN_ID, NO_MATCH_CAMPAIGN_NAME } from '../../firestore';
 import { logger } from '../../utils/logger';
 import { toInr } from '../../utils/fxRates';
 import { eventDateFromRaw } from '../eventTime';
+import { hasAnyUtmParamRaw } from '../facebookCampaignExtractor';
+import { extractCampaign as extractGadsCampaign } from './googleAdsCampaignHandler';
 import {
   dayKeyUTC,
   statusBucket,
@@ -29,7 +32,7 @@ const FB_UTM_SOURCES = new Set(['facebook', 'fb', 'meta', 'instagram', 'ig', 'me
 // for the priority ladder this enables.
 const META_ID_RE = /^\d{10,20}$/;
 
-type FbSource = 'fb_campaign_id' | 'utm_id' | 'utm_campaign';
+type FbSource = 'fb_campaign_id' | 'utm_id' | 'utm_campaign' | 'no_match';
 
 interface Bucket {
   campaign_id: string;
@@ -220,7 +223,11 @@ export function createFacebookCampaignHandler(): ReconcilerHandler {
         const raw = d.data() as Record<string, unknown>;
         const campaign_id = String(raw.campaign_id ?? '').trim();
         const sourceRaw = String(raw.source ?? 'fb_campaign_id');
-        const source: FbSource = sourceRaw === 'utm_campaign' ? 'utm_campaign' : 'fb_campaign_id';
+        const source: FbSource =
+          sourceRaw === 'utm_campaign' ? 'utm_campaign'
+          : sourceRaw === 'utm_id' ? 'utm_id'
+          : sourceRaw === 'no_match' ? 'no_match'
+          : 'fb_campaign_id';
         const date = String(raw.date ?? '').trim();
         if (!campaign_id || !date) continue;
         const b = bucketFor(campaign_id, source, date);
@@ -238,13 +245,28 @@ export function createFacebookCampaignHandler(): ReconcilerHandler {
       const offer_id = String(raw.offer_id ?? '');
       if (!offer_id) return;
       const campaign = extractFbCampaign(raw);
-      if (!campaign) return;
+      if (campaign) {
+        clicks_with_campaign += 1;
+        clickMeta.set(click_id, {
+          campaign_id: campaign.campaign_id,
+          source: campaign.source,
+          offer_id,
+          campaign_name: campaign.campaign_name,
+        });
+        return;
+      }
+      // Grey bucket: utm_* present, but no FB extractor match AND no GAds
+      // identifier (gad_campaignid / gclid / gbraid / wbraid). Stored here so
+      // the operator can see leakage; excluded from totals by the read-side.
+      const gads = extractGadsCampaign(raw);
+      if (gads) return;
+      if (!hasAnyUtmParamRaw(raw.extra_params)) return;
       clicks_with_campaign += 1;
       clickMeta.set(click_id, {
-        campaign_id: campaign.campaign_id,
-        source: campaign.source,
+        campaign_id: NO_MATCH_CAMPAIGN_ID,
+        source: 'no_match',
         offer_id,
-        campaign_name: campaign.campaign_name,
+        campaign_name: NO_MATCH_CAMPAIGN_NAME,
       });
     },
 
@@ -289,14 +311,27 @@ export function createFacebookCampaignHandler(): ReconcilerHandler {
     processOrphanClick(click_id: string, raw: Record<string, unknown>): void {
       conversions_orphan_lookups += 1;
       orphanWants.delete(click_id);
+      let meta: ClickMeta | null = null;
       const campaign = extractFbCampaign(raw);
-      if (!campaign) return;
-      const meta: ClickMeta = {
-        campaign_id: campaign.campaign_id,
-        source: campaign.source,
-        offer_id: String(raw.offer_id ?? ''),
-        campaign_name: campaign.campaign_name,
-      };
+      if (campaign) {
+        meta = {
+          campaign_id: campaign.campaign_id,
+          source: campaign.source,
+          offer_id: String(raw.offer_id ?? ''),
+          campaign_name: campaign.campaign_name,
+        };
+      } else {
+        const gads = extractGadsCampaign(raw);
+        if (!gads && hasAnyUtmParamRaw(raw.extra_params)) {
+          meta = {
+            campaign_id: NO_MATCH_CAMPAIGN_ID,
+            source: 'no_match',
+            offer_id: String(raw.offer_id ?? ''),
+            campaign_name: NO_MATCH_CAMPAIGN_NAME,
+          };
+        }
+      }
+      if (!meta) return;
       clickMeta.set(click_id, meta);
       for (let i = 0; i < deferred.length; i++) {
         const d = deferred[i]!;

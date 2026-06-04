@@ -132,3 +132,28 @@ export function isMetaUtmSource(
   const utmSource = (extra_params?.utm_source ?? '').toLowerCase().trim();
   return utmSource !== '' && FB_UTM_SOURCES.has(utmSource);
 }
+
+// True when the click carries at least one utm_* parameter with a non-empty
+// value. Used to gate the grey `no_match_no_fbclid_or_gclid` bucket — a click
+// with zero UTM tracking has nothing to attribute and shouldn't pollute the
+// grey row.
+const UTM_KEYS = ['utm_source', 'utm_medium', 'utm_campaign', 'utm_id', 'utm_term', 'utm_content'] as const;
+export function hasAnyUtmParam(extra_params: Record<string, string> | undefined): boolean {
+  if (!extra_params) return false;
+  for (const k of UTM_KEYS) {
+    const v = extra_params[k];
+    if (typeof v === 'string' && v.trim()) return true;
+  }
+  return false;
+}
+
+// Raw-doc variant for the reconciler (Firestore docs come in as Record<string, unknown>).
+export function hasAnyUtmParamRaw(extra: unknown): boolean {
+  if (!extra || typeof extra !== 'object') return false;
+  const e = extra as Record<string, unknown>;
+  for (const k of UTM_KEYS) {
+    const v = e[k];
+    if (typeof v === 'string' && v.trim()) return true;
+  }
+  return false;
+}

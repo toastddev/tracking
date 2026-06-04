@@ -7,21 +7,26 @@ import {
   drilldownRepository,
   campaignReportRepository,
   facebookCampaignReportRepository,
+  NO_MATCH_CAMPAIGN_ID,
+  NO_MATCH_CAMPAIGN_NAME,
 } from '../firestore';
 import { googleAdsForwardingService } from './googleAdsForwardingService';
 import { facebookForwardingService } from './facebookForwardingService';
-import { extractFbCampaign } from './facebookCampaignExtractor';
+import { extractFbCampaign, hasAnyUtmParam } from './facebookCampaignExtractor';
 import { retry } from '../utils/retry';
 import type { AdIds, ClickRecord, Offer } from '../types';
 
-// Pull a campaign id off the click. `gad_campaignid` (extra_params) is the
-// canonical Google Ads tag; `utm_campaign` is the cross-platform fallback.
-// Final fallback: a click that carries a gclid/gbraid/wbraid (real Google Ads
-// click) but neither campaign tag is attributed to a synthetic
-// `gads_untagged` campaign — the conversion is real GAds revenue and would
-// otherwise vanish from campaign_reports entirely (offer_reports still has it
-// raw in USD). Source is reported as `gad_campaignid` so it groups under
-// Google Ads in the dashboard.
+// Pull a Google Ads campaign id off the click. Strict — only identifiers Google
+// itself emits qualify, never generic utm_*. Priority:
+//   1. extra_params.gad_campaignid  — operator/template-set canonical id
+//   2. ad_ids.gclid / gbraid / wbraid — real GAds click without a campaign tag,
+//      bucketed into the synthetic `gads_untagged` campaign so the revenue is
+//      not lost from campaign_reports (offer_reports still has it raw).
+//
+// utm_campaign is intentionally NOT a fallback. It was leaking Facebook (and
+// other) traffic into Google rollups because every UTM-tagged click was being
+// claimed as "Google". A click without a Google identifier is not Google
+// revenue — let the grey `no_match_no_fbclid_or_gclid` bucket surface it.
 export const GADS_UNTAGGED_CAMPAIGN_ID = 'gads_untagged';
 export const GADS_UNTAGGED_CAMPAIGN_NAME = 'GAds (untagged)';
 
@@ -29,17 +34,13 @@ function extractCampaign(
   click: { extra_params?: Record<string, string>; ad_ids?: AdIds } | undefined
 ): {
   campaign_id: string;
-  source: 'gad_campaignid' | 'utm_campaign';
+  source: 'gad_campaignid';
   campaign_name?: string;
 } | null {
   if (!click) return null;
   const gad = click.extra_params?.gad_campaignid;
   if (typeof gad === 'string' && gad.trim()) {
     return { campaign_id: gad.trim(), source: 'gad_campaignid' };
-  }
-  const utm = click.extra_params?.utm_campaign;
-  if (typeof utm === 'string' && utm.trim()) {
-    return { campaign_id: utm.trim(), source: 'utm_campaign' };
   }
   const ad = click.ad_ids;
   if (ad && (ad.gclid || ad.gbraid || ad.wbraid)) {
@@ -267,6 +268,27 @@ export const clickService = {
           error: err instanceof Error ? err.message : String(err),
         });
       });
+    } else if (!campaign && hasAnyUtmParam(click.extra_params)) {
+      // Grey bucket — the click carries utm_* tags but no Google identifier
+      // (gad_campaignid / gclid / gbraid / wbraid) AND no Facebook identifier
+      // (fb_campaign_id / Meta utm_source / fbclid / fbc / fbp). Persisted into
+      // facebook_campaign_reports under NO_MATCH_CAMPAIGN_ID so the operator
+      // can see leakage; the read-side service strips it from totals on both
+      // dashboards so it never inflates either rollup's numbers.
+      retry(() =>
+        facebookCampaignReportRepository.incrementClick({
+          campaign_id: NO_MATCH_CAMPAIGN_ID,
+          campaign_name: NO_MATCH_CAMPAIGN_NAME,
+          source: 'no_match',
+          at: new Date(click.created_at),
+          offer_id: click.offer_id,
+        })
+      ).catch((err: unknown) => {
+        logger.warn('no_match_click_increment_failed', {
+          click_id: click.click_id,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
     }
 
     // Facebook CAPI fan-out — fire only when the click carries a Facebook
@@ -397,6 +419,25 @@ export const clickService = {
                 error: err instanceof Error ? err.message : String(err),
               });
             });
+          } else {
+            // Grey bucket — see comments in persistAsync.
+            const gadsHit = extractCampaign(click);
+            if (!gadsHit && hasAnyUtmParam(click.extra_params)) {
+              retry(() =>
+                facebookCampaignReportRepository.incrementClick({
+                  campaign_id: NO_MATCH_CAMPAIGN_ID,
+                  campaign_name: NO_MATCH_CAMPAIGN_NAME,
+                  source: 'no_match',
+                  at: new Date(click.created_at),
+                  offer_id: click.offer_id,
+                })
+              ).catch((err: unknown) => {
+                logger.warn('no_match_click_increment_failed', {
+                  click_id: click.click_id,
+                  error: err instanceof Error ? err.message : String(err),
+                });
+              });
+            }
           }
         }
 

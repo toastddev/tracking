@@ -1,4 +1,9 @@
-import { facebookCampaignReportRepository, offerReportRepository, type FacebookCampaignReportDoc } from '../firestore';
+import {
+  facebookCampaignReportRepository,
+  offerReportRepository,
+  NO_MATCH_CAMPAIGN_ID,
+  type FacebookCampaignReportDoc,
+} from '../firestore';
 import { toInr } from '../utils/fxRates';
 import { logger } from '../utils/logger';
 
@@ -237,7 +242,8 @@ export const facebookCampaignReportsService = {
       }
 
       const profit = revenue - spend;
-      if (spend > 0) {
+      // Grey bucket should never count as a "campaign" in profitability stats.
+      if (spend > 0 && campaign_id !== NO_MATCH_CAMPAIGN_ID) {
         campaignsWithSpend += 1;
         if (profit > 0) profitableCampaigns += 1;
         else if (profit < 0) unprofitableCampaigns += 1;
@@ -272,6 +278,10 @@ export const facebookCampaignReportsService = {
         fb_cpc: safeDiv(spend, fbClicks),
         series: Array.from(seriesMap.values()).sort((a, b) => a.date.localeCompare(b.date)),
       });
+
+      // Grey bucket — kept as a visible row for the operator, but excluded
+      // from totals so neither FB nor GAds dashboards inflate from leakage.
+      if (campaign_id === NO_MATCH_CAMPAIGN_ID) continue;
 
       totalClicks += clicks;
       totalPostbacks += postbacks;
@@ -313,6 +323,9 @@ export const facebookCampaignReportsService = {
     });
 
     const totalProfit = totalRevenue - totalSpend;
+    // Grey bucket lives in `summaries` for visibility but never counts as a
+    // real campaign in totals.campaigns or spend_coverage denominators.
+    const realCampaignCount = summaries.filter((s) => s.campaign_id !== NO_MATCH_CAMPAIGN_ID).length;
     const totals = {
       clicks: totalClicks,
       postbacks: totalPostbacks,
@@ -325,10 +338,10 @@ export const facebookCampaignReportsService = {
       epc: safeDiv(totalRevenue, totalClicks),
       roas: safeDiv(totalRevenue, totalSpend),
       roi: totalSpend > 0 ? (totalRevenue - totalSpend) / totalSpend : 0,
-      campaigns: summaries.length,
+      campaigns: realCampaignCount,
       profitable_campaigns: profitableCampaigns,
       unprofitable_campaigns: unprofitableCampaigns,
-      spend_coverage: safeDiv(campaignsWithSpend, Math.max(summaries.length, 1)),
+      spend_coverage: safeDiv(campaignsWithSpend, Math.max(realCampaignCount, 1)),
       fb_clicks: totalFbClicks,
       fb_impressions: totalFbImpressions,
       fb_ctr: safeDiv(totalFbClicks, totalFbImpressions),
@@ -336,7 +349,12 @@ export const facebookCampaignReportsService = {
       total_revenue_inr: totalRevenueInr,
     };
 
-    const insights = buildInsights(summaries, totals);
+    // Insights should never reason about the grey bucket — it would surface
+    // misleading "losing money" / "trending down" alerts on unattributed leakage.
+    const insights = buildInsights(
+      summaries.filter((s) => s.campaign_id !== NO_MATCH_CAMPAIGN_ID),
+      totals,
+    );
 
     return {
       from: f.from.toISOString(),
