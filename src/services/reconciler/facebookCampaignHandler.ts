@@ -5,7 +5,7 @@ import { NO_MATCH_CAMPAIGN_ID, NO_MATCH_CAMPAIGN_NAME } from '../../firestore';
 import { logger } from '../../utils/logger';
 import { toInr } from '../../utils/fxRates';
 import { eventDateFromRaw } from '../eventTime';
-import { hasAnyUtmParamRaw } from '../facebookCampaignExtractor';
+import { hasAnyUtmParamRaw, FB_UTM_SOURCES } from '../facebookCampaignExtractor';
 import { extractCampaign as extractGadsCampaign } from './googleAdsCampaignHandler';
 import {
   dayKeyUTC,
@@ -26,7 +26,10 @@ const MAX_BUCKETS_FLUSH = Number(process.env.FB_CAMPAIGN_REPORTS_BACKFILL_MAX_BU
 
 const FB_UNTAGGED_CAMPAIGN_ID = 'fb_untagged';
 const FB_UNTAGGED_CAMPAIGN_NAME = 'Facebook (untagged)';
-const FB_UTM_SOURCES = new Set(['facebook', 'fb', 'meta', 'instagram', 'ig', 'messenger', 'msg', 'an']);
+// FB_UTM_SOURCES is imported above so the canonical list in
+// ../facebookCampaignExtractor.ts is the single source of truth — adding a
+// new Meta source (e.g. when Meta launches a new placement) only requires
+// one edit there.
 // Meta campaign / ad IDs are 15-17 digit numbers — used to tell a numeric
 // utm_campaign apart from a text one. See ../facebookCampaignExtractor.ts
 // for the priority ladder this enables.

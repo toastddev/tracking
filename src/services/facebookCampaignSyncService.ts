@@ -81,19 +81,41 @@ export const facebookCampaignSyncService = {
           const unknownCurrenciesSeen = new Set<string>();
 
           // Apply names eagerly per campaign — small writes, makes the UI snappy.
-          const campaignNames = new Map<string, string>();
 
-          // Pass 1: name backfill from /campaigns. Insights only returns
+          // Pass 1: Insights names. Written first because the same campaigns
+          // will get spend / clicks rows from updateAdsMetrics below, so it's
+          // fine if updateName creates a today placeholder for any that
+          // somehow lack a doc.
+          const insightsNames = new Map<string, string>();
+          for (const r of rows) {
+            const cid = String(r.campaign_id ?? '');
+            const name = String(r.campaign_name ?? '');
+            if (cid && name) insightsNames.set(cid, name);
+          }
+          for (const [cid, name] of insightsNames.entries()) {
+            await facebookCampaignReportRepository.updateName({ campaign_id: cid, campaign_name: name });
+          }
+
+          // Pass 2: name backfill from /campaigns. Insights only returns
           // campaigns that had activity in the queried window, so a campaign
-          // referenced by a click's utm_id but with no recent spend would
-          // never get a name. /{ad_account_id}/campaigns returns every
-          // campaign in the account (paused, ended, no-spend) — that's what
-          // makes the FB dashboard render real names instead of bare ids
-          // like "120247890393410531".
+          // referenced by a click's utm_id / utm_campaign but with no recent
+          // spend would never get a name. /{ad_account_id}/campaigns returns
+          // every campaign in the account (paused, ended, no-spend) — that's
+          // what makes the FB dashboard render real names instead of bare ids
+          // like "120247890393410531". Gated with only_if_exists so we don't
+          // create empty rows for campaigns we never saw a click for.
+          let backfillNames = 0;
           try {
             const allCampaigns = await fetchAllCampaignNames(conn, adAccountId);
             for (const c of allCampaigns) {
-              if (c.id && c.name) campaignNames.set(c.id, c.name);
+              if (!c.id || !c.name) continue;
+              if (insightsNames.has(c.id)) continue;  // already named above
+              await facebookCampaignReportRepository.updateName({
+                campaign_id: c.id,
+                campaign_name: c.name,
+                only_if_exists: true,
+              });
+              backfillNames += 1;
             }
           } catch (err) {
             logger.warn('facebook_campaign_names_fetch_failed', {
@@ -102,19 +124,6 @@ export const facebookCampaignSyncService = {
               error: err instanceof Error ? err.message : String(err),
             });
             // Non-fatal — Insights still fills names for active campaigns.
-          }
-
-          // Pass 2: Insights names take priority over /campaigns names ONLY
-          // because Insights is the source of truth for the report period
-          // (and is what runs alongside spend); but in practice both should
-          // agree. Set last so an Insights name wins on conflict.
-          for (const r of rows) {
-            const cid = String(r.campaign_id ?? '');
-            const name = String(r.campaign_name ?? '');
-            if (cid && name) campaignNames.set(cid, name);
-          }
-          for (const [cid, name] of campaignNames.entries()) {
-            await facebookCampaignReportRepository.updateName({ campaign_id: cid, campaign_name: name });
           }
 
           for (const r of rows) {
@@ -166,7 +175,7 @@ export const facebookCampaignSyncService = {
             totalImpressions += impressions;
           }
 
-          campaignsUpdated += campaignNames.size;
+          campaignsUpdated += insightsNames.size + backfillNames;
         } catch (err) {
           logger.warn('facebook_campaign_sync_failed', {
             connection_id: conn.connection_id,

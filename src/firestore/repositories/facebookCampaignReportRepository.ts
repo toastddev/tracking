@@ -269,7 +269,16 @@ export const facebookCampaignReportRepository = {
     );
   },
 
-  async updateName(input: { campaign_id: string; campaign_name: string }): Promise<void> {
+  async updateName(input: {
+    campaign_id: string;
+    campaign_name: string;
+    // When true, skip the today-placeholder fallback for campaigns that have
+    // no existing row. Used by the /campaigns name-backfill pass so we don't
+    // create empty rows for every paused/never-clicked campaign in an ad
+    // account. The Insights pass leaves this default (writes a placeholder)
+    // because it will follow up immediately with spend / clicks for the day.
+    only_if_exists?: boolean;
+  }): Promise<void> {
     const name = String(input.campaign_name).trim().slice(0, 200);
     if (!name) throw new Error('invalid_campaign_name');
     const snap = await db()
@@ -277,6 +286,7 @@ export const facebookCampaignReportRepository = {
       .where('campaign_id', '==', input.campaign_id)
       .get();
     if (snap.empty) {
+      if (input.only_if_exists) return;
       const today = dayKeyUTC(new Date());
       await db().collection(COLLECTIONS.FACEBOOK_CAMPAIGN_REPORTS).doc(docId(input.campaign_id, today)).set(
         {

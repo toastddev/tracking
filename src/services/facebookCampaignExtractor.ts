@@ -40,6 +40,9 @@ export const FB_UNTAGGED_CAMPAIGN_NAME = 'Facebook (untagged)';
 
 // Meta's `site_source_name` macro emits one of these. Anything else means the
 // click didn't come from Meta and we shouldn't claim it.
+// Operators can also hand-tag utm_source themselves — so we include the
+// full-word variants ('facebook', 'instagram', 'threads') alongside the macro
+// short-codes ('fb', 'ig', 'th').
 export const FB_UTM_SOURCES = new Set([
   'facebook',
   'fb',
@@ -48,6 +51,8 @@ export const FB_UTM_SOURCES = new Set([
   'ig',
   'messenger',
   'msg',
+  'threads',      // Meta-owned; carries ads since 2025
+  'th',           // short code occasionally used by operators
   'an',           // Audience Network
 ]);
 
