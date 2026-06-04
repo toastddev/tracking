@@ -109,19 +109,16 @@ function extractFbCampaign(
     };
   }
 
-  // 4. Synthetic fallback — Meta-tagged click with no campaign id.
+  // 4. Synthetic fallback — clicks with definitive Meta provenance but no
+  //    campaign tag. Only `fbclid` qualifies (see comments in
+  //    ../facebookCampaignExtractor.ts for the full reasoning — fbp/fbc are
+  //    returning-visitor cookies, not proof of THIS click's source).
   const ad = rawClick.ad_ids;
-  const meta = rawClick.meta_ids;
   const hasFbclid =
     ad && typeof ad === 'object' &&
     typeof (ad as Record<string, unknown>).fbclid === 'string' &&
     ((ad as Record<string, unknown>).fbclid as string).trim() !== '';
-  const hasFbCookie =
-    meta && typeof meta === 'object' && (
-      (typeof (meta as Record<string, unknown>).fbc === 'string' && ((meta as Record<string, unknown>).fbc as string).trim() !== '') ||
-      (typeof (meta as Record<string, unknown>).fbp === 'string' && ((meta as Record<string, unknown>).fbp as string).trim() !== '')
-    );
-  if (hasFbclid || hasFbCookie) {
+  if (hasFbclid) {
     return {
       campaign_id: FB_UNTAGGED_CAMPAIGN_ID,
       source: 'fb_campaign_id',

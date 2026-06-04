@@ -110,11 +110,16 @@ export function extractFbCampaign(
     };
   }
 
-  // 4. Synthetic fallback — clicks with Meta identifiers but no campaign tag.
-  const fbclid = click.ad_ids?.fbclid;
-  const fbc = click.meta_ids?.fbc;
-  const fbp = click.meta_ids?.fbp;
-  if (fbclid || fbc || fbp) {
+  // 4. Synthetic fallback — clicks with definitive Meta provenance but no
+  //    campaign tag. Only `fbclid` qualifies: it is appended by Meta itself at
+  //    click time, so its presence proves the current click came from a Meta
+  //    surface. `fbp` is set by the FB Pixel on every pageview (organic,
+  //    direct, anything) and `fbc` is a cookie derived from a fbclid the user
+  //    clicked at some earlier point — both are returning-visitor cookies, not
+  //    proof of THIS click's source. They stay on the click record (CAPI
+  //    needs them for match quality on conversions) but they no longer drive
+  //    campaign attribution.
+  if (click.ad_ids?.fbclid) {
     return {
       campaign_id: FB_UNTAGGED_CAMPAIGN_ID,
       campaign_name: FB_UNTAGGED_CAMPAIGN_NAME,
