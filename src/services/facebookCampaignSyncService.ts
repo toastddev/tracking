@@ -82,6 +82,32 @@ export const facebookCampaignSyncService = {
 
           // Apply names eagerly per campaign — small writes, makes the UI snappy.
           const campaignNames = new Map<string, string>();
+
+          // Pass 1: name backfill from /campaigns. Insights only returns
+          // campaigns that had activity in the queried window, so a campaign
+          // referenced by a click's utm_id but with no recent spend would
+          // never get a name. /{ad_account_id}/campaigns returns every
+          // campaign in the account (paused, ended, no-spend) — that's what
+          // makes the FB dashboard render real names instead of bare ids
+          // like "120247890393410531".
+          try {
+            const allCampaigns = await fetchAllCampaignNames(conn, adAccountId);
+            for (const c of allCampaigns) {
+              if (c.id && c.name) campaignNames.set(c.id, c.name);
+            }
+          } catch (err) {
+            logger.warn('facebook_campaign_names_fetch_failed', {
+              connection_id: conn.connection_id,
+              ad_account_id: adAccountId,
+              error: err instanceof Error ? err.message : String(err),
+            });
+            // Non-fatal — Insights still fills names for active campaigns.
+          }
+
+          // Pass 2: Insights names take priority over /campaigns names ONLY
+          // because Insights is the source of truth for the report period
+          // (and is what runs alongside spend); but in practice both should
+          // agree. Set last so an Insights name wins on conflict.
           for (const r of rows) {
             const cid = String(r.campaign_id ?? '');
             const name = String(r.campaign_name ?? '');
@@ -221,4 +247,40 @@ function isAuthError(err: FacebookGraphError): boolean {
   if (err.code === 190) return true;
   if (err.code === 200 || err.code === 102 || err.code === 2500) return true;
   return /OAuthException|expired|access_token|permission/i.test(err.message);
+}
+
+// Lists every campaign id + name in an ad account, regardless of spend or
+// activity. Paginates via `paging.next`. Used to seed names for campaigns
+// that appear in our postback data (via utm_id) but produced no Insights
+// rows for the synced window (paused / ended / zero-spend campaigns).
+async function fetchAllCampaignNames(
+  conn: FacebookConnection,
+  adAccountId: string,
+): Promise<{ id: string; name: string }[]> {
+  const token = decryptSecret(conn.access_token_enc);
+  let url = buildGraphUrl(`/${adAccountId}/campaigns`, {
+    fields: 'id,name',
+    limit: 500,
+    access_token: token,
+  });
+  const out: { id: string; name: string }[] = [];
+  // Same safety cap as the Insights walker — a runaway page-loop should not
+  // burn the connection's rate-limit budget.
+  let safety = 0;
+  while (url && safety < 50) {
+    const res = await facebookGraphApi.get<{
+      data?: { id?: string; name?: string }[];
+      paging?: { next?: string };
+    }>(url);
+    if (res.data) {
+      for (const c of res.data) {
+        const id = String(c.id ?? '').trim();
+        const name = String(c.name ?? '').trim();
+        if (id && name) out.push({ id, name });
+      }
+    }
+    url = res.paging?.next ?? '';
+    safety++;
+  }
+  return out;
 }
