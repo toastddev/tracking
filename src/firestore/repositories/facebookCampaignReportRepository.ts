@@ -60,7 +60,7 @@ function dayKeyUTC(d: Date): string {
   return d.toISOString().slice(0, 10);
 }
 
-export type FacebookCampaignSource = 'fb_campaign_id' | 'utm_campaign';
+export type FacebookCampaignSource = 'fb_campaign_id' | 'utm_id' | 'utm_campaign';
 
 export interface FbIncrementClickInput {
   campaign_id: string;

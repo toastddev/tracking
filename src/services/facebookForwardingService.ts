@@ -8,6 +8,7 @@ import { decryptSecret } from '../utils/crypto';
 import { eventDate } from './eventTime';
 import { logger } from '../utils/logger';
 import { convertCurrency } from '../utils/fxRates';
+import { isMetaUtmSource } from './facebookCampaignExtractor';
 import type { ClickRecord, ConversionRecord } from '../types';
 import type {
   FacebookConnection,
@@ -40,30 +41,43 @@ export interface FbDispatchClickInput {
 }
 
 interface IdentifierPick {
-  type: FacebookIdentifierType;
-  value: string;
+  // 'ip_only' means we have no fbclid/fbc/fbp but the click is provably from
+  // Meta (utm_source) AND we have IP + user-agent to send. Meta accepts this
+  // as a (lower-match-quality) signal — without it we'd silently drop a
+  // meaningful share of Meta traffic on iOS / in-app browsers / Audience
+  // Network placements where fbclid gets stripped.
+  type: FacebookIdentifierType | 'ip_only';
+  value?: string;     // omitted when type='ip_only'
 }
 
-// Pick the strongest Meta user-data identifier available. `fbc` (the cookie
-// form `fb.1.<ms>.<fbclid>`) is what Meta really wants — if we only have a raw
-// `fbclid`, synthesise the `fbc` ourselves using the click's creation time.
-function pickFbIdentifier(
-  ad_ids: ClickRecord['ad_ids'] | undefined,
-  meta_ids: { fbc?: string; fbp?: string } | undefined,
-  clickCreatedAtIso: string | undefined
-): IdentifierPick | null {
-  const fbc = meta_ids?.fbc;
+// Pick the strongest Meta user-data identifier available. Priority:
+//   fbc (cookie)  >  fbclid (synthesise fbc from it)  >  fbp (cookie)
+//
+// When NONE of those exist, fall back to ip_only mode IF:
+//   - utm_source identifies the click as Meta (ig/fb/meta/an/...)
+//   - we have IP + user-agent to populate user_data
+// Otherwise return null and the dispatcher skips with no_facebook_identifier.
+function pickFbIdentifier(click: ClickRecord): IdentifierPick | null {
+  const fbc = click.meta_ids?.fbc;
   if (fbc) return { type: 'fbc', value: fbc };
 
-  const fbclid = ad_ids?.fbclid;
+  const fbclid = click.ad_ids?.fbclid;
   if (fbclid) {
-    const t = clickCreatedAtIso ? new Date(clickCreatedAtIso).getTime() : Date.now();
+    const t = click.created_at ? new Date(click.created_at).getTime() : Date.now();
     const synthesised = `fb.1.${Number.isFinite(t) ? t : Date.now()}.${fbclid}`;
     return { type: 'fbclid', value: synthesised };
   }
 
-  const fbp = meta_ids?.fbp;
+  const fbp = click.meta_ids?.fbp;
   if (fbp) return { type: 'fbp', value: fbp };
+
+  // No click-side Meta identifier. Fall back to IP+UA only when we KNOW the
+  // click came from Meta (utm_source) AND we have something to populate
+  // user_data with. Sending an event with empty user_data fails Meta's
+  // server-side validation outright.
+  if (isMetaUtmSource(click.extra_params) && click.ip && click.user_agent) {
+    return { type: 'ip_only' };
+  }
 
   return null;
 }
@@ -147,8 +161,17 @@ interface UploadContext {
 
 function buildCapiPayload(ctx: UploadContext): { data: Record<string, unknown>[] } {
   const userData: Record<string, unknown> = {};
-  if (ctx.identifier.type === 'fbp') userData.fbp = ctx.identifier.value;
-  else userData[ctx.identifier.type === 'fbclid' ? 'fbc' : ctx.identifier.type] = ctx.identifier.value;
+
+  // Click-side identifier — omitted for ip_only mode (Meta then attributes
+  // via IP + UA only, lower match quality but still attributed).
+  if (ctx.identifier.type === 'fbc' && ctx.identifier.value) {
+    userData.fbc = ctx.identifier.value;
+  } else if (ctx.identifier.type === 'fbclid' && ctx.identifier.value) {
+    userData.fbc = ctx.identifier.value;   // we synthesised an fbc from fbclid
+  } else if (ctx.identifier.type === 'fbp' && ctx.identifier.value) {
+    userData.fbp = ctx.identifier.value;
+  }
+  // type === 'ip_only' — no fbc/fbp field, just rely on IP+UA below.
 
   if (ctx.ip) userData.client_ip_address = ctx.ip;
   if (ctx.user_agent) userData.client_user_agent = ctx.user_agent;
@@ -339,7 +362,7 @@ export const facebookForwardingService = {
       });
       return;
     }
-    const identifier = pickFbIdentifier(click.ad_ids, click.meta_ids, click.created_at);
+    const identifier = pickFbIdentifier(click);
     if (!identifier) {
       await recordSkip({
         kind: 'conversion',
@@ -438,7 +461,7 @@ export const facebookForwardingService = {
   // short-circuit at the call site (clickService) so we don't even log noise.
   async dispatchClick(input: FbDispatchClickInput): Promise<void> {
     const click = input.click;
-    const identifier = pickFbIdentifier(click.ad_ids, click.meta_ids, click.created_at);
+    const identifier = pickFbIdentifier(click);
     if (!identifier) return;
 
     const eventTimeSec = Math.floor(new Date(click.created_at).getTime() / 1000);
@@ -517,7 +540,7 @@ export const facebookForwardingService = {
     const eligible: Eligible[] = [];
     for (const { conversion, click, postback_timezone } of inputs) {
       if (!conversion.verified || !click) { stats.skipped++; continue; }
-      const identifier = pickFbIdentifier(click.ad_ids, click.meta_ids, click.created_at);
+      const identifier = pickFbIdentifier(click);
       if (!identifier) { stats.skipped++; continue; }
       const event_time_unix = Math.floor(
         adjustEventDateForFb(conversion, postback_timezone).getTime() / 1000
@@ -599,8 +622,15 @@ export const facebookForwardingService = {
     ): Record<string, unknown> {
       const money = moneyForUpload(item.conversion, conn);
       const userData: Record<string, unknown> = {};
-      if (item.identifier.type === 'fbp') userData.fbp = item.identifier.value;
-      else userData[item.identifier.type === 'fbclid' ? 'fbc' : item.identifier.type] = item.identifier.value;
+      // Mirror buildCapiPayload's per-identifier-type field mapping. ip_only
+      // contributes nothing here — Meta attributes via IP+UA below.
+      if (item.identifier.type === 'fbc' && item.identifier.value) {
+        userData.fbc = item.identifier.value;
+      } else if (item.identifier.type === 'fbclid' && item.identifier.value) {
+        userData.fbc = item.identifier.value;
+      } else if (item.identifier.type === 'fbp' && item.identifier.value) {
+        userData.fbp = item.identifier.value;
+      }
       if (item.click.ip) userData.client_ip_address = item.click.ip;
       if (item.click.user_agent) userData.client_user_agent = item.click.user_agent;
       return {

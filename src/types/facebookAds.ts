@@ -146,8 +146,11 @@ export type FacebookUploadStatus =
 
 // Meta user_data identifiers. `fbc` is the canonical cookie value
 // (fb.1.<ms>.<fbclid>); `fbp` is the browser pixel cookie; `fbclid` is the raw
-// URL param. Order of preference at dispatch time: fbc > fbclid > fbp.
-export type FacebookIdentifierType = 'fbc' | 'fbp' | 'fbclid';
+// URL param. `ip_only` is the fallback when none of those exist but the click
+// came from Meta via utm_source — we send the event with just IP + UA in
+// user_data, which Meta accepts at lower match quality.
+// Order of preference at dispatch time: fbc > fbclid > fbp > ip_only.
+export type FacebookIdentifierType = 'fbc' | 'fbp' | 'fbclid' | 'ip_only';
 
 export type FacebookUploadKind = 'conversion' | 'click';
 

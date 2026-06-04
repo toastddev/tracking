@@ -23,9 +23,13 @@ const MAX_BUCKETS_FLUSH = Number(process.env.FB_CAMPAIGN_REPORTS_BACKFILL_MAX_BU
 
 const FB_UNTAGGED_CAMPAIGN_ID = 'fb_untagged';
 const FB_UNTAGGED_CAMPAIGN_NAME = 'Facebook (untagged)';
-const FB_UTM_SOURCES = new Set(['facebook', 'fb', 'meta', 'instagram', 'ig', 'messenger']);
+const FB_UTM_SOURCES = new Set(['facebook', 'fb', 'meta', 'instagram', 'ig', 'messenger', 'msg', 'an']);
+// Meta campaign / ad IDs are 15-17 digit numbers — used to tell a numeric
+// utm_campaign apart from a text one. See ../facebookCampaignExtractor.ts
+// for the priority ladder this enables.
+const META_ID_RE = /^\d{10,20}$/;
 
-type FbSource = 'fb_campaign_id' | 'utm_campaign';
+type FbSource = 'fb_campaign_id' | 'utm_id' | 'utm_campaign';
 
 interface Bucket {
   campaign_id: string;
@@ -62,19 +66,44 @@ function extractFbCampaign(
   rawClick: Record<string, unknown> | null | undefined
 ): { campaign_id: string; source: FbSource; campaign_name?: string } | null {
   if (!rawClick) return null;
+
   const extra = rawClick.extra_params;
-  if (extra && typeof extra === 'object') {
-    const e = extra as Record<string, unknown>;
-    const fbCid = e.fb_campaign_id;
-    if (typeof fbCid === 'string' && fbCid.trim()) {
-      return { campaign_id: fbCid.trim(), source: 'fb_campaign_id' };
-    }
-    const utmSource = typeof e.utm_source === 'string' ? e.utm_source.toLowerCase().trim() : '';
-    const utm = e.utm_campaign;
-    if (typeof utm === 'string' && utm.trim() && FB_UTM_SOURCES.has(utmSource)) {
-      return { campaign_id: utm.trim(), source: 'utm_campaign' };
-    }
+  const e = (extra && typeof extra === 'object') ? (extra as Record<string, unknown>) : {};
+
+  // 1. Operator-set explicit Meta campaign id — always trusted.
+  const fbCid = e.fb_campaign_id;
+  if (typeof fbCid === 'string' && fbCid.trim()) {
+    return { campaign_id: fbCid.trim(), source: 'fb_campaign_id' };
   }
+
+  const utmSource = typeof e.utm_source === 'string' ? e.utm_source.toLowerCase().trim() : '';
+  const utmId = typeof e.utm_id === 'string' ? e.utm_id.trim() : '';
+  const utmCampaign = typeof e.utm_campaign === 'string' ? e.utm_campaign.trim() : '';
+  const fromMetaUtm = utmSource !== '' && FB_UTM_SOURCES.has(utmSource);
+
+  // 2. utm_id — Meta's canonical numeric campaign id (preferred over utm_campaign
+  //    which often carries the friendly NAME, not the id).
+  if (fromMetaUtm && utmId && META_ID_RE.test(utmId)) {
+    return {
+      campaign_id: utmId,
+      source: 'utm_id',
+      campaign_name: utmCampaign && !META_ID_RE.test(utmCampaign) ? utmCampaign : undefined,
+    };
+  }
+
+  // 3. utm_campaign fallback. Record campaign_name when value is text so the
+  //    dashboard shows a readable label until Insights sync overwrites with
+  //    the canonical Meta campaign name.
+  if (fromMetaUtm && utmCampaign) {
+    const isNumeric = META_ID_RE.test(utmCampaign);
+    return {
+      campaign_id: utmCampaign,
+      source: 'utm_campaign',
+      campaign_name: isNumeric ? undefined : utmCampaign,
+    };
+  }
+
+  // 4. Synthetic fallback — Meta-tagged click with no campaign id.
   const ad = rawClick.ad_ids;
   const meta = rawClick.meta_ids;
   const hasFbclid =
