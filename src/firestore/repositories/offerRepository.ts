@@ -109,7 +109,13 @@ export const offerRepository = {
     const exists = (await ref.get()).exists;
     if (!exists) return null;
 
-    const update: Record<string, unknown> = { ...patch, updated_at: FieldValue.serverTimestamp() };
+    const update: Record<string, unknown> = { updated_at: FieldValue.serverTimestamp() };
+    for (const [k, v] of Object.entries(patch)) {
+      // Explicit null → erase the field. The linkage fields use this so the
+      // operator can "unlink" an offer from a campaign without dropping the
+      // whole offer record.
+      update[k] = v === null ? FieldValue.delete() : v;
+    }
     if (patch.name) update.name_lower = patch.name.toLowerCase();
     await ref.update(update);
     cache.delete(offer_id);

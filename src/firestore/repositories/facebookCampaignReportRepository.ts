@@ -18,6 +18,7 @@ import { logger } from '../../utils/logger';
 // Writes from the hot path are atomic FieldValue.increment, same as GAds.
 
 const fetchRangeCache = new TTLCache<FacebookCampaignReportDoc[]>({ ttlMs: 60_000, maxEntries: 128 });
+const distinctCache = new TTLCache<Array<{ campaign_id: string; campaign_name?: string; source: string }>>({ ttlMs: 5 * 60_000, maxEntries: 8 });
 
 export interface FacebookCampaignReportDoc {
   campaign_id: string;
@@ -355,6 +356,32 @@ export const facebookCampaignReportRepository = {
       .limit(max)
       .get();
     return snap.docs.map((d) => hydrate(d.data() as Record<string, unknown>));
+  },
+
+  // Distinct (campaign_id, campaign_name, source) pairs across the FB
+  // collection. Mirrors campaignReportRepository.listDistinct — same caching
+  // strategy and same use case (offer-linkage form picker).
+  async listDistinct(max = 5000): Promise<Array<{ campaign_id: string; campaign_name?: string; source: string }>> {
+    const cacheKey = `fb-distinct|${max}`;
+    return distinctCache.getOrLoad(cacheKey, async () => {
+      const snap = await db()
+        .collection(COLLECTIONS.FACEBOOK_CAMPAIGN_REPORTS)
+        .orderBy('campaign_id', 'asc')
+        .limit(max)
+        .get();
+      const seen = new Map<string, { campaign_id: string; campaign_name?: string; source: string }>();
+      for (const d of snap.docs) {
+        const raw = d.data() as Record<string, unknown>;
+        const id = String(raw.campaign_id ?? '');
+        if (!id || seen.has(id)) continue;
+        seen.set(id, {
+          campaign_id: id,
+          campaign_name: typeof raw.campaign_name === 'string' ? raw.campaign_name : undefined,
+          source: String(raw.source ?? 'fb_campaign_id'),
+        });
+      }
+      return [...seen.values()];
+    });
   },
 };
 

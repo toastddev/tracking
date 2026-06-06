@@ -4,6 +4,12 @@ export interface Offer {
   base_url: string;
   status: 'active' | 'paused';
   default_params?: Record<string, string>;
+  // Operator-set linkage between an offer and an upstream ad campaign. Purely
+  // organisational — does not change click/conversion attribution, which still
+  // runs off the URL params on the click itself.
+  traffic_source?: 'google' | 'facebook';
+  linked_campaign_id?: string;
+  link_type?: 'direct' | 'normal';
   created_at?: string;
   updated_at?: string;
 }

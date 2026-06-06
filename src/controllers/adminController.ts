@@ -15,7 +15,7 @@ import { postbackReportDetailService } from '../services/postbackReportDetailSer
 import { campaignReportsService } from '../services/campaignReportsService';
 import { campaignReportDetailService } from '../services/campaignReportDetailService';
 import { campaignReportsBackfillService } from '../services/campaignReportsBackfillService';
-import { campaignReportRepository } from '../firestore';
+import { campaignReportRepository, facebookCampaignReportRepository } from '../firestore';
 import { googleAdsSyncStateRepository } from '../firestore';
 import { googleAdsForwardingService } from '../services/googleAdsForwardingService';
 import { googleAdsCampaignSyncService } from '../services/googleAdsCampaignSyncService';
@@ -97,6 +97,30 @@ function parseExtraMappings(input: unknown): ExtraResult {
   return { ok: true, value: out };
 }
 
+// Parses the operator-set offer↔campaign linkage. Each field is independently
+// optional; either all three are set (full linkage) or all three are blank
+// (offer floats unattached). Used on create — update has its own per-field
+// nullable handling because PATCH semantics differ.
+type LinkageResult =
+  | { value: { traffic_source?: 'google' | 'facebook'; linked_campaign_id?: string; link_type?: 'direct' | 'normal' } }
+  | { error: string };
+function parseOfferLinkage(body: Record<string, unknown>): LinkageResult {
+  const out: { traffic_source?: 'google' | 'facebook'; linked_campaign_id?: string; link_type?: 'direct' | 'normal' } = {};
+  if (body.traffic_source != null && body.traffic_source !== '') {
+    if (body.traffic_source !== 'google' && body.traffic_source !== 'facebook') return { error: 'invalid_traffic_source' };
+    out.traffic_source = body.traffic_source;
+  }
+  if (body.linked_campaign_id != null && body.linked_campaign_id !== '') {
+    if (typeof body.linked_campaign_id !== 'string' || !isValidCampaignId(body.linked_campaign_id)) return { error: 'invalid_linked_campaign_id' };
+    out.linked_campaign_id = body.linked_campaign_id;
+  }
+  if (body.link_type != null && body.link_type !== '') {
+    if (body.link_type !== 'direct' && body.link_type !== 'normal') return { error: 'invalid_link_type' };
+    out.link_type = body.link_type;
+  }
+  return { value: out };
+}
+
 function parseLimit(c: Context): number | undefined {
   const v = c.req.query('limit');
   if (!v) return undefined;
@@ -161,8 +185,17 @@ export const adminController = {
     if (!name) return c.json({ error: 'name_required' }, 400);
     if (!base_url) return c.json({ error: 'base_url_required' }, 400);
 
+    const linkage = parseOfferLinkage(body);
+    if ('error' in linkage) return c.json({ error: linkage.error }, 400);
+
     try {
-      const offer = await offerRepository.create(offer_id, { name, base_url, status, default_params });
+      const offer = await offerRepository.create(offer_id, {
+        name,
+        base_url,
+        status,
+        default_params,
+        ...linkage.value,
+      });
       return c.json({ ...offer, tracking_url: trackingUrl(offer.offer_id) }, 201);
     } catch (err) {
       if (err instanceof Error && err.message === 'offer_already_exists') {
@@ -191,9 +224,60 @@ export const adminController = {
     if (body.status === 'active' || body.status === 'paused') patch.status = body.status;
     if (body.default_params && typeof body.default_params === 'object') patch.default_params = body.default_params;
 
+    // Linkage fields are nullable: passing `null` explicitly clears them, leaving
+    // them undefined leaves the stored value alone.
+    if ('traffic_source' in body) {
+      if (body.traffic_source === null || body.traffic_source === '') patch.traffic_source = null;
+      else if (body.traffic_source === 'google' || body.traffic_source === 'facebook') patch.traffic_source = body.traffic_source;
+      else return c.json({ error: 'invalid_traffic_source' }, 400);
+    }
+    if ('linked_campaign_id' in body) {
+      if (body.linked_campaign_id === null || body.linked_campaign_id === '') patch.linked_campaign_id = null;
+      else if (typeof body.linked_campaign_id === 'string' && isValidCampaignId(body.linked_campaign_id)) patch.linked_campaign_id = body.linked_campaign_id;
+      else return c.json({ error: 'invalid_linked_campaign_id' }, 400);
+    }
+    if ('link_type' in body) {
+      if (body.link_type === null || body.link_type === '') patch.link_type = null;
+      else if (body.link_type === 'direct' || body.link_type === 'normal') patch.link_type = body.link_type;
+      else return c.json({ error: 'invalid_link_type' }, 400);
+    }
+
     const updated = await offerRepository.update(id, patch);
     if (!updated) return c.json({ error: 'not_found' }, 404);
     return c.json({ ...updated, tracking_url: trackingUrl(updated.offer_id) });
+  },
+
+  // Searches across recorded campaigns for the offer-linkage form. `source`
+  // toggles between the GAds and FB campaign-report collections; `q` is a
+  // case-insensitive substring matched against either campaign_name or
+  // campaign_id so the operator can find a campaign by either.
+  async searchCampaigns(c: Context) {
+    const source = c.req.query('source');
+    const q = (c.req.query('q') ?? '').trim().toLowerCase();
+    const limit = Math.min(Math.max(parseLimit(c) ?? 25, 1), 100);
+    if (source !== 'google' && source !== 'facebook') return c.json({ error: 'invalid_source' }, 400);
+
+    const all = source === 'google'
+      ? await campaignReportRepository.listDistinct()
+      : await facebookCampaignReportRepository.listDistinct();
+
+    const filtered = q
+      ? all.filter((row) =>
+          row.campaign_id.toLowerCase().includes(q) ||
+          (row.campaign_name?.toLowerCase().includes(q) ?? false))
+      : all;
+
+    // Prefer rows with a campaign_name first — these are the operator-named
+    // campaigns from a successful GAds/FB sync. Then alphabetical so results
+    // are stable across calls.
+    filtered.sort((a, b) => {
+      const an = a.campaign_name ? 0 : 1;
+      const bn = b.campaign_name ? 0 : 1;
+      if (an !== bn) return an - bn;
+      return (a.campaign_name ?? a.campaign_id).localeCompare(b.campaign_name ?? b.campaign_id);
+    });
+
+    return c.json({ items: filtered.slice(0, limit) });
   },
 
   // Pulls campaign names and ad spend directly from all connected Google Ads child accounts.

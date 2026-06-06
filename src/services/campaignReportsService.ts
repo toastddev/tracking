@@ -1,5 +1,5 @@
 import { campaignReportRepository, offerReportRepository, type CampaignReportDoc } from '../firestore';
-import { toInr } from '../utils/fxRates';
+import { toInr, fxRates } from '../utils/fxRates';
 import { logger } from '../utils/logger';
 
 export interface CampaignReportsFilters {
@@ -35,6 +35,7 @@ export interface CampaignReportSummary {
   pending: number;
   rejected: number;
   revenue: number;
+  revenue_usd: number;     // reverse-converted from `revenue` (INR) using current FX rate
   spend: number;
   profit: number;          // revenue - spend
   cvr: number;             // conversions / clicks
@@ -115,6 +116,13 @@ export interface CampaignReportsResponse {
 }
 
 const DAY_MS = 24 * 60 * 60 * 1000;
+
+function inrToUsdApprox(inr: number): number {
+  const rates = fxRates();
+  const inrPerUsd = rates.INR;
+  if (!inrPerUsd || inrPerUsd <= 0) return 0;
+  return inr / inrPerUsd;
+}
 
 function dayKeyUTC(d: Date): string {
   return d.toISOString().slice(0, 10);
@@ -285,6 +293,11 @@ export const campaignReportsService = {
         pending,
         rejected,
         revenue,
+        // Reverse-converted USD form for the dashboard's view-2. Approximate —
+        // uses the current INR-per-USD rate so this is correct only when the
+        // window's average FX rate is close to today's; deviates over long
+        // historical ranges with major FX moves.
+        revenue_usd: inrToUsdApprox(revenue),
         spend,
         profit,
         cvr: safeDiv(conversions, clicks),

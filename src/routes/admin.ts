@@ -20,6 +20,11 @@ adminRoutes.get('/api/offers/:id', (c) => adminController.getOffer(c));
 adminRoutes.patch('/api/offers/:id', (c) => adminController.updateOffer(c));
 adminRoutes.delete('/api/offers/:id', (c) => adminController.deleteOffer(c));
 
+// Campaign search (for the offer-linkage form picker). Filtered by traffic
+// source (google | facebook) so the picker only shows campaigns from the
+// platform the operator chose.
+adminRoutes.get('/api/campaigns/search', (c) => adminController.searchCampaigns(c));
+
 // Networks (postback configurations)
 adminRoutes.get('/api/networks', (c) => adminController.listNetworks(c));
 adminRoutes.post('/api/networks', (c) => adminController.createNetwork(c));

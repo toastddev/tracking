@@ -4,7 +4,7 @@ import {
   NO_MATCH_CAMPAIGN_ID,
   type FacebookCampaignReportDoc,
 } from '../firestore';
-import { toInr } from '../utils/fxRates';
+import { toInr, fxRates } from '../utils/fxRates';
 import { logger } from '../utils/logger';
 
 // Read-side service for the FB Campaigns dashboard. Mirror of
@@ -43,6 +43,7 @@ export interface FbCampaignReportSummary {
   pending: number;
   rejected: number;
   revenue: number;
+  revenue_usd: number;     // reverse-converted from `revenue` (INR) for view-2
   spend: number;
   profit: number;
   cvr: number;
@@ -111,6 +112,13 @@ function eachDayKeyUTC(from: Date, to: Date): string[] {
   const out: string[] = [];
   for (let t = start; t <= end; t += DAY_MS) out.push(new Date(t).toISOString().slice(0, 10));
   return out;
+}
+
+function inrToUsdApprox(inr: number): number {
+  const rates = fxRates();
+  const inrPerUsd = rates.INR;
+  if (!inrPerUsd || inrPerUsd <= 0) return 0;
+  return inr / inrPerUsd;
 }
 
 function safeDiv(num: number, den: number): number {
@@ -261,6 +269,7 @@ export const facebookCampaignReportsService = {
         pending,
         rejected,
         revenue,
+        revenue_usd: inrToUsdApprox(revenue),
         spend,
         profit,
         cvr: safeDiv(conversions, clicks),

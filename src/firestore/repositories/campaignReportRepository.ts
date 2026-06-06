@@ -8,6 +8,7 @@ import { logger } from '../../utils/logger';
 // 60s read-through cache for fetchRange. Mirrors offerReportRepository — see
 // the comment there for the rationale.
 const fetchRangeCache = new TTLCache<CampaignReportDoc[]>({ ttlMs: 60_000, maxEntries: 128 });
+const distinctCache = new TTLCache<Array<{ campaign_id: string; campaign_name?: string; source: string }>>({ ttlMs: 5 * 60_000, maxEntries: 8 });
 
 // Per-campaign daily rollup. Doc id = `{campaign_id}__{YYYY-MM-DD}` (UTC day).
 // `campaign_id` is sourced from the `gad_campaignid` URL param (Google Ads)
@@ -356,6 +357,35 @@ export const campaignReportRepository = {
         .limit(max)
         .get();
       return snap.docs.map((d) => hydrate(d.data() as Record<string, unknown>));
+    });
+  },
+
+  // Distinct (campaign_id, campaign_name, source) pairs across the whole
+  // collection. Powers the offer-linkage form's campaign picker — the
+  // operator types a few characters and we surface every campaign that has
+  // ever recorded data on the GAds (or utm) side. We page through the doc
+  // index since there's no native distinct in Firestore; the work is bounded
+  // by `max` and cached for 5 minutes so it doesn't get expensive.
+  async listDistinct(max = 5000): Promise<Array<{ campaign_id: string; campaign_name?: string; source: string }>> {
+    const cacheKey = `distinct|${max}`;
+    return distinctCache.getOrLoad(cacheKey, async () => {
+      const snap = await db()
+        .collection(COLLECTIONS.CAMPAIGN_REPORTS)
+        .orderBy('campaign_id', 'asc')
+        .limit(max)
+        .get();
+      const seen = new Map<string, { campaign_id: string; campaign_name?: string; source: string }>();
+      for (const d of snap.docs) {
+        const raw = d.data() as Record<string, unknown>;
+        const id = String(raw.campaign_id ?? '');
+        if (!id || seen.has(id)) continue;
+        seen.set(id, {
+          campaign_id: id,
+          campaign_name: typeof raw.campaign_name === 'string' ? raw.campaign_name : undefined,
+          source: String(raw.source ?? 'gad_campaignid'),
+        });
+      }
+      return [...seen.values()];
     });
   },
 
