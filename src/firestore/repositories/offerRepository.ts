@@ -65,7 +65,17 @@ export const offerRepository = {
     }
 
     const cursorVal = decodeCursor(opts.cursor);
-    if (cursorVal) query = query.startAfter(cursorVal);
+    if (cursorVal) {
+      // The cursor type MUST match the orderBy field's type or Firestore can't
+      // position correctly. The search branch orders by `name_lower` (a string),
+      // so the raw decoded string is right. The default branch orders by
+      // `created_at` (a Timestamp) — passing the ISO string as-is makes Firestore
+      // compare a String against Timestamps (different sort types), which silently
+      // resets paging to the newest docs and breaks Next past page 2. Rehydrate it
+      // to a Date so the comparison happens within the timestamp type, matching
+      // clickRepository.list.
+      query = query.startAfter(opts.q ? cursorVal : new Date(cursorVal));
+    }
 
     const snap = await query.limit(limit + 1).get();
     const docs = snap.docs.slice(0, limit);
