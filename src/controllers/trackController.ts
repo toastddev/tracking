@@ -46,8 +46,11 @@ export const trackController = {
     const offer_id = c.req.param('offer_id');
     const query = c.req.query();
 
-    // Always use the URL slug as aff_id, ignore any query param
-    const aff_id = offer_id!;
+    // Honour an explicit ?aff_id= when the caller sends one, otherwise fall
+    // back to the offer slug. Mirrors the pixel endpoint so both tracking paths
+    // populate aff_id consistently and the affiliate dimension in reports is
+    // real rather than always equal to offer_id.
+    const aff_id = (query.aff_id ?? '').trim() || offer_id!;
 
     const check = requireParams({ offer_id, aff_id }, ['offer_id', 'aff_id']);
     if (!check.ok) {

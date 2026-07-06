@@ -34,6 +34,21 @@ function clientIp(c: Context): string | undefined {
   );
 }
 
+// Pull the presented postback secret (if any) from, in priority order:
+//   ?secret= / ?key= query param, X-Postback-Secret header, or
+//   Authorization: Bearer <secret>. Only consulted when the network has a
+//   postback_secret configured; harmless noise otherwise.
+function presentedSecret(c: Context, raw: Record<string, string>): string | undefined {
+  const fromQuery = raw.secret ?? raw.key;
+  if (fromQuery && fromQuery.trim()) return fromQuery.trim();
+  const header = c.req.header('x-postback-secret');
+  if (header && header.trim()) return header.trim();
+  const authz = c.req.header('authorization') ?? '';
+  const m = authz.match(/^Bearer\s+(.+)$/i);
+  if (m) return m[1]!.trim();
+  return undefined;
+}
+
 export const postbackController = {
   async handle(c: Context) {
     const network_id = c.req.param('network_id');
@@ -49,6 +64,7 @@ export const postbackController = {
       raw,
       method,
       source_ip: clientIp(c),
+      presented_secret: presentedSecret(c, raw),
     });
 
     if (!result.ok) {

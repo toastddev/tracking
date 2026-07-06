@@ -12,6 +12,7 @@ import { initFirestore } from './firestore';
 import { logger } from './utils/logger';
 import { affiliateApiScheduler } from './services/affiliateApiScheduler';
 import { offerReportsReconciliationScheduler } from './services/offerReportsReconciliationScheduler';
+import { encKeyStatus } from './utils/crypto';
 
 // Catch errors that escape Hono's request scope (scheduler ticks, async
 // fire-and-forget, Firestore client internals). Without this they vanish
@@ -30,6 +31,14 @@ process.on('unhandledRejection', (reason) => {
 try {
   initFirestore();
   logger.info('firestore_ready');
+  // Fail loud, not silent: affiliate-API auth secrets (bearer tokens / api keys)
+  // are stored AES-256-GCM encrypted and decrypted per run. If the key is
+  // missing or malformed, every scheduled run would throw deep in decryptSecret
+  // and quietly stop pulling conversions. Surface it once, at boot, as CRITICAL.
+  const keyStatus = encKeyStatus();
+  if (!keyStatus.ok) {
+    logger.critical('enc_key_misconfigured', { reason: keyStatus.reason });
+  }
   affiliateApiScheduler.start();
   // Single reconciler covers offer_reports + campaign_reports + facebook_campaign_reports
   // in one shared scan per tick — see services/reconciler/unifiedReconciler.ts.

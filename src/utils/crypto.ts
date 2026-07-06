@@ -20,6 +20,25 @@ function loadKey(): Buffer {
   return key;
 }
 
+// Non-throwing boot-time probe: is GOOGLE_ADS_TOKEN_ENC_KEY present and the
+// correct length? Returns a reason string when misconfigured so index.ts can
+// log a CRITICAL at startup instead of letting every affiliate-API run crash
+// deep inside decryptSecret (which stores encrypted bearer tokens / api keys).
+export function encKeyStatus(): { ok: true } | { ok: false; reason: string } {
+  const raw = process.env.GOOGLE_ADS_TOKEN_ENC_KEY;
+  if (!raw) return { ok: false, reason: 'GOOGLE_ADS_TOKEN_ENC_KEY is not set' };
+  let key: Buffer;
+  try {
+    key = Buffer.from(raw, 'base64');
+  } catch {
+    return { ok: false, reason: 'GOOGLE_ADS_TOKEN_ENC_KEY is not valid base64' };
+  }
+  if (key.length !== KEY_BYTES) {
+    return { ok: false, reason: `GOOGLE_ADS_TOKEN_ENC_KEY must decode to ${KEY_BYTES} bytes (got ${key.length})` };
+  }
+  return { ok: true };
+}
+
 export function encryptSecret(plaintext: string): EncryptedBlob {
   const key = loadKey();
   const iv = randomBytes(IV_BYTES);

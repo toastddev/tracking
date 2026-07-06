@@ -67,7 +67,7 @@ function formatGoogleAdsDateTime(
       });
       const parts = Object.fromEntries(fmt.formatToParts(networkTs).map((p) => [p.type, p.value]));
       const date = `${parts.year}-${parts.month}-${parts.day}`;
-      const time = `${parts.hour === '24' ? '00' : parts.hour}:${parts.minute}:${parts.second}`;
+      const time = `${parts.hour}:${parts.minute}:${parts.second}`;
 
       const sign = offsetMin >= 0 ? '+' : '-';
       const abs = Math.abs(offsetMin);
@@ -173,21 +173,38 @@ function forcedUploadCurrency(): string | undefined {
   return /^[A-Z]{3}$/.test(code) ? code : undefined;
 }
 
+type MoneyResult =
+  | { ok: true; conversion_value: number; currency_code: string }
+  | { ok: false; reason: string; from_currency: string; to_currency: string };
+
+// Compute the value + currency to upload to Google Ads.
+//
+// The account is standardised on INR (GOOGLE_ADS_UPLOAD_CURRENCY=INR), so a
+// USD/GBP/EUR payout must be converted to INR *before* upload — Google bids on
+// the number we send, tagged with the currency we declare. The two MUST agree.
+//
+// Correctness rule: we NEVER send a value labelled with a currency it isn't in.
+// If the source currency can't be converted to the target (no FX rate
+// configured for it), we return ok:false so the caller SKIPS the upload and
+// records why, instead of shipping e.g. a GBP amount labelled "GBP" (or, worse,
+// a raw number labelled INR) that silently corrupts the campaign's bid signal.
+// The operator fixes it by adding the rate to GOOGLE_ADS_FX_RATES and re-running.
 function moneyForUpload(
   conversion: ConversionRecord,
   connection: GoogleAdsConnection
-): { conversion_value: number; currency_code: string } {
+): MoneyResult {
   const sourceValue = conversion.payout ?? 0;
   const sourceCurrency = (conversion.currency || 'USD').trim().toUpperCase();
-  
-  // Priority: 
-  // 1. Forced env var (GOOGLE_ADS_UPLOAD_CURRENCY)
-  // 2. Fallback to USD (Default)
+
+  // Priority:
+  // 1. Forced env var (GOOGLE_ADS_UPLOAD_CURRENCY) — INR in production
+  // 2. The destination account's own currency
+  // 3. USD as a last resort
   const forced = forcedUploadCurrency();
-  const targetCurrency = forced || 'USD';
-  
+  const targetCurrency = forced || (connection.currency_code || 'USD').trim().toUpperCase();
+
   const converted = convertCurrency(sourceValue, sourceCurrency, targetCurrency);
-  
+
   if (converted) {
     if (converted.currency !== sourceCurrency) {
       logger.info('gads_conversion_value_converted', {
@@ -200,19 +217,17 @@ function moneyForUpload(
         forced_env: !!forced,
       });
     }
-    return { conversion_value: converted.amount, currency_code: converted.currency };
+    return { ok: true, conversion_value: converted.amount, currency_code: converted.currency };
   }
 
-  // If conversion failed (missing rate), we default to USD only if the source was USD.
-  // Otherwise, we send the source currency and hope Google Ads handles it.
+  // No usable FX rate for this pair — do NOT guess. Signal a skip.
   logger.warn('gads_conversion_value_fx_missing', {
     conversion_id: conversion.conversion_id,
     from_currency: sourceCurrency,
     to_currency: targetCurrency,
     connection_id: connection.connection_id,
   });
-  
-  return { conversion_value: sourceValue, currency_code: sourceCurrency };
+  return { ok: false, reason: `fx_rate_missing_${sourceCurrency}_to_${targetCurrency}`, from_currency: sourceCurrency, to_currency: targetCurrency };
 }
 
 async function callGoogleAds(
@@ -384,6 +399,11 @@ export const googleAdsForwardingService = {
     }
 
     let dispatched = 0;
+    // Skips recorded inside the destination loops (e.g. FX rate missing). Kept
+    // separate from `dispatched` so the "no destination configured" fallback at
+    // the tail doesn't also fire when we DID have a destination but skipped it
+    // for a concrete, already-recorded reason.
+    let skipsRecorded = 0;
 
     // 1) Cross-account: fire to every active MCC connection that has a sale action set.
     const mccConns = await googleAdsConnectionRepository.listByType('mcc');
@@ -391,6 +411,20 @@ export const googleAdsForwardingService = {
       if (conn.status !== 'active') continue;
       if (!conn.sale_conversion_action_resource) continue;
       const money = moneyForUpload(conversion, conn);
+      if (!money.ok) {
+        await recordSkip({
+          kind: 'conversion',
+          source_id: conversion.conversion_id,
+          conversion_id: conversion.conversion_id,
+          reason: money.reason,
+          identifier,
+          connection_id: conn.connection_id,
+          customer_id: conn.customer_id,
+          conversion_action_resource: conn.sale_conversion_action_resource,
+        });
+        skipsRecorded++;
+        continue;
+      }
       const ctx: UploadContext = {
         kind: 'conversion',
         source_id: conversion.conversion_id,
@@ -431,26 +465,40 @@ export const googleAdsForwardingService = {
         });
       } else {
         const money = moneyForUpload(conversion, target);
-        const ctx: UploadContext = {
-          kind: 'conversion',
-          source_id: conversion.conversion_id,
-          conversion_id: conversion.conversion_id,
-          identifier,
-          conversion_action_resource: route.sale_conversion_action_resource,
-          conversion_value: money.conversion_value,
-          currency_code: money.currency_code,
-          conversion_date_time_iso: adjustEventDateForGads(conversion, input.postback_timezone).toISOString(),
-          raw_network_timestamp: conversion.network_timestamp,
-          postback_timezone: input.postback_timezone,
-          order_id: conversion.conversion_id,
-        };
-        const result = await callGoogleAds(target, ctx);
-        await persistAttempt({ ctx, connection: target, result });
-        dispatched++;
+        if (!money.ok) {
+          await recordSkip({
+            kind: 'conversion',
+            source_id: conversion.conversion_id,
+            conversion_id: conversion.conversion_id,
+            reason: money.reason,
+            identifier,
+            connection_id: target.connection_id,
+            customer_id: target.customer_id,
+            conversion_action_resource: route.sale_conversion_action_resource,
+          });
+          skipsRecorded++;
+        } else {
+          const ctx: UploadContext = {
+            kind: 'conversion',
+            source_id: conversion.conversion_id,
+            conversion_id: conversion.conversion_id,
+            identifier,
+            conversion_action_resource: route.sale_conversion_action_resource,
+            conversion_value: money.conversion_value,
+            currency_code: money.currency_code,
+            conversion_date_time_iso: adjustEventDateForGads(conversion, input.postback_timezone).toISOString(),
+            raw_network_timestamp: conversion.network_timestamp,
+            postback_timezone: input.postback_timezone,
+            order_id: conversion.conversion_id,
+          };
+          const result = await callGoogleAds(target, ctx);
+          await persistAttempt({ ctx, connection: target, result });
+          dispatched++;
+        }
       }
     }
 
-    if (dispatched === 0) {
+    if (dispatched === 0 && skipsRecorded === 0) {
       await recordSkip({
         kind: 'conversion',
         source_id: conversion.conversion_id,
@@ -604,6 +652,28 @@ export const googleAdsForwardingService = {
       // MCC connections
       for (const conn of activeMcc) {
         const money = moneyForUpload(conversion, conn);
+        if (!money.ok) {
+          // Can't convert to the upload currency — skip rather than ship a
+          // mislabelled value into the batch. Recorded for audit visibility.
+          stats.skipped++;
+          googleAdsUploadRepository
+            .record({
+              kind: 'conversion',
+              source_id: conversion.conversion_id,
+              conversion_id: conversion.conversion_id,
+              click_id: item.click.click_id,
+              connection_id: conn.connection_id,
+              customer_id: conn.customer_id,
+              identifier_type: identifier.type,
+              identifier_value: identifier.value,
+              conversion_action_resource: conn.sale_conversion_action_resource,
+              status: 'skipped',
+              attempts: 0,
+              skip_reason: money.reason,
+            })
+            .catch(() => {});
+          continue;
+        }
         const cc: Record<string, unknown> = {
           conversion_action: conn.sale_conversion_action_resource,
           conversion_date_time: formatGoogleAdsDateTime(
@@ -630,6 +700,26 @@ export const googleAdsForwardingService = {
       if (resolved) {
         const { route, conn } = resolved;
         const money = moneyForUpload(conversion, conn);
+        if (!money.ok) {
+          stats.skipped++;
+          googleAdsUploadRepository
+            .record({
+              kind: 'conversion',
+              source_id: conversion.conversion_id,
+              conversion_id: conversion.conversion_id,
+              click_id: item.click.click_id,
+              connection_id: conn.connection_id,
+              customer_id: conn.customer_id,
+              identifier_type: identifier.type,
+              identifier_value: identifier.value,
+              conversion_action_resource: route.sale_conversion_action_resource,
+              status: 'skipped',
+              attempts: 0,
+              skip_reason: money.reason,
+            })
+            .catch(() => {});
+          continue;
+        }
         const cc: Record<string, unknown> = {
           conversion_action: route.sale_conversion_action_resource,
           conversion_date_time: formatGoogleAdsDateTime(

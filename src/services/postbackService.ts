@@ -1,3 +1,4 @@
+import { timingSafeEqual } from 'node:crypto';
 import { generateConversionId } from '../utils/idGenerator';
 import { logger } from '../utils/logger';
 import {
@@ -23,6 +24,10 @@ export interface PostbackInput {
   raw: Record<string, string>;
   method: 'GET' | 'POST';
   source_ip?: string;
+  // Secret the caller presented (query ?secret=/?key=, X-Postback-Secret
+  // header, or Authorization: Bearer). Only checked when the network has a
+  // postback_secret configured. Undefined otherwise.
+  presented_secret?: string;
 }
 
 export type PostbackResult =
@@ -75,20 +80,57 @@ function applyMapping(_network: Network, raw: Record<string, string>): MappedFie
   };
 }
 
-// Postback verification hook. Today it's a no-op so the endpoint is ready for
-// integration testing. Replace with per-network secret/HMAC/IP allowlist.
-function verifyPostback(_input: PostbackInput): { ok: true } | { ok: false; reason: 'unauthorized' } {
+// Constant-time string compare that never throws and doesn't early-return on
+// length mismatch in a way that leaks the secret. (Length is compared first,
+// which only reveals length — acceptable for a shared postback secret.)
+function constantTimeEqual(a: string, b: string): boolean {
+  const aBuf = Buffer.from(a, 'utf8');
+  const bBuf = Buffer.from(b, 'utf8');
+  if (aBuf.length !== bBuf.length) return false;
+  return timingSafeEqual(aBuf, bBuf);
+}
+
+// Per-network postback authentication. Both controls are OPT-IN: a network with
+// neither `postback_secret` nor `postback_ip_allowlist` configured is accepted
+// unconditionally (the common case — networks that can't send any auth). When
+// either is configured it must pass; when both are, both must pass.
+function verifyPostback(
+  network: Network,
+  input: PostbackInput
+): { ok: true } | { ok: false; reason: 'unauthorized' } {
+  // IP allowlist (opt-in). Reject when configured and the source IP isn't on it
+  // (or can't be resolved at all).
+  const allow = network.postback_ip_allowlist;
+  if (Array.isArray(allow) && allow.length > 0) {
+    const ip = (input.source_ip ?? '').trim();
+    if (!ip || !allow.some((a) => a.trim() === ip)) {
+      return { ok: false, reason: 'unauthorized' };
+    }
+  }
+
+  // Shared secret (opt-in). Reject when configured and the presented secret is
+  // absent or doesn't match.
+  const secret = network.postback_secret;
+  if (typeof secret === 'string' && secret.length > 0) {
+    const presented = input.presented_secret ?? '';
+    if (!presented || !constantTimeEqual(presented, secret)) {
+      return { ok: false, reason: 'unauthorized' };
+    }
+  }
+
   return { ok: true };
 }
 
 export const postbackService = {
   async record(input: PostbackInput): Promise<PostbackResult> {
-    const auth = verifyPostback(input);
-    if (!auth.ok) return { ok: false, reason: 'unauthorized' };
-
     const network = await networkService.fetch(input.network_id);
     if (!network) return { ok: false, reason: 'unknown_network' };
     if (network.status !== 'active') return { ok: false, reason: 'network_inactive' };
+
+    // Optional per-network auth — see verifyPostback. No-op for networks that
+    // don't configure a secret / IP allowlist.
+    const auth = verifyPostback(network, input);
+    if (!auth.ok) return { ok: false, reason: 'unauthorized' };
 
     const mapped = applyMapping(network, input.raw);
     if (!mapped.click_id) return { ok: false, reason: 'missing_click_id' };

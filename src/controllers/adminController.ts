@@ -1,4 +1,5 @@
 import type { Context } from 'hono';
+import { FieldValue } from 'firebase-admin/firestore';
 import {
   offerRepository,
   networkRepository,
@@ -95,6 +96,24 @@ function parseExtraMappings(input: unknown): ExtraResult {
     out[canonical] = param;
   }
   return { ok: true, value: out };
+}
+
+// Parse an optional postback IP allowlist. Accepts an array of strings or a
+// comma-separated string; returns a de-duped, trimmed list. Empty → [].
+function parsePostbackIpAllowlist(
+  input: unknown
+): { ok: true; value: string[] } | { ok: false; error: string } {
+  if (input == null || input === '') return { ok: true, value: [] };
+  let arr: string[];
+  if (Array.isArray(input)) arr = input.map((x) => String(x).trim());
+  else if (typeof input === 'string') arr = input.split(',').map((s) => s.trim());
+  else return { ok: false, error: 'invalid_postback_ip_allowlist' };
+  const out = arr.filter((s) => s.length > 0);
+  for (const ip of out) {
+    // Permissive sanity bound — accepts IPv4/IPv6 without a full parser.
+    if (ip.length > 45 || /[\s,]/.test(ip)) return { ok: false, error: 'invalid_postback_ip_allowlist' };
+  }
+  return { ok: true, value: Array.from(new Set(out)) };
 }
 
 // Parses the operator-set offer↔campaign linkage. Each field is independently
@@ -357,6 +376,9 @@ export const adminController = {
     const extras = parseExtraMappings(body.extra_mappings);
     if (!extras.ok) return c.json({ error: extras.error }, 400);
 
+    const ipAllow = parsePostbackIpAllowlist(body.postback_ip_allowlist);
+    if (!ipAllow.ok) return c.json({ error: ipAllow.error }, 400);
+
     const data = {
       name,
       status,
@@ -369,6 +391,9 @@ export const adminController = {
       extra_mappings: extras.value,
       default_status: body.default_status ? String(body.default_status).trim() : undefined,
       postback_api_id: body.postback_api_id ? String(body.postback_api_id).trim() : undefined,
+      // Optional postback auth (opt-in). Empty secret / empty list = disabled.
+      postback_secret: body.postback_secret ? String(body.postback_secret) : undefined,
+      postback_ip_allowlist: ipAllow.value.length > 0 ? ipAllow.value : undefined,
       postback_timezone: undefined as string | undefined,
     };
 
@@ -429,6 +454,21 @@ export const adminController = {
       const extras = parseExtraMappings(body.extra_mappings);
       if (!extras.ok) return c.json({ error: extras.error }, 400);
       patch.extra_mappings = extras.value;
+    }
+
+    // Optional postback auth. Both support clearing: empty string / empty list
+    // removes the control and re-opens the endpoint for that network. We use
+    // FieldValue.delete() for the empty case because the client runs with
+    // ignoreUndefinedProperties, so a plain `undefined` would be a no-op and
+    // silently leave the old value enforced.
+    if ('postback_secret' in body) {
+      const raw = typeof body.postback_secret === 'string' ? body.postback_secret : '';
+      patch.postback_secret = raw.length > 0 ? raw : FieldValue.delete();
+    }
+    if ('postback_ip_allowlist' in body) {
+      const ipAllow = parsePostbackIpAllowlist(body.postback_ip_allowlist);
+      if (!ipAllow.ok) return c.json({ error: ipAllow.error }, 400);
+      patch.postback_ip_allowlist = ipAllow.value.length > 0 ? ipAllow.value : FieldValue.delete();
     }
 
     const updated = await networkRepository.update(id, patch);

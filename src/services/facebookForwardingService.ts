@@ -87,10 +87,19 @@ function uploadCurrency(): string {
   return /^[A-Z]{3}$/.test(code) ? code : 'USD';
 }
 
+type FbMoneyResult =
+  | { ok: true; value: number; currency_code: string }
+  | { ok: false; reason: string };
+
+// Same correctness rule as the Google Ads forwarder: convert the payout to the
+// Meta upload currency (META_UPLOAD_CURRENCY, default USD) and NEVER ship a
+// value labelled with a currency it isn't in. If there's no FX rate to convert
+// the source currency, return ok:false so the caller skips the event rather
+// than reporting a mislabelled purchase value into Meta's optimisation.
 function moneyForUpload(
   conversion: ConversionRecord,
   connection: FacebookConnection
-): { value: number; currency_code: string } {
+): FbMoneyResult {
   const sourceValue = conversion.payout ?? 0;
   const sourceCurrency = (conversion.currency || 'USD').trim().toUpperCase();
   const target = uploadCurrency();
@@ -107,7 +116,7 @@ function moneyForUpload(
         connection_id: connection.connection_id,
       });
     }
-    return { value: converted.amount, currency_code: converted.currency };
+    return { ok: true, value: converted.amount, currency_code: converted.currency };
   }
 
   logger.warn('fb_conversion_value_fx_missing', {
@@ -116,7 +125,7 @@ function moneyForUpload(
     to_currency: target,
     connection_id: connection.connection_id,
   });
-  return { value: sourceValue, currency_code: sourceCurrency };
+  return { ok: false, reason: `fx_rate_missing_${sourceCurrency}_to_${target}` };
 }
 
 // Re-interpret network_timestamp in the network's reported timezone before
@@ -381,12 +390,27 @@ export const facebookForwardingService = {
 
     // 1. Cross-account: every active 'business' connection that has a sale
     //    event configured. Mirrors GAds MCC fan-out.
+    let skipsRecorded = 0;
     const businessConns = await facebookConnectionRepository.listByType('business');
     for (const conn of businessConns) {
       if (conn.status !== 'active' && conn.status !== 'expiring') continue;
       const target = resolveSaleTarget(conn);
       if (!target) continue;
       const money = moneyForUpload(conversion, conn);
+      if (!money.ok) {
+        await recordSkip({
+          kind: 'conversion',
+          source_id: conversion.conversion_id,
+          conversion_id: conversion.conversion_id,
+          reason: money.reason,
+          identifier,
+          connection_id: conn.connection_id,
+          dataset_id: target.dataset_id,
+          event_name: target.event_name,
+        });
+        skipsRecorded++;
+        continue;
+      }
       const ctx: UploadContext = {
         kind: 'conversion',
         source_id: conversion.conversion_id,
@@ -425,28 +449,42 @@ export const facebookForwardingService = {
         const target = resolveSaleTarget(targetConn, route);
         if (target) {
           const money = moneyForUpload(conversion, targetConn);
-          const ctx: UploadContext = {
-            kind: 'conversion',
-            source_id: conversion.conversion_id,
-            conversion_id: conversion.conversion_id,
-            identifier,
-            event_name: target.event_name,
-            dataset_id: target.dataset_id,
-            event_id: conversion.conversion_id,
-            event_time_unix: eventTimeSec,
-            value: money.value,
-            currency_code: money.currency_code,
-            ip: click.ip,
-            user_agent: click.user_agent,
-          };
-          const result = await postCapi(targetConn, ctx);
-          await persistAttempt({ ctx, connection: targetConn, result });
-          dispatched++;
+          if (!money.ok) {
+            await recordSkip({
+              kind: 'conversion',
+              source_id: conversion.conversion_id,
+              conversion_id: conversion.conversion_id,
+              reason: money.reason,
+              identifier,
+              connection_id: targetConn.connection_id,
+              dataset_id: target.dataset_id,
+              event_name: target.event_name,
+            });
+            skipsRecorded++;
+          } else {
+            const ctx: UploadContext = {
+              kind: 'conversion',
+              source_id: conversion.conversion_id,
+              conversion_id: conversion.conversion_id,
+              identifier,
+              event_name: target.event_name,
+              dataset_id: target.dataset_id,
+              event_id: conversion.conversion_id,
+              event_time_unix: eventTimeSec,
+              value: money.value,
+              currency_code: money.currency_code,
+              ip: click.ip,
+              user_agent: click.user_agent,
+            };
+            const result = await postCapi(targetConn, ctx);
+            await persistAttempt({ ctx, connection: targetConn, result });
+            dispatched++;
+          }
         }
       }
     }
 
-    if (dispatched === 0) {
+    if (dispatched === 0 && skipsRecorded === 0) {
       await recordSkip({
         kind: 'conversion',
         source_id: conversion.conversion_id,
@@ -614,13 +652,16 @@ export const facebookForwardingService = {
       g.items.push({ payload, eligible });
     }
 
+    // Returns null when the payout can't be converted to the upload currency —
+    // the caller then records a skip instead of enqueuing a mislabelled event.
     function buildEvent(
       item: Eligible,
       conn: FacebookConnection,
       event_name: string,
       event_time_unix: number
-    ): Record<string, unknown> {
+    ): Record<string, unknown> | null {
       const money = moneyForUpload(item.conversion, conn);
+      if (!money.ok) return null;
       const userData: Record<string, unknown> = {};
       // Mirror buildCapiPayload's per-identifier-type field mapping. ip_only
       // contributes nothing here — Meta attributes via IP+UA below.
@@ -652,13 +693,29 @@ export const facebookForwardingService = {
       for (const conn of activeBusiness) {
         const target = resolveSaleTarget(conn);
         if (!target) continue;
-        pushToGroup(
-          ensureBatch(conn),
-          target.dataset_id,
-          target.event_name,
-          buildEvent(item, conn, target.event_name, item.event_time_unix),
-          item
-        );
+        const event = buildEvent(item, conn, target.event_name, item.event_time_unix);
+        if (!event) {
+          // FX rate missing — skip this destination, record for audit.
+          stats.skipped++;
+          facebookUploadRepository
+            .record({
+              kind: 'conversion',
+              source_id: item.conversion.conversion_id,
+              conversion_id: item.conversion.conversion_id,
+              click_id: item.click.click_id,
+              connection_id: conn.connection_id,
+              dataset_id: target.dataset_id,
+              event_name: target.event_name,
+              identifier_type: item.identifier.type,
+              identifier_value: item.identifier.value,
+              status: 'skipped',
+              attempts: 0,
+              skip_reason: `fx_rate_missing_${(item.conversion.currency || 'USD').toUpperCase()}`,
+            })
+            .catch(() => {});
+          continue;
+        }
+        pushToGroup(ensureBatch(conn), target.dataset_id, target.event_name, event, item);
       }
 
       // 2. Per-offer/network route
@@ -666,13 +723,28 @@ export const facebookForwardingService = {
       if (resolved) {
         const target = resolveSaleTarget(resolved.conn, resolved.route);
         if (target) {
-          pushToGroup(
-            ensureBatch(resolved.conn),
-            target.dataset_id,
-            target.event_name,
-            buildEvent(item, resolved.conn, target.event_name, item.event_time_unix),
-            item
-          );
+          const event = buildEvent(item, resolved.conn, target.event_name, item.event_time_unix);
+          if (!event) {
+            stats.skipped++;
+            facebookUploadRepository
+              .record({
+                kind: 'conversion',
+                source_id: item.conversion.conversion_id,
+                conversion_id: item.conversion.conversion_id,
+                click_id: item.click.click_id,
+                connection_id: resolved.conn.connection_id,
+                dataset_id: target.dataset_id,
+                event_name: target.event_name,
+                identifier_type: item.identifier.type,
+                identifier_value: item.identifier.value,
+                status: 'skipped',
+                attempts: 0,
+                skip_reason: `fx_rate_missing_${(item.conversion.currency || 'USD').toUpperCase()}`,
+              })
+              .catch(() => {});
+          } else {
+            pushToGroup(ensureBatch(resolved.conn), target.dataset_id, target.event_name, event, item);
+          }
         }
       }
     }

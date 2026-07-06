@@ -75,32 +75,49 @@ export const conversionRepository = {
   },
 
   // Bulk variant for hot loops. Uses a BulkWriter with create() so existing
-  // docs error out and are silently dropped — deterministic-id dedupe.
-  async bulkInsertIfAbsent(records: ConversionRecord[]): Promise<{ inserted: number; duplicates: number; insertedRecords: ConversionRecord[] }> {
-    if (records.length === 0) return { inserted: 0, duplicates: 0, insertedRecords: [] };
+  // docs error out — deterministic-id dedupe.
+  //
+  // Counting is done per-create-promise and awaited to completion BEFORE
+  // returning, so the caller's inserted/duplicate/failed tallies and the
+  // `insertedRecords` list are exact. The previous version incremented counters
+  // inside .then() microtasks and returned after only `writer.close()` — those
+  // microtasks were not guaranteed to have run, so genuinely-persisted rows
+  // could be missing from `insertedRecords`, causing the affiliate-sync flush()
+  // to drop their report rollups and Google Ads / Facebook uploads. Hard write
+  // failures (transient errors exhausted) were also lost with no `failed`
+  // counter, so run summaries under-reported data loss.
+  async bulkInsertIfAbsent(
+    records: ConversionRecord[]
+  ): Promise<{ inserted: number; duplicates: number; failed: number; insertedRecords: ConversionRecord[] }> {
+    if (records.length === 0) return { inserted: 0, duplicates: 0, failed: 0, insertedRecords: [] };
     const writer = db().bulkWriter();
     let inserted = 0;
     let duplicates = 0;
+    let failed = 0;
     const insertedRecords: ConversionRecord[] = [];
-    writer.onWriteError((err) => {
-      if (err.code === 6 /* ALREADY_EXISTS */) {
-        duplicates++;
-        return false;
-      }
-      // Retry transient errors a few times before surfacing.
-      return err.failedAttempts < 5;
-    });
-    for (const conv of records) {
+    // Don't retry ALREADY_EXISTS (that's a duplicate, handled below); retry
+    // other errors a few times before letting the create() promise reject.
+    writer.onWriteError((err) => err.code !== 6 && err.failedAttempts < 5);
+
+    const ops = records.map((conv) => {
       const ref = db().collection(COLLECTIONS.CONVERSIONS).doc(conv.conversion_id);
-      writer.create(ref, { ...conv, created_at: FieldValue.serverTimestamp() })
-        .then(() => { 
-          inserted++; 
+      return writer
+        .create(ref, { ...conv, created_at: FieldValue.serverTimestamp() })
+        .then(() => {
+          inserted++;
           insertedRecords.push(conv);
         })
-        .catch(() => { /* surfaced via onWriteError */ });
-    }
+        .catch((err: { code?: number }) => {
+          if (err?.code === 6 /* ALREADY_EXISTS */) duplicates++;
+          else failed++;
+        });
+    });
+
+    // close() flushes and resolves once every enqueued write has settled; then
+    // await the per-op promises so all counter updates are guaranteed applied.
     await writer.close();
-    return { inserted, duplicates, insertedRecords };
+    await Promise.all(ops);
+    return { inserted, duplicates, failed, insertedRecords };
   },
 
   // All conversions tied to one click_id, newest first. Backed by the

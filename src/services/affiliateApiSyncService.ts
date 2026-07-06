@@ -336,11 +336,16 @@ function buildHeaders(api: AffiliateApi): Record<string, string> {
   return headers;
 }
 
-// Map one upstream item → ConversionRecord candidate. Returns null when a
-// required field is missing — counted as failed in the run summary.
+// Map one upstream item → ConversionRecord candidate. Returns null ONLY when
+// the dedupe key (external_id) is missing — without it we can't idempotently
+// store the row, so it's counted as failed. A missing click_id does NOT drop
+// the row: it's persisted as an unverified "unknown click" conversion (exactly
+// like the postback path) so the revenue stays visible and auditable instead of
+// vanishing. This is the failure mode that silently swallowed all Kelkoo data
+// after 2026-07-02, when upstream rows arrived without our publisherClickId.
 function mapItem(api: AffiliateApi, item: unknown): {
   external_id: string;
-  click_id: string;
+  click_id?: string;
   payout?: number;
   currency?: string;
   status?: string;
@@ -350,7 +355,7 @@ function mapItem(api: AffiliateApi, item: unknown): {
   const m = api.mapping;
   const external_id = asString(getPath(item, m.external_id_path));
   const click_id = asString(getPath(item, m.click_id_path));
-  if (!external_id || !click_id) return null;
+  if (!external_id) return null;
 
   const rawStatus = m.status_path ? asString(getPath(item, m.status_path)) : undefined;
   const mappedStatus = rawStatus && m.status_map ? m.status_map[rawStatus] ?? rawStatus : rawStatus;
@@ -455,9 +460,12 @@ export async function runAffiliateApi(api: AffiliateApi, opts: RunOptions): Prom
     const batch = buffer.splice(0, buffer.length);
     try {
       const convs = batch.map((b) => b.conv);
-      const { inserted, duplicates, insertedRecords } = await conversionRepository.bulkInsertIfAbsent(convs);
+      const { inserted, duplicates, failed, insertedRecords } = await conversionRepository.bulkInsertIfAbsent(convs);
       run.records_inserted = (run.records_inserted ?? 0) + inserted;
       run.records_skipped_duplicate = (run.records_skipped_duplicate ?? 0) + duplicates;
+      // Hard write failures (transient errors exhausted) — previously lost
+      // silently. Count them so the run summary is honest about data loss.
+      if (failed > 0) run.records_failed = (run.records_failed ?? 0) + failed;
 
       // Filter the original batch down to strictly the new inserts
       const insertedIds = new Set(insertedRecords.map((c) => c.conversion_id));
@@ -644,6 +652,9 @@ export async function runAffiliateApi(api: AffiliateApi, opts: RunOptions): Prom
   let cursor: string | undefined;
   let page = pg.start_page ?? 1;
   let offset = 0;
+  // Total rows returned by the upstream across all pages, regardless of whether
+  // they mapped. Drives the post-run health signals below.
+  let totalItemsFetched = 0;
 
   try {
     for (let i = 0; i < maxPages; i++) {
@@ -670,6 +681,7 @@ export async function runAffiliateApi(api: AffiliateApi, opts: RunOptions): Prom
       }
       run.http_calls = (run.http_calls ?? 0) + 1;
       run.pages_fetched = (run.pages_fetched ?? 0) + 1;
+      totalItemsFetched += result.items.length;
 
       for (const item of result.items) {
         const mapped = mapItem(api, item);
@@ -686,20 +698,20 @@ export async function runAffiliateApi(api: AffiliateApi, opts: RunOptions): Prom
         const conversion_id = deterministicConversionId(api.api_id, mapped.external_id);
 
         // Click verification. Persist the row either way: when click resolves
-        // it's a normal verified conversion; when not, store with verified=false
-        // so the postback log captures it (audit trail) and the rollup counts
-        // it as `unverified` instead of dropping silently. The
-        // records_skipped_unknown_click counter is incremented in flush() so
-        // it only includes truly-new rows (not duplicates from prior runs).
-        // The repository's getById is cached so repeat lookups within a run
-        // (same click hit twice) are free.
-        const click = await clickRepository.getById(mapped.click_id);
+        // it's a normal verified conversion; when not (unresolved OR no click_id
+        // in the upstream row at all), store with verified=false so the log
+        // captures it (audit trail) and the rollup counts it as `unverified`
+        // instead of dropping silently. The records_skipped_unknown_click
+        // counter is incremented in flush() so it only includes truly-new rows
+        // (not duplicates from prior runs). The repository's getById is cached
+        // so repeat lookups within a run (same click hit twice) are free.
+        const click = mapped.click_id ? await clickRepository.getById(mapped.click_id) : null;
         const verified = click !== null;
 
         const conv: ConversionRecord = {
           conversion_id,
           network_id: api.network_id ?? api.api_id,
-          click_id: mapped.click_id,
+          click_id: mapped.click_id ?? '',
           offer_id: click?.offer_id ?? 'unknown',
           payout: mapped.payout,
           currency: mapped.currency,
@@ -743,6 +755,37 @@ export async function runAffiliateApi(api: AffiliateApi, opts: RunOptions): Prom
     }
 
     await flush();
+
+    // ── Post-run health signals ──────────────────────────────────────
+    // (a) Upstream returned rows but NONE mapped → external_id_path is almost
+    //     certainly broken (upstream schema change / misconfig). This is a
+    //     silent data-loss condition: CRITICAL so it pages via the alert
+    //     pipeline instead of hiding behind a benign 'partial'.
+    if (totalItemsFetched > 0 && (run.records_seen ?? 0) === 0) {
+      logger.critical('aff_api_zero_mapped', {
+        api_id: api.api_id,
+        run_id,
+        fetched: totalItemsFetched,
+      });
+      if (!run.error) run.error = 'zero_rows_mapped';
+    } else {
+      // (b) Rows mapped, but the overwhelming majority of NEW rows carried no
+      //     resolvable click_id → traffic is reaching the network without
+      //     passing through our tracker (exactly the July-2 Kelkoo failure).
+      //     WARN surfaces it on Telegram without paging. Thresholded so small
+      //     runs and all-duplicate re-pulls stay quiet.
+      const newUnknown = run.records_skipped_unknown_click ?? 0;
+      const seen = run.records_seen ?? 0;
+      if (seen >= 20 && newUnknown >= seen * 0.8) {
+        logger.warn('aff_api_high_unknown_click_rate', {
+          api_id: api.api_id,
+          run_id,
+          seen,
+          unknown_click: newUnknown,
+        });
+      }
+    }
+
     if (run.status === 'running') {
       if ((run.records_failed ?? 0) > 0) {
         run.status = 'partial';

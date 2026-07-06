@@ -188,114 +188,121 @@ export const clickService = {
   // the user-visible path. The reconciliation scheduler is the long-tail
   // safety net if all retries fail.
   persistAsync(click: ClickRecord): void {
-    retry(() => clickRepository.insert(click)).catch((err: unknown) => {
-      logger.error('click_persist_failed', {
-        click_id: click.click_id,
-        offer_id: click.offer_id,
-        error: err instanceof Error ? err.message : String(err),
-      });
-    });
-
-    // Roll-up into the TTL-safe offer_reports collection so historical
-    // reporting survives the 90-day click TTL.
-    retry(() =>
-      offerReportRepository.incrementClick({
-        offer_id: click.offer_id,
-        at: new Date(click.created_at),
-      })
-    ).catch((err: unknown) => {
-      logger.warn('offer_report_click_increment_failed', {
-        click_id: click.click_id,
-        offer_id: click.offer_id,
-        error: err instanceof Error ? err.message : String(err),
-      });
-    });
-
-    retry(() => drilldownRepository.incrementOfferClick(click)).catch((err: unknown) => {
-      logger.warn('drilldown_offer_click_increment_failed', {
-        click_id: click.click_id,
-        error: err instanceof Error ? err.message : String(err),
-      });
-    });
-
-    // Campaign rollup. Fed when the click carries a Google Ads campaign id,
-    // a utm_campaign tag, or any Google Ads click identifier (gclid/gbraid/
-    // wbraid) — the last falls through to the synthetic `gads_untagged`
-    // campaign so real GAds revenue without a campaign tag still shows up.
-    const campaign = extractCampaign(click);
-    if (campaign) {
-      retry(() =>
-        campaignReportRepository.incrementClick({
-          campaign_id: campaign.campaign_id,
-          campaign_name: campaign.campaign_name,
-          source: campaign.source,
-          at: new Date(click.created_at),
-          offer_id: click.offer_id,
-        })
-      ).catch((err: unknown) => {
-        logger.warn('campaign_report_click_increment_failed', {
-          click_id: click.click_id,
-          campaign_id: campaign.campaign_id,
-          error: err instanceof Error ? err.message : String(err),
-        });
-      });
-    }
-
-    // Fan out to Google Ads only when the click came from Google (gclid/gbraid/wbraid).
-    // Non-Google clicks short-circuit inside the service with no DB write.
+    // Ad-platform fan-out is independent of our own Firestore write — it only
+    // needs the in-memory click — so fire it up front and never gate it on the
+    // click doc persisting. Google Ads: only for Google clicks; non-Google
+    // short-circuits inside the service. Facebook CAPI: only when a Meta
+    // identifier is present.
     if (click.ad_ids?.gclid || click.ad_ids?.gbraid || click.ad_ids?.wbraid) {
       googleAdsForwardingService.forgetClick({ click });
     }
-
-    // Facebook campaign rollup — separate `facebook_campaign_reports` table.
-    // Mirrors the GAds extractCampaign block above; runs alongside, never
-    // replaces it. fb_untagged synthetic campaign covers clicks with
-    // fbclid/fbc/fbp but no campaign tag.
-    const fbCampaign = extractFbCampaign(click);
-    if (fbCampaign) {
-      retry(() =>
-        facebookCampaignReportRepository.incrementClick({
-          campaign_id: fbCampaign.campaign_id,
-          campaign_name: fbCampaign.campaign_name,
-          source: fbCampaign.source,
-          at: new Date(click.created_at),
-          offer_id: click.offer_id,
-        })
-      ).catch((err: unknown) => {
-        logger.warn('fb_campaign_report_click_increment_failed', {
-          click_id: click.click_id,
-          campaign_id: fbCampaign.campaign_id,
-          error: err instanceof Error ? err.message : String(err),
-        });
-      });
-    } else if (!campaign && hasAnyUtmParam(click.extra_params)) {
-      // Grey bucket — the click carries utm_* tags but no Google identifier
-      // (gad_campaignid / gclid / gbraid / wbraid) AND no Facebook identifier
-      // (fb_campaign_id / Meta utm_source / fbclid / fbc / fbp). Persisted into
-      // facebook_campaign_reports under NO_MATCH_CAMPAIGN_ID so the operator
-      // can see leakage; the read-side service strips it from totals on both
-      // dashboards so it never inflates either rollup's numbers.
-      retry(() =>
-        facebookCampaignReportRepository.incrementClick({
-          campaign_id: NO_MATCH_CAMPAIGN_ID,
-          campaign_name: NO_MATCH_CAMPAIGN_NAME,
-          source: 'no_match',
-          at: new Date(click.created_at),
-          offer_id: click.offer_id,
-        })
-      ).catch((err: unknown) => {
-        logger.warn('no_match_click_increment_failed', {
-          click_id: click.click_id,
-          error: err instanceof Error ? err.message : String(err),
-        });
-      });
-    }
-
-    // Facebook CAPI fan-out — fire only when the click carries a Facebook
-    // identifier. Parallel to the GAds dispatch above; never gated by it.
     if (click.ad_ids?.fbclid || click.meta_ids?.fbc || click.meta_ids?.fbp) {
       facebookForwardingService.forgetClick({ click });
     }
+
+    // Persist the click FIRST, then roll up — gating the report increments on a
+    // successful write so a failed click insert can't leave orphaned counts in
+    // offer_reports / drilldowns / campaign_reports (which then drift until the
+    // reconciler rebuilds them). Mirrors persistPixelAsync's ordering. Still
+    // fully detached from the redirect: the controller never awaits this.
+    retry(() => clickRepository.insert(click))
+      .then(() => {
+        // Roll-up into the TTL-safe offer_reports collection so historical
+        // reporting survives the 90-day click TTL.
+        retry(() =>
+          offerReportRepository.incrementClick({
+            offer_id: click.offer_id,
+            at: new Date(click.created_at),
+          })
+        ).catch((err: unknown) => {
+          logger.warn('offer_report_click_increment_failed', {
+            click_id: click.click_id,
+            offer_id: click.offer_id,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        });
+
+        retry(() => drilldownRepository.incrementOfferClick(click)).catch((err: unknown) => {
+          logger.warn('drilldown_offer_click_increment_failed', {
+            click_id: click.click_id,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        });
+
+        // Campaign rollup. Fed when the click carries a Google Ads campaign id,
+        // a utm_campaign tag, or any Google Ads click identifier (gclid/gbraid/
+        // wbraid) — the last falls through to the synthetic `gads_untagged`
+        // campaign so real GAds revenue without a campaign tag still shows up.
+        const campaign = extractCampaign(click);
+        if (campaign) {
+          retry(() =>
+            campaignReportRepository.incrementClick({
+              campaign_id: campaign.campaign_id,
+              campaign_name: campaign.campaign_name,
+              source: campaign.source,
+              at: new Date(click.created_at),
+              offer_id: click.offer_id,
+            })
+          ).catch((err: unknown) => {
+            logger.warn('campaign_report_click_increment_failed', {
+              click_id: click.click_id,
+              campaign_id: campaign.campaign_id,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          });
+        }
+
+        // Facebook campaign rollup — separate `facebook_campaign_reports` table.
+        // Mirrors the GAds extractCampaign block above; runs alongside, never
+        // replaces it. fb_untagged synthetic campaign covers clicks with
+        // fbclid/fbc/fbp but no campaign tag.
+        const fbCampaign = extractFbCampaign(click);
+        if (fbCampaign) {
+          retry(() =>
+            facebookCampaignReportRepository.incrementClick({
+              campaign_id: fbCampaign.campaign_id,
+              campaign_name: fbCampaign.campaign_name,
+              source: fbCampaign.source,
+              at: new Date(click.created_at),
+              offer_id: click.offer_id,
+            })
+          ).catch((err: unknown) => {
+            logger.warn('fb_campaign_report_click_increment_failed', {
+              click_id: click.click_id,
+              campaign_id: fbCampaign.campaign_id,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          });
+        } else if (!campaign && hasAnyUtmParam(click.extra_params)) {
+          // Grey bucket — the click carries utm_* tags but no Google identifier
+          // (gad_campaignid / gclid / gbraid / wbraid) AND no Facebook identifier
+          // (fb_campaign_id / Meta utm_source / fbclid / fbc / fbp). Persisted into
+          // facebook_campaign_reports under NO_MATCH_CAMPAIGN_ID so the operator
+          // can see leakage; the read-side service strips it from totals on both
+          // dashboards so it never inflates either rollup's numbers.
+          retry(() =>
+            facebookCampaignReportRepository.incrementClick({
+              campaign_id: NO_MATCH_CAMPAIGN_ID,
+              campaign_name: NO_MATCH_CAMPAIGN_NAME,
+              source: 'no_match',
+              at: new Date(click.created_at),
+              offer_id: click.offer_id,
+            })
+          ).catch((err: unknown) => {
+            logger.warn('no_match_click_increment_failed', {
+              click_id: click.click_id,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          });
+        }
+      })
+      .catch((err: unknown) => {
+        logger.error('click_persist_failed', {
+          click_id: click.click_id,
+          offer_id: click.offer_id,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
   },
 
   // Builds a click record for the pixel flow. Key differences vs. `build()`:

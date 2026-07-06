@@ -94,6 +94,20 @@ export interface Network {
   // arrive and are persisted as audit-only (verified=true, shadow=true) so we
   // never lose the network's signal — but reporting prefers the API rows.
   postback_api_id?: string;
+  // ── Optional postback authentication (opt-in, per network) ──────────
+  // Most affiliate networks fire postbacks with NO authentication, so both of
+  // these default to "off" and the endpoint stays open for them. Set either to
+  // lock a network down:
+  //   postback_secret        — a shared secret the network must echo back, via
+  //                            ?secret= / ?key= query param, an
+  //                            `X-Postback-Secret` header, or Authorization:
+  //                            Bearer <secret>. Compared in constant time.
+  //   postback_ip_allowlist  — source IPs permitted to post for this network.
+  //                            When non-empty, requests from any other IP (or
+  //                            with no resolvable IP) are rejected 401.
+  // When both are set, BOTH must pass.
+  postback_secret?: string;
+  postback_ip_allowlist?: string[];
   created_at?: string;
   updated_at?: string;
 }
