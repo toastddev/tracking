@@ -1,0 +1,38 @@
+{
+  "displayName": "tracking-backend ERROR",
+  "combiner": "OR",
+  "enabled": true,
+  "severity": "ERROR",
+  "conditions": [
+    {
+      "name": "projects/toastd/alertPolicies/9006970433564962812/conditions/9006970433564959239",
+      "displayName": "Log match condition",
+      "conditionMatchedLog": {
+        "filter": "resource.type=\"cloud_run_revision\"\nresource.labels.service_name=\"tracking-backend\"\nseverity=\"ERROR\"",
+        "labelExtractors": {
+          "event": "EXTRACT(jsonPayload.msg)",
+          "detail": "EXTRACT(jsonPayload.\"error.message\")",
+          "api_id": "EXTRACT(jsonPayload.api_id)",
+          "run_id": "EXTRACT(jsonPayload.run_id)",
+          "click_id": "EXTRACT(jsonPayload.click_id)",
+          "conversion_id": "EXTRACT(jsonPayload.conversion_id)",
+          "http_status": "EXTRACT(httpRequest.status)",
+          "http_url": "EXTRACT(httpRequest.requestUrl)"
+        }
+      }
+    }
+  ],
+  "alertStrategy": {
+    "autoClose": "604800s",
+    "notificationPrompts": ["OPENED"],
+    "notificationRateLimit": { "period": "300s" }
+  },
+  "notificationChannels": [
+    "projects/toastd/notificationChannels/7140300826184736576"
+  ],
+  "documentation": {
+    "mimeType": "text/markdown",
+    "subject": "${log.extracted_label.event} on tracking-backend",
+    "content": "event: ${log.extracted_label.event}\ndetail: ${log.extracted_label.detail}\napi: ${log.extracted_label.api_id}\nrun: ${log.extracted_label.run_id}\nclick: ${log.extracted_label.click_id}\nconversion: ${log.extracted_label.conversion_id}\nstatus: ${log.extracted_label.http_status}\nurl: ${log.extracted_label.http_url}\nrevision: ${resource.label.revision_name}"
+  }
+}

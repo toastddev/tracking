@@ -1,0 +1,36 @@
+{
+  "displayName": "tracking-backend CRITICAL",
+  "combiner": "OR",
+  "enabled": true,
+  "severity": "CRITICAL",
+  "conditions": [
+    {
+      "name": "projects/toastd/alertPolicies/7449006349144570938/conditions/7449006349144571879",
+      "displayName": "Log match condition",
+      "conditionMatchedLog": {
+        "filter": "resource.type=\"cloud_run_revision\"\nresource.labels.service_name=\"tracking-backend\"\nseverity=\"CRITICAL\"",
+        "labelExtractors": {
+          "event": "EXTRACT(jsonPayload.msg)",
+          "detail": "EXTRACT(jsonPayload.\"error.message\")",
+          "error_name": "EXTRACT(jsonPayload.\"error.name\")",
+          "api_id": "EXTRACT(jsonPayload.api_id)",
+          "run_id": "EXTRACT(jsonPayload.run_id)"
+        }
+      }
+    }
+  ],
+  "alertStrategy": {
+    "autoClose": "604800s",
+    "notificationPrompts": ["OPENED"],
+    "notificationRateLimit": { "period": "300s" }
+  },
+  "notificationChannels": [
+    "projects/toastd/notificationChannels/7140300826184736576",
+    "projects/toastd/notificationChannels/10988237065889054851"
+  ],
+  "documentation": {
+    "mimeType": "text/markdown",
+    "subject": "${log.extracted_label.event} on tracking-backend",
+    "content": "event: ${log.extracted_label.event}\ntype: ${log.extracted_label.error_name}\ndetail: ${log.extracted_label.detail}\napi: ${log.extracted_label.api_id}\nrun: ${log.extracted_label.run_id}\nrevision: ${resource.label.revision_name}"
+  }
+}

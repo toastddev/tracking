@@ -1,0 +1,38 @@
+{
+  "displayName": "tracking-backend WARNING",
+  "combiner": "OR",
+  "enabled": true,
+  "severity": "WARNING",
+  "conditions": [
+    {
+      "name": "projects/toastd/alertPolicies/16358487569254348371/conditions/16358487569254348766",
+      "displayName": "Log match condition",
+      "conditionMatchedLog": {
+        "filter": "resource.type=\"cloud_run_revision\"\nresource.labels.service_name=\"tracking-backend\"\nseverity=\"WARNING\"",
+        "labelExtractors": {
+          "event": "EXTRACT(jsonPayload.msg)",
+          "detail": "EXTRACT(jsonPayload.\"error.message\")",
+          "network_id": "EXTRACT(jsonPayload.network_id)",
+          "reason": "EXTRACT(jsonPayload.reason)",
+          "http_method": "EXTRACT(httpRequest.requestMethod)",
+          "http_status": "EXTRACT(httpRequest.status)",
+          "http_url": "EXTRACT(httpRequest.requestUrl)",
+          "remote_ip": "EXTRACT(httpRequest.remoteIp)"
+        }
+      }
+    }
+  ],
+  "alertStrategy": {
+    "autoClose": "604800s",
+    "notificationPrompts": ["OPENED"],
+    "notificationRateLimit": { "period": "3600s" }
+  },
+  "notificationChannels": [
+    "projects/toastd/notificationChannels/7140300826184736576"
+  ],
+  "documentation": {
+    "mimeType": "text/markdown",
+    "subject": "${log.extracted_label.event} on tracking-backend",
+    "content": "event: ${log.extracted_label.event}\ndetail: ${log.extracted_label.detail}\nnetwork: ${log.extracted_label.network_id}\nreason: ${log.extracted_label.reason}\nmethod: ${log.extracted_label.http_method}\nstatus: ${log.extracted_label.http_status}\nurl: ${log.extracted_label.http_url}\nfrom: ${log.extracted_label.remote_ip}\nrevision: ${resource.label.revision_name}"
+  }
+}
