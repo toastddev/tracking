@@ -1,6 +1,7 @@
 import { serve } from '@hono/node-server';
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
+import { rootRoutes } from './routes/root';
 import { trackRoutes } from './routes/track';
 import { pixelRoutes } from './routes/pixel';
 import { postbackRoutes } from './routes/postback';
@@ -64,6 +65,7 @@ app.use(
   })
 );
 
+app.route('/', rootRoutes);
 app.route('/', healthRoutes);
 app.route('/', trackRoutes);
 app.route('/', pixelRoutes);
