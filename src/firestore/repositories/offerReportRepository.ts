@@ -2,6 +2,8 @@ import { FieldValue, Timestamp } from 'firebase-admin/firestore';
 import { db } from '../config';
 import { COLLECTIONS } from '../schema';
 import { TTLCache } from '../../utils/ttlCache';
+import { logger } from '../../utils/logger';
+import { toUsd, defaultConversionCurrency } from '../../utils/fxRates';
 import type { VerificationReason } from '../../types';
 
 // 60s read-through cache for fetchRange. The /reports page fires multiple
@@ -24,7 +26,12 @@ export interface OfferReportDoc {
   postbacks: number;     // verified + unverified, excluding shadow rows
   conversions: number;   // verified only
   unverified: number;    // postbacks - conversions
-  revenue: number;       // sum of payout for verified
+  // Sum of payout for verified rows, normalised to USD. Networks pay in mixed
+  // currencies (most in USD, AliExpress in CNY) — the raw payout is NEVER
+  // summed directly, or a ¥100 payout would add the same as a $100 one.
+  // Campaign reports use INR for the same reason; offer / postback surfaces
+  // stay USD, which is what the frontend's fmtMoney renders.
+  revenue: number;
   approved: number;      // verified with status approved
   pending: number;       // verified with status pending
   rejected: number;      // verified with status rejected
@@ -59,6 +66,38 @@ function dayKeyUTC(d: Date): string {
   return d.toISOString().slice(0, 10);
 }
 
+// Throttled warn so one network sending an unratable currency doesn't flood
+// the logs (WARN routes to Telegram) while still surfacing the problem once.
+const fxWarnCache = new Set<string>();
+
+// Converts a payout into USD for storage on offer_reports. Returns null when
+// the currency has no configured rate — the caller then skips the increment
+// rather than adding a foreign-denominated number into a USD total.
+//
+// An empty currency means a pre-fix historical row: treat it as the global
+// default, which is exactly what the old code silently assumed.
+function payoutToUsd(
+  payout: number,
+  currency: string | undefined,
+  offer_id: string,
+): number | null {
+  const code = (currency ?? '').trim() || defaultConversionCurrency();
+  const usd = toUsd(payout, code);
+  if (usd == null) {
+    const key = `offer_revenue_fx:${code}`;
+    if (!fxWarnCache.has(key)) {
+      fxWarnCache.add(key);
+      logger.warn('offer_revenue_fx_missing', {
+        currency: code,
+        offer_id,
+        hint: 'Add this code to FX_RATES in src/utils/fxRates.constants.ts (units per USD).',
+      });
+    }
+    return null;
+  }
+  return usd;
+}
+
 export interface IncrementClickInput {
   offer_id: string;
   at: Date;
@@ -71,6 +110,11 @@ export interface IncrementConversionInput {
   verified: boolean;
   status?: string;
   payout?: number;
+  // ISO-4217 code the payout is denominated in. Resolved at ingestion (see
+  // resolveConversionCurrency), so it's populated on every new conversion.
+  // Missing on pre-fix historical rows — those are treated as the global
+  // default, which is what they were implicitly assumed to be anyway.
+  currency?: string;
   // When 'unknown_click_id', the row is counted toward
   // unknown_click_conversions / unknown_click_revenue (in addition to the
   // existing `unverified` counter) so reports can call it out distinctly.
@@ -117,20 +161,20 @@ export const offerReportRepository = {
       postbacks: FieldValue.increment(1),
       updated_at: FieldValue.serverTimestamp(),
     };
+    const usd =
+      typeof input.payout === 'number' && Number.isFinite(input.payout)
+        ? payoutToUsd(input.payout, input.currency, input.offer_id)
+        : null;
     if (input.verified) {
       patch.conversions = FieldValue.increment(1);
-      if (typeof input.payout === 'number' && Number.isFinite(input.payout)) {
-        patch.revenue = FieldValue.increment(input.payout);
-      }
+      if (usd != null) patch.revenue = FieldValue.increment(usd);
       const bucket = statusBucket(input.status);
       patch[bucket] = FieldValue.increment(1);
     } else {
       patch.unverified = FieldValue.increment(1);
       if (input.verification_reason === 'unknown_click_id') {
         patch.unknown_click_conversions = FieldValue.increment(1);
-        if (typeof input.payout === 'number' && Number.isFinite(input.payout)) {
-          patch.unknown_click_revenue = FieldValue.increment(input.payout);
-        }
+        if (usd != null) patch.unknown_click_revenue = FieldValue.increment(usd);
       }
     }
     await ref.set(patch, { merge: true });
@@ -179,16 +223,20 @@ export const offerReportRepository = {
         buckets.set(key, b);
       }
       b.postbacks += 1;
+      const usd =
+        typeof r.payout === 'number' && Number.isFinite(r.payout)
+          ? payoutToUsd(r.payout, r.currency, r.offer_id)
+          : null;
       if (r.verified) {
         b.conversions += 1;
-        if (typeof r.payout === 'number' && Number.isFinite(r.payout)) b.revenue += r.payout;
+        if (usd != null) b.revenue += usd;
         const sb = statusBucket(r.status);
         b[sb] += 1;
       } else {
         b.unverified += 1;
         if (r.verification_reason === 'unknown_click_id') {
           b.unknown_click_conversions += 1;
-          if (typeof r.payout === 'number' && Number.isFinite(r.payout)) b.unknown_click_revenue += r.payout;
+          if (usd != null) b.unknown_click_revenue += usd;
         }
       }
     }

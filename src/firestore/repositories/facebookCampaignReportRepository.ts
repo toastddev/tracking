@@ -2,7 +2,7 @@ import { FieldValue, Timestamp } from 'firebase-admin/firestore';
 import { db } from '../config';
 import { COLLECTIONS } from '../schema';
 import { TTLCache } from '../../utils/ttlCache';
-import { toInr } from '../../utils/fxRates';
+import { toInr, defaultConversionCurrency } from '../../utils/fxRates';
 import { logger } from '../../utils/logger';
 
 // Per-campaign daily rollup for FACEBOOK ads — separate collection from
@@ -426,7 +426,7 @@ function payoutToInr(
   currency: string | undefined,
   campaign_id: string,
 ): number | null {
-  const code = (currency ?? '').toUpperCase().trim() || 'USD';
+  const code = (currency ?? '').trim() || defaultConversionCurrency();
   const inr = toInr(payout, code);
   if (inr == null) {
     const key = `fb_campaign_revenue_fx:${code}`;
@@ -435,7 +435,7 @@ function payoutToInr(
       logger.warn('fb_campaign_revenue_fx_missing', {
         currency: code,
         campaign_id,
-        hint: 'Set GOOGLE_ADS_FX_RATES env var (e.g. INR:93,EUR:100) for this code.',
+        hint: 'Add this code to FX_RATES in src/utils/fxRates.constants.ts (units per USD).',
       });
     }
     return null;

@@ -1,5 +1,6 @@
 import { networkRepository, conversionRepository, drilldownRepository, offerRepository } from '../firestore';
 import type { ConversionRecord } from '../types';
+import { toUsd, defaultConversionCurrency } from '../utils/fxRates';
 
 // A postback drill-down is much cheaper than an offer drill-down because we
 // don't need raw clicks — every signal lives on the conversion document
@@ -256,6 +257,18 @@ function percentile(sorted: number[], p: number): number | null {
 
 type ConvForReport = Awaited<ReturnType<typeof conversionRepository.fetchRange>>[number];
 
+// Postback report money is USD, matching offer_reports. Payouts arrive in mixed
+// currencies (most networks USD, AliExpress CNY), so each row is converted
+// before it joins a total — summing raw payouts would add a ¥100 row as if it
+// were $100. Rows whose currency has no configured rate contribute 0 rather
+// than a face-value number.
+function payoutUsd(r: ConvForReport): number {
+  const raw = r.payout ?? 0;
+  if (!Number.isFinite(raw) || raw === 0) return 0;
+  const code = (r.currency ?? '').trim() || defaultConversionCurrency();
+  return toUsd(raw, code) ?? 0;
+}
+
 function summarise(rows: ConvForReport[]): PostbackDetailSummary {
   let postbacks = 0, verified = 0, unverified = 0, approved = 0, pending = 0, rejected = 0, revenue = 0;
   const offers = new Set<string>();
@@ -269,7 +282,7 @@ function summarise(rows: ConvForReport[]): PostbackDetailSummary {
       if (bucket === 'approved') approved += 1;
       else if (bucket === 'pending') pending += 1;
       else rejected += 1;
-      revenue += r.payout ?? 0;
+      revenue += payoutUsd(r);
       if (r.offer_id) offers.add(r.offer_id);
       if (r.click_id) matchedClickIds.set(r.click_id, (matchedClickIds.get(r.click_id) ?? 0) + 1);
     } else {
@@ -317,7 +330,7 @@ function buildSeries(rows: ConvForReport[], from: Date, to: Date): PostbackDetai
       if (b === 'approved') p.approved += 1;
       else if (b === 'pending') p.pending += 1;
       else p.rejected += 1;
-      p.revenue += r.payout ?? 0;
+      p.revenue += payoutUsd(r);
     } else {
       p.unverified += 1;
     }

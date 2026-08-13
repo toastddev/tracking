@@ -16,7 +16,13 @@ import { googleAdsForwardingService } from './googleAdsForwardingService';
 import { facebookForwardingService } from './facebookForwardingService';
 import { eventDate } from './eventTime';
 import { retry } from '../utils/retry';
+import { resolveConversionCurrency } from '../utils/fxRates';
 import type { ConversionRecord, Network, VerificationReason } from '../types';
+
+// Networks we've already warned about for missing currency config. Throttled
+// so a misconfigured network logs once per process rather than once per
+// postback (WARN routes to Telegram).
+const currencyWarnCache = new Set<string>();
 
 export interface PostbackInput {
   network_id: string;
@@ -93,6 +99,24 @@ export const postbackService = {
     const mapped = applyMapping(network, input.raw);
     if (!mapped.click_id) return { ok: false, reason: 'missing_click_id' };
 
+    // Normalise the currency ONCE, here at the boundary, so every downstream
+    // consumer (offer/campaign reports, Google Ads, Meta) can trust
+    // `conversion.currency` instead of re-guessing. Falling through to the
+    // global default on a network that doesn't pay in it is the silent
+    // mis-pricing path, so warn (throttled) when that happens.
+    const resolvedCurrency = resolveConversionCurrency(mapped.currency, network.default_currency);
+    if (resolvedCurrency.source === 'global_default') {
+      const key = `postback_currency:${network.network_id}`;
+      if (!currencyWarnCache.has(key)) {
+        currencyWarnCache.add(key);
+        logger.warn('postback_currency_assumed_default', {
+          network_id: network.network_id,
+          assumed_currency: resolvedCurrency.currency,
+          hint: 'Network sent no currency param. Set default_currency on this network if it does not pay in this currency.',
+        });
+      }
+    }
+
     // Click verification: look the click_id up in Firestore. Even when it
     // doesn't resolve we still persist the conversion (verified: false) so
     // the audit trail captures every postback the network sent us.
@@ -125,7 +149,7 @@ export const postbackService = {
       click_id: mapped.click_id,
       offer_id: click?.offer_id,
       payout: mapped.payout,
-      currency: mapped.currency,
+      currency: resolvedCurrency.currency,
       status: mapped.status ?? network.default_status ?? 'approved',
       txn_id: mapped.txn_id,
       network_timestamp: mapped.network_timestamp,
@@ -173,6 +197,7 @@ export const postbackService = {
             verified: conv.verified,
             status: conv.status,
             payout: conv.payout,
+            currency: conv.currency,
             verification_reason: conv.verification_reason,
           }),
         );

@@ -3,7 +3,7 @@ import { db } from '../../firestore/config';
 import { COLLECTIONS } from '../../firestore/schema';
 import { NO_MATCH_CAMPAIGN_ID, NO_MATCH_CAMPAIGN_NAME } from '../../firestore';
 import { logger } from '../../utils/logger';
-import { toInr } from '../../utils/fxRates';
+import { toInr, defaultConversionCurrency } from '../../utils/fxRates';
 import { eventDateFromRaw } from '../eventTime';
 import { hasAnyUtmParamRaw, FB_UTM_SOURCES } from '../facebookCampaignExtractor';
 import { extractCampaign as extractGadsCampaign } from './googleAdsCampaignHandler';
@@ -154,7 +154,7 @@ export function createFacebookCampaignHandler(): ReconcilerHandler {
   };
 
   function payoutToInr(payout: number, currency: string | undefined): number | null {
-    const code = (currency ?? '').toUpperCase().trim() || 'USD';
+    const code = (currency ?? '').trim() || defaultConversionCurrency();
     const inr = toInr(payout, code);
     if (inr == null) {
       revenue_fx_skipped += 1;
@@ -163,7 +163,7 @@ export function createFacebookCampaignHandler(): ReconcilerHandler {
         fxWarnCache.add(key);
         logger.warn('fb_campaign_backfill_revenue_fx_missing', {
           currency: code,
-          hint: 'Set GOOGLE_ADS_FX_RATES env var (e.g. INR:93,EUR:100) for this code.',
+          hint: 'Add this code to FX_RATES in src/utils/fxRates.constants.ts (units per USD).',
         });
       }
       return null;
@@ -175,7 +175,7 @@ export function createFacebookCampaignHandler(): ReconcilerHandler {
     const offer_id = (rawConv.offer_id as string | undefined) || meta.offer_id || 'unknown';
     const payout = typeof rawConv.payout === 'number' ? rawConv.payout : 0;
     const currencyRaw = (rawConv.currency as string | undefined) || '';
-    const currency = currencyRaw.trim() || 'USD';
+    const currency = currencyRaw.trim() || defaultConversionCurrency();
     const status = rawConv.status as string | undefined;
     const b = bucketFor(meta.campaign_id, meta.source, eventDay);
     if (meta.campaign_name && !b.campaign_name) b.campaign_name = meta.campaign_name;

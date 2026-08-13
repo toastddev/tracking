@@ -7,7 +7,7 @@ import { facebookGraphApi, buildGraphUrl, FacebookGraphError } from './facebookG
 import { decryptSecret } from '../utils/crypto';
 import { eventDate } from './eventTime';
 import { logger } from '../utils/logger';
-import { convertCurrency } from '../utils/fxRates';
+import { resolveUploadMoney, normalizeCurrency } from '../utils/fxRates';
 import { isMetaUtmSource } from './facebookCampaignExtractor';
 import type { ClickRecord, ConversionRecord } from '../types';
 import type {
@@ -23,7 +23,8 @@ import type {
 //   - event_id is Meta's dedupe key — we reuse conversion.conversion_id /
 //     `click_${click_id}` exactly like GAds order_id
 //   - Identifier preference: fbc > fbclid (synth fbc) > fbp
-//   - Money: convertCurrency from META_UPLOAD_CURRENCY env (default USD)
+//   - Money: resolveUploadMoney into META_UPLOAD_CURRENCY, else the ad
+//     account's own currency
 //   - Auth failure heuristic: Meta error code 190 / OAuthException
 //
 // The public API (`dispatchConversion`, `dispatchClick`, `dispatchConversionsBatch`,
@@ -82,41 +83,62 @@ function pickFbIdentifier(click: ClickRecord): IdentifierPick | null {
   return null;
 }
 
-function uploadCurrency(): string {
-  const code = (process.env.META_UPLOAD_CURRENCY ?? 'USD').trim().toUpperCase();
-  return /^[A-Z]{3}$/.test(code) ? code : 'USD';
+// Throttled so a single unratable currency logs once per process instead of
+// once per conversion — WARN routes to the Telegram alert channel.
+const fxWarnCache = new Set<string>();
+
+/**
+ * The currency to upload in, in priority order:
+ *   1. META_UPLOAD_CURRENCY (explicit operator override)
+ *   2. the destination ad account's own currency
+ *
+ * Mirrors uploadCurrencyFor() in googleAdsForwardingService — matching the ad
+ * account's currency means Meta performs no conversion of its own, so Events
+ * Manager and the dashboard show identical values.
+ */
+function uploadCurrencyFor(connection: FacebookConnection): string {
+  return (
+    normalizeCurrency(process.env.META_UPLOAD_CURRENCY) ??
+    normalizeCurrency(connection.currency_code) ??
+    'USD'
+  );
 }
 
 function moneyForUpload(
   conversion: ConversionRecord,
   connection: FacebookConnection
 ): { value: number; currency_code: string } {
-  const sourceValue = conversion.payout ?? 0;
-  const sourceCurrency = (conversion.currency || 'USD').trim().toUpperCase();
-  const target = uploadCurrency();
-  const converted = convertCurrency(sourceValue, sourceCurrency, target);
+  const target = uploadCurrencyFor(connection);
+  const money = resolveUploadMoney(conversion.payout ?? 0, conversion.currency, target);
 
-  if (converted) {
-    if (converted.currency !== sourceCurrency) {
+  if (money.ok) {
+    if (money.converted) {
       logger.info('fb_conversion_value_converted', {
         conversion_id: conversion.conversion_id,
-        from_currency: sourceCurrency,
-        to_currency: converted.currency,
-        from_value: sourceValue,
-        to_value: converted.amount,
+        from_currency: conversion.currency,
+        to_currency: money.currency,
+        from_value: conversion.payout ?? 0,
+        to_value: money.value,
         connection_id: connection.connection_id,
       });
     }
-    return { value: converted.amount, currency_code: converted.currency };
+    return { value: money.value, currency_code: money.currency };
   }
 
-  logger.warn('fb_conversion_value_fx_missing', {
-    conversion_id: conversion.conversion_id,
-    from_currency: sourceCurrency,
-    to_currency: target,
-    connection_id: connection.connection_id,
-  });
-  return { value: sourceValue, currency_code: sourceCurrency };
+  // No rate for this pair — send the untouched source amount under its TRUE
+  // source currency and let Meta convert. Approximate, but never mislabelled.
+  const key = `fb_fx:${money.currency}->${target}`;
+  if (!fxWarnCache.has(key)) {
+    fxWarnCache.add(key);
+    logger.warn('fb_conversion_value_fx_missing', {
+      from_currency: money.currency,
+      to_currency: target,
+      connection_id: connection.connection_id,
+      effect: 'uploaded in source currency; Meta will convert at its own daily rate',
+      hint: `Add ${money.currency} to FX_RATES in src/utils/fxRates.constants.ts so the dashboard and Meta agree.`,
+    });
+  }
+  return { value: money.value, currency_code: money.currency };
 }
 
 // Re-interpret network_timestamp in the network's reported timezone before

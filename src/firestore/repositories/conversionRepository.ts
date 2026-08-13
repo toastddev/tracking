@@ -340,6 +340,11 @@ export const conversionRepository = {
     return snap.data().count;
   },
 
+  // CURRENCY-UNSAFE — currently unused. Firestore's server-side sum() adds the
+  // raw `payout` field across whatever currencies the rows happen to be in, so
+  // a ¥100 row contributes the same as a $100 one. Do not wire this into a
+  // report: convert per row (see offerReportRepository.payoutToUsd) or read a
+  // pre-normalised rollup instead.
   async sumPayout(opts: ConversionRangeOptions): Promise<number> {
     let query: FirebaseFirestore.Query = db().collection(COLLECTIONS.CONVERSIONS);
     if (opts.network_id) query = query.where('network_id', '==', opts.network_id);

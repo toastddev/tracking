@@ -2,6 +2,7 @@ import { FieldValue } from 'firebase-admin/firestore';
 import { db } from '../../firestore/config';
 import { COLLECTIONS } from '../../firestore/schema';
 import { logger } from '../../utils/logger';
+import { toUsd, defaultConversionCurrency } from '../../utils/fxRates';
 import { eventDateFromRaw } from '../eventTime';
 import {
   dayKeyUTC,
@@ -45,11 +46,15 @@ function emptyBucket(offer_id: string, network_id: string, date: string): Bucket
   };
 }
 
+// Throttled across the whole run — one line per unratable currency.
+const fxWarnCache = new Set<string>();
+
 export function createOfferReportsHandler(): ReconcilerHandler {
   const buckets = new Map<string, Bucket>();
   let window: ReconcilerWindow | null = null;
   let existing_buckets_scanned = 0;
   let conversions_scanned = 0;
+  let revenue_fx_skipped = 0;
   let truncated = false;
   let truncated_reason: string | undefined;
   const started = Date.now();
@@ -60,6 +65,27 @@ export function createOfferReportsHandler(): ReconcilerHandler {
     if (!b) { b = emptyBucket(offer_id, network_id, date); buckets.set(key, b); }
     return b;
   };
+
+  // offer_reports.revenue is canonically USD. Payouts arrive in mixed
+  // currencies, so every one is converted before it joins the total —
+  // summing raw payouts would add a ¥100 row as if it were $100.
+  function payoutToUsd(payout: number, currency: string | undefined): number | null {
+    const code = (currency ?? '').trim() || defaultConversionCurrency();
+    const usd = toUsd(payout, code);
+    if (usd == null) {
+      revenue_fx_skipped += 1;
+      const key = `offer_backfill_fx:${code}`;
+      if (!fxWarnCache.has(key)) {
+        fxWarnCache.add(key);
+        logger.warn('offer_reports_backfill_revenue_fx_missing', {
+          currency: code,
+          hint: 'Add this code to FX_RATES in src/utils/fxRates.constants.ts (units per USD).',
+        });
+      }
+      return null;
+    }
+    return usd;
+  }
 
   return {
     name: 'offer_reports',
@@ -127,18 +153,20 @@ export function createOfferReportsHandler(): ReconcilerHandler {
       const status = raw.status as string | undefined;
       const network_id = (raw.network_id as string | undefined) || 'none';
       const verification_reason = raw.verification_reason as string | undefined;
+      const currency = (raw.currency as string | undefined) || '';
+      const usd = Number.isFinite(payout) ? payoutToUsd(payout, currency) : null;
 
       const b = bucketFor(offer_id, network_id, eventDay);
       b.postbacks += 1;
       if (verified) {
         b.conversions += 1;
-        if (Number.isFinite(payout)) b.revenue += payout;
+        if (usd != null) b.revenue += usd;
         b[statusBucket(status)] += 1;
       } else {
         b.unverified += 1;
         if (verification_reason === 'unknown_click_id') {
           b.unknown_click_conversions += 1;
-          if (Number.isFinite(payout)) b.unknown_click_revenue += payout;
+          if (usd != null) b.unknown_click_revenue += usd;
         }
       }
       conversions_scanned += 1;
@@ -204,6 +232,7 @@ export function createOfferReportsHandler(): ReconcilerHandler {
         buckets_written,
         conversions_scanned,
         existing_buckets_scanned,
+        revenue_fx_skipped,
         duration_ms: Date.now() - started,
       };
     },

@@ -2,7 +2,7 @@ import { FieldValue, Timestamp } from 'firebase-admin/firestore';
 import { db } from '../config';
 import { COLLECTIONS } from '../schema';
 import { TTLCache } from '../../utils/ttlCache';
-import { toInr } from '../../utils/fxRates';
+import { toInr, defaultConversionCurrency } from '../../utils/fxRates';
 import { logger } from '../../utils/logger';
 
 // 60s read-through cache for fetchRange. Mirrors offerReportRepository — see
@@ -440,18 +440,20 @@ function numOr0(v: unknown): number {
 const fxWarnCache = new Set<string>();
 
 // Converts a postback/API payout into INR for storage on campaign_reports.
-// Postback/affiliate-API payouts are USD by system convention (offer_reports
-// store them raw, in USD). Campaign revenue is canonically INR, so an
-// empty / missing currency is treated as USD here — otherwise toInr would
-// short-circuit and leave the raw USD figure sitting in the INR-denominated
-// `revenue` field (the exact regression that bit us when the reconciler tick
-// kept reverting the field back to USD-as-INR).
+// Campaign revenue is canonically INR, so the raw payout must never land in
+// `revenue` untouched (the exact regression that bit us when the reconciler
+// tick kept reverting the field back to USD-as-INR).
+//
+// New conversions always carry a resolved currency (see
+// resolveConversionCurrency at the ingestion boundary). An empty currency here
+// means a pre-fix historical row, which is treated as the global default —
+// precisely what the old code implicitly assumed it was.
 function payoutToInr(
   payout: number,
   currency: string | undefined,
   campaign_id: string,
 ): number | null {
-  const code = (currency ?? '').toUpperCase().trim() || 'USD';
+  const code = (currency ?? '').trim() || defaultConversionCurrency();
   const inr = toInr(payout, code);
   if (inr == null) {
     const key = `campaign_revenue_fx:${code}`;
@@ -460,7 +462,7 @@ function payoutToInr(
       logger.warn('campaign_revenue_fx_missing', {
         currency: code,
         campaign_id,
-        hint: 'Set GOOGLE_ADS_FX_RATES env var (e.g. INR:93,EUR:100) for this code.',
+        hint: 'Add this code to FX_RATES in src/utils/fxRates.constants.ts (units per USD).',
       });
     }
     return null;

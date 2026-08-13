@@ -347,7 +347,7 @@ export const campaignReportsService = {
         if (!fxWarnedCurrencies.has('USD')) {
           fxWarnedCurrencies.add('USD');
           logger.warn('campaign_reports_daily_total_fx_missing', {
-            hint: 'Set GOOGLE_ADS_FX_RATES env var (e.g. INR:93,EUR:100) for USD→INR conversion.',
+            hint: 'Set INR in FX_RATES (src/utils/fxRates.constants.ts) for USD→INR conversion.',
           });
         }
       } else {

@@ -3,9 +3,27 @@ import { db } from '../config';
 import { COLLECTIONS } from '../schema';
 import type { ClickRecord, ConversionRecord } from '../../types';
 import { eventDate } from '../../services/eventTime';
+import { toUsd, defaultConversionCurrency } from '../../utils/fxRates';
 
 function dayKeyUTC(d: Date): string {
   return d.toISOString().slice(0, 10);
+}
+
+// Drilldown revenue (per affiliate / country / ad platform / sub-id) and the
+// payout histogram are denominated in USD, matching offer_reports. Payouts
+// arrive in mixed currencies, so convert before bucketing — otherwise a ¥100
+// row lands in the same histogram bucket as a $100 one and inflates every
+// breakdown it touches.
+//
+// Returns 0 when the currency has no configured rate: the conversion still
+// counts, but its money is left out rather than added at face value. The
+// no-rate case is already warned about (throttled) by the offer_reports path
+// that runs alongside this one.
+function payoutUsd(conv: ConversionRecord): number {
+  const raw = typeof conv.payout === 'number' && Number.isFinite(conv.payout) ? conv.payout : 0;
+  if (raw === 0) return 0;
+  const code = (conv.currency ?? '').trim() || defaultConversionCurrency();
+  return toUsd(raw, code) ?? 0;
 }
 
 function detectAdPlatform(ad_ids: Record<string, string | undefined> | undefined): string {
@@ -129,7 +147,7 @@ export const drilldownRepository = {
     };
 
     const verified = conv.verified;
-    const payout = typeof conv.payout === 'number' ? conv.payout : 0;
+    const payout = payoutUsd(conv);
 
     if (verified && click) {
       const aff_id = truncateKey(click.aff_id, '(none)');
@@ -195,7 +213,7 @@ export const drilldownRepository = {
     const src = conv.source === 'postback' || conv.source === 'api' ? conv.source : 'unknown';
     const method = conv.method === 'GET' || conv.method === 'POST' ? conv.method : 'unknown';
     const verified = conv.verified;
-    const payout = typeof conv.payout === 'number' ? conv.payout : 0;
+    const payout = payoutUsd(conv);
     const status = statusBucket(conv.status);
 
     const dow = date.getUTCDay();

@@ -24,6 +24,7 @@ import { refreshService } from '../services/refreshService';
 import { dataResetService } from '../services/dataResetService';
 import { logger } from '../utils/logger';
 import { csvEscape } from '../utils/csv';
+import { normalizeCurrency } from '../utils/fxRates';
 
 // Campaign IDs are external (Google Ads, UTM tags) so they can contain a
 // wider set of characters than our internal isValidId regex allows. Restrict
@@ -368,9 +369,18 @@ export const adminController = {
       mapping_timestamp: body.mapping_timestamp ? String(body.mapping_timestamp).trim() : undefined,
       extra_mappings: extras.value,
       default_status: body.default_status ? String(body.default_status).trim() : undefined,
+      default_currency: undefined as string | undefined,
       postback_api_id: body.postback_api_id ? String(body.postback_api_id).trim() : undefined,
       postback_timezone: undefined as string | undefined,
     };
+
+    // default_currency: validated to ISO-4217 so a typo can't become the
+    // assumed currency for every conversion this network sends.
+    if (typeof body.default_currency === 'string' && body.default_currency.trim()) {
+      const code = normalizeCurrency(body.default_currency);
+      if (!code) return c.json({ error: 'invalid_default_currency' }, 400);
+      data.default_currency = code;
+    }
 
     // Validate and set postback_timezone (IANA tz for Google Ads upload only).
     if (typeof body.postback_timezone === 'string' && body.postback_timezone.trim()) {
@@ -418,6 +428,18 @@ export const adminController = {
         patch.postback_timezone = raw;
       } else {
         patch.postback_timezone = undefined;
+      }
+    }
+
+    // default_currency: same set-or-clear shape, validated to ISO-4217.
+    if ('default_currency' in body) {
+      const raw = typeof body.default_currency === 'string' ? body.default_currency.trim() : '';
+      if (raw) {
+        const code = normalizeCurrency(raw);
+        if (!code) return c.json({ error: 'invalid_default_currency' }, 400);
+        patch.default_currency = code;
+      } else {
+        patch.default_currency = undefined;
       }
     }
     for (const f of fields) {

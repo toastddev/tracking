@@ -4,6 +4,7 @@ import { affiliateApiScheduler } from '../services/affiliateApiScheduler';
 import { runAffiliateApi } from '../services/affiliateApiSyncService';
 import { encryptSecret } from '../utils/crypto';
 import { logger } from '../utils/logger';
+import { normalizeCurrency } from '../utils/fxRates';
 import type {
   AffiliateApi,
   AffiliateApiAuthConfig,
@@ -171,6 +172,9 @@ function parseMapping(raw: unknown): { ok: true; value: AffiliateApiMapping } | 
       event_time_path: asString(m.event_time_path),
       status_map,
       default_status: asString(m.default_status),
+      // Normalised (and validated) so an operator typo like "rmb" or "¥" can
+      // never reach the ingestion path as a bogus currency code.
+      default_currency: normalizeCurrency(asString(m.default_currency)) ?? undefined,
     },
   };
 }

@@ -20,6 +20,7 @@ import { googleAdsForwardingService } from './googleAdsForwardingService';
 import { facebookForwardingService } from './facebookForwardingService';
 import { eventDate } from './eventTime';
 import { retry } from '../utils/retry';
+import { resolveConversionCurrency } from '../utils/fxRates';
 import type {
   AffiliateApi,
   AffiliateApiAuthConfig,
@@ -336,6 +337,11 @@ function buildHeaders(api: AffiliateApi): Record<string, string> {
   return headers;
 }
 
+// APIs we've already warned about for missing currency config. Throttled so a
+// misconfigured API logs once per process, not once per synced row (WARN
+// routes to Telegram).
+const currencyWarnCache = new Set<string>();
+
 // Map one upstream item → ConversionRecord candidate. Returns null when a
 // required field is missing — counted as failed in the run summary.
 function mapItem(api: AffiliateApi, item: unknown): {
@@ -355,11 +361,29 @@ function mapItem(api: AffiliateApi, item: unknown): {
   const rawStatus = m.status_path ? asString(getPath(item, m.status_path)) : undefined;
   const mappedStatus = rawStatus && m.status_map ? m.status_map[rawStatus] ?? rawStatus : rawStatus;
 
+  // Resolve the currency at the ingestion boundary so `conversion.currency` is
+  // always a valid ISO code downstream. A row with no currency_path configured
+  // (or a path that resolves to nothing) falls back to the API's
+  // default_currency, then to the global default — see resolveConversionCurrency.
+  const rawCurrency = m.currency_path ? asString(getPath(item, m.currency_path)) : undefined;
+  const resolvedCurrency = resolveConversionCurrency(rawCurrency, m.default_currency);
+  if (resolvedCurrency.source === 'global_default') {
+    const key = `aff_api_currency:${api.api_id}`;
+    if (!currencyWarnCache.has(key)) {
+      currencyWarnCache.add(key);
+      logger.warn('aff_api_currency_assumed_default', {
+        api_id: api.api_id,
+        assumed_currency: resolvedCurrency.currency,
+        hint: 'No currency on the row and no mapping.default_currency set. If this API does not pay in this currency, set default_currency (e.g. CNY for AliExpress).',
+      });
+    }
+  }
+
   return {
     external_id,
     click_id,
     payout: m.payout_path ? asNumber(getPath(item, m.payout_path)) : undefined,
-    currency: m.currency_path ? asString(getPath(item, m.currency_path)) : undefined,
+    currency: resolvedCurrency.currency,
     status: mappedStatus ?? m.default_status,
     txn_id: m.txn_id_path ? asString(getPath(item, m.txn_id_path)) : undefined,
     network_timestamp: m.event_time_path ? asString(getPath(item, m.event_time_path)) : undefined,
@@ -485,6 +509,7 @@ export async function runAffiliateApi(api: AffiliateApi, opts: RunOptions): Prom
             verified: !!b.conv.verified,
             status: b.conv.status,
             payout: b.conv.payout,
+            currency: b.conv.currency,
             verification_reason: b.conv.verification_reason,
           }));
         if (rollupRows.length > 0) {

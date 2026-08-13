@@ -5,7 +5,7 @@ import {
   offerRepository,
   type CampaignReportDoc,
 } from '../firestore';
-import { toInr } from '../utils/fxRates';
+import { toInr, defaultConversionCurrency } from '../utils/fxRates';
 
 // Caps copied from offerReportDetailService — same memory/latency envelope.
 const CLICK_FETCH_CAP = 20_000;
@@ -289,7 +289,7 @@ export const campaignReportDetailService = {
         // convention when no explicit currency is tagged, so default empty
         // currency to USD before converting; raw payouts must not leak into
         // the INR-denominated revenue field.
-        const currency = (conv.currency || '').trim() || 'USD';
+        const currency = (conv.currency || '').trim() || defaultConversionCurrency();
         const inr = toInr(conv.payout, currency);
         if (inr != null) bucket.revenue += inr;
       }

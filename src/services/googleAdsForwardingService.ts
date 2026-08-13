@@ -6,7 +6,7 @@ import {
   googleAdsUploadRepository,
 } from '../firestore';
 import { logger } from '../utils/logger';
-import { convertCurrency } from '../utils/fxRates';
+import { resolveUploadMoney, normalizeCurrency } from '../utils/fxRates';
 import type { ClickRecord, ConversionRecord } from '../types';
 import type {
   GoogleAdsConnection,
@@ -168,51 +168,65 @@ interface UploadContext {
   order_id: string;
 }
 
-function forcedUploadCurrency(): string | undefined {
-  const code = (process.env.GOOGLE_ADS_UPLOAD_CURRENCY ?? '').trim().toUpperCase();
-  return /^[A-Z]{3}$/.test(code) ? code : undefined;
+// Throttled so a single unratable currency logs once per process instead of
+// once per conversion — WARN routes to the Telegram alert channel.
+const fxWarnCache = new Set<string>();
+
+/**
+ * The currency to upload in, in priority order:
+ *   1. GOOGLE_ADS_UPLOAD_CURRENCY (explicit operator override)
+ *   2. the destination account's own currency
+ *
+ * Preferring the account's currency means Google performs no conversion of its
+ * own, so the "Conv. value" column matches the dashboard exactly rather than
+ * drifting with Google's daily rate.
+ */
+function uploadCurrencyFor(connection: GoogleAdsConnection): string {
+  return (
+    normalizeCurrency(process.env.GOOGLE_ADS_UPLOAD_CURRENCY) ??
+    normalizeCurrency(connection.currency_code) ??
+    'USD'
+  );
 }
 
 function moneyForUpload(
   conversion: ConversionRecord,
   connection: GoogleAdsConnection
 ): { conversion_value: number; currency_code: string } {
-  const sourceValue = conversion.payout ?? 0;
-  const sourceCurrency = (conversion.currency || 'USD').trim().toUpperCase();
-  
-  // Priority: 
-  // 1. Forced env var (GOOGLE_ADS_UPLOAD_CURRENCY)
-  // 2. Fallback to USD (Default)
-  const forced = forcedUploadCurrency();
-  const targetCurrency = forced || 'USD';
-  
-  const converted = convertCurrency(sourceValue, sourceCurrency, targetCurrency);
-  
-  if (converted) {
-    if (converted.currency !== sourceCurrency) {
+  const targetCurrency = uploadCurrencyFor(connection);
+  const money = resolveUploadMoney(conversion.payout ?? 0, conversion.currency, targetCurrency);
+
+  if (money.ok) {
+    if (money.converted) {
       logger.info('gads_conversion_value_converted', {
         conversion_id: conversion.conversion_id,
-        from_currency: sourceCurrency,
-        to_currency: converted.currency,
-        from_value: sourceValue,
-        to_value: converted.amount,
+        from_currency: conversion.currency,
+        to_currency: money.currency,
+        from_value: conversion.payout ?? 0,
+        to_value: money.value,
         connection_id: connection.connection_id,
-        forced_env: !!forced,
       });
     }
-    return { conversion_value: converted.amount, currency_code: converted.currency };
+    return { conversion_value: money.value, currency_code: money.currency };
   }
 
-  // If conversion failed (missing rate), we default to USD only if the source was USD.
-  // Otherwise, we send the source currency and hope Google Ads handles it.
-  logger.warn('gads_conversion_value_fx_missing', {
-    conversion_id: conversion.conversion_id,
-    from_currency: sourceCurrency,
-    to_currency: targetCurrency,
-    connection_id: connection.connection_id,
-  });
-  
-  return { conversion_value: sourceValue, currency_code: sourceCurrency };
+  // No rate for this pair. Upload the untouched source amount labelled with its
+  // TRUE source currency and let Google apply its own daily rate — approximate,
+  // but never mislabelled. The one thing we must never do is ship a value
+  // scaled to one currency under another currency's code; Google can't detect
+  // that and silently reports a wrong number.
+  const key = `gads_fx:${money.currency}->${targetCurrency}`;
+  if (!fxWarnCache.has(key)) {
+    fxWarnCache.add(key);
+    logger.warn('gads_conversion_value_fx_missing', {
+      from_currency: money.currency,
+      to_currency: targetCurrency,
+      connection_id: connection.connection_id,
+      effect: 'uploaded in source currency; Google Ads will convert at its own daily rate',
+      hint: `Add ${money.currency} to FX_RATES in src/utils/fxRates.constants.ts so the dashboard and Google Ads agree.`,
+    });
+  }
+  return { conversion_value: money.value, currency_code: money.currency };
 }
 
 async function callGoogleAds(
@@ -234,7 +248,10 @@ async function callGoogleAds(
       connection.convert_tz_to_account
     ),
     conversion_value: ctx.conversion_value,
-    currency_code: ctx.currency_code || connection.currency_code || 'USD',
+    // Always a valid ISO-4217 code — Google rejects the row otherwise, and a
+    // rejection only ever surfaces inside partial_failure_error.
+    currency_code:
+      normalizeCurrency(ctx.currency_code) ?? normalizeCurrency(connection.currency_code) ?? 'USD',
     order_id: ctx.order_id,
     [ctx.identifier.type]: ctx.identifier.value,
   };

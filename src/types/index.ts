@@ -83,6 +83,12 @@ export interface Network {
   // in the example URL placeholder; value is the parameter name the network sends.
   extra_mappings?: Record<string, string>;
   default_status?: string;
+  // ISO-4217 currency to assume when a postback carries no `currency` param
+  // (e.g. AliExpress pays in CNY but doesn't tag the row). Without this the
+  // conversion falls back to the global default (USD) and a ¥ payout gets
+  // priced as dollars — an ~8x overstatement once it reaches Google Ads.
+  // Set this for every network that does not pay in the global default.
+  default_currency?: string;
   // IANA timezone of timestamps sent by this network (e.g. 'America/New_York',
   // 'America/Los_Angeles', 'UTC'). Used exclusively by the Google Ads
   // forwarding service to correctly interpret network_timestamp before
@@ -203,6 +209,9 @@ export interface AffiliateApiMapping {
   // Map upstream status string → canonical "approved" | "pending" | "rejected" etc.
   status_map?: Record<string, string>;
   default_status?: string;
+  // ISO-4217 currency to assume when `currency_path` is unset or resolves to
+  // nothing. See Network.default_currency — same rationale, same failure mode.
+  default_currency?: string;
 }
 
 export interface AffiliateApiSchedule {

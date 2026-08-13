@@ -8,10 +8,21 @@ import {
   BACKFILL_SCAN_PAD_BEFORE_MS,
   BACKFILL_SCAN_PAD_AFTER_MS,
 } from './eventTime';
+import { toUsd, defaultConversionCurrency } from '../utils/fxRates';
 import type { ClickRecord, ConversionRecord } from '../types';
 
 const PAGE = 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
+
+// Mirror of drilldownRepository.payoutUsd for the raw-Firestore rebuild path,
+// which reads plain docs rather than typed ConversionRecords. Rows with an
+// unratable currency contribute 0 instead of a face-value number.
+function payoutUsd(rawPayout: unknown, rawCurrency: string | undefined): number {
+  const value = typeof rawPayout === 'number' && Number.isFinite(rawPayout) ? rawPayout : 0;
+  if (value === 0) return 0;
+  const code = (rawCurrency ?? '').trim() || defaultConversionCurrency();
+  return toUsd(value, code) ?? 0;
+}
 
 function dayKeyUTC(d: Date): string {
   return d.toISOString().slice(0, 10);
@@ -208,7 +219,10 @@ export const drilldownsBackfillService = {
           const offer_id = (raw.offer_id as string | undefined) || 'unknown';
           const network_id = (raw.network_id as string | undefined) || '(unknown)';
           const verified = Boolean(raw.verified);
-          const payout = typeof raw.payout === 'number' ? raw.payout : 0;
+          // Drilldown money is USD (see drilldownRepository.payoutUsd). Convert
+          // before bucketing so a rebuild can't reintroduce mixed-currency
+          // sums into revenue and the payout histogram.
+          const payout = payoutUsd(raw.payout, raw.currency as string | undefined);
           const status = raw.status as string | undefined;
 
           // Process Offer Drilldown for Conversion
