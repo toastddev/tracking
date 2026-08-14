@@ -77,7 +77,10 @@ function applyMapping(_network: Network, raw: Record<string, string>): MappedFie
     currency: pick(r, 'currency'),
     status: pick(r, 'status'),
     txn_id: pick(r, 'transaction_id'),
-    network_timestamp: pick(r, 'event_time'),
+    network_timestamp:
+      pick(r, 'event_time') ??
+      pick(r, 'event_timestamp') ??
+      pick(r, 'timestamp'),
   };
 }
 
