@@ -28,7 +28,11 @@ export interface ConversionTimestamps {
 export function eventDate(conv: ConversionTimestamps): Date {
   const created = new Date(conv.created_at);
   if (!conv.network_timestamp) return created;
-  const reported = new Date(conv.network_timestamp);
+  let reported = new Date(conv.network_timestamp);
+  if (Number.isNaN(reported.getTime()) && /^\d+$/.test(conv.network_timestamp)) {
+    const numericTs = Number(conv.network_timestamp);
+    reported = new Date(numericTs < 10000000000 ? numericTs * 1000 : numericTs);
+  }
   if (Number.isNaN(reported.getTime())) return created;
   if (Number.isNaN(created.getTime())) return reported;
   const delta = reported.getTime() - created.getTime();
@@ -44,7 +48,11 @@ export function eventDateFromRaw(
   networkTimestamp: unknown,
 ): Date {
   if (typeof networkTimestamp !== 'string' || !networkTimestamp) return createdAt;
-  const reported = new Date(networkTimestamp);
+  let reported = new Date(networkTimestamp);
+  if (Number.isNaN(reported.getTime()) && /^\d+$/.test(networkTimestamp)) {
+    const numericTs = Number(networkTimestamp);
+    reported = new Date(numericTs < 10000000000 ? numericTs * 1000 : numericTs);
+  }
   if (Number.isNaN(reported.getTime())) return createdAt;
   const delta = reported.getTime() - createdAt.getTime();
   if (delta < -MAX_BACKDATE_MS || delta > MAX_FUTURE_MS) return createdAt;
