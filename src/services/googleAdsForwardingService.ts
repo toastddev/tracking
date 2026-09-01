@@ -402,67 +402,75 @@ export const googleAdsForwardingService = {
 
     let dispatched = 0;
 
-    // 1) Cross-account: fire to every active MCC connection that has a sale action set.
-    const mccConns = await googleAdsConnectionRepository.listByType('mcc');
-    for (const conn of mccConns) {
-      if (conn.status !== 'active') continue;
-      if (!conn.sale_conversion_action_resource) continue;
-      const money = moneyForUpload(conversion, conn);
-      const ctx: UploadContext = {
-        kind: 'conversion',
-        source_id: conversion.conversion_id,
-        conversion_id: conversion.conversion_id,
-        identifier,
-        conversion_action_resource: conn.sale_conversion_action_resource,
-        conversion_value: money.conversion_value,
-        currency_code: money.currency_code,
-        conversion_date_time_iso: adjustEventDateForGads(conversion, input.postback_timezone).toISOString(),
-        raw_network_timestamp: conversion.network_timestamp,
-        postback_timezone: input.postback_timezone,
-        order_id: conversion.conversion_id,    // same order_id across MCCs is fine — different customer scope
-      };
-      const result = await callGoogleAds(conn, ctx);
-      await persistAttempt({ ctx, connection: conn, result });
-      dispatched++;
-    }
-
-    // 2) Per-offer/per-network child route. Status filter applies here.
+    // 1) Specific child route (Per-offer/per-network). This overrides global MCC routing.
     const route = await googleAdsRouteRepository.resolveForConversion(
       conversion.offer_id,
       conversion.network_id
     );
-    if (route && route.sale_conversion_action_resource) {
-      // No status filter — `verified === true` (already gated at the top of
-      // dispatchConversion) is the real signal that the click_id matched a
-      // tracked click. The network's `status` string is unreliable.
-      const target = await googleAdsConnectionRepository.getById(route.target_connection_id);
-      if (!target || target.status !== 'active') {
+
+    if (route) {
+      if (route.sale_conversion_action_resource) {
+        const target = await googleAdsConnectionRepository.getById(route.target_connection_id);
+        if (!target || target.status !== 'active') {
+          await recordSkip({
+            kind: 'conversion',
+            source_id: conversion.conversion_id,
+            conversion_id: conversion.conversion_id,
+            reason: target ? 'connection_not_active' : 'destination_missing',
+            identifier,
+            connection_id: route.target_connection_id,
+            conversion_action_resource: route.sale_conversion_action_resource,
+          });
+        } else {
+          const money = moneyForUpload(conversion, target);
+          const ctx: UploadContext = {
+            kind: 'conversion',
+            source_id: conversion.conversion_id,
+            conversion_id: conversion.conversion_id,
+            identifier,
+            conversion_action_resource: route.sale_conversion_action_resource,
+            conversion_value: money.conversion_value,
+            currency_code: money.currency_code,
+            conversion_date_time_iso: adjustEventDateForGads(conversion, input.postback_timezone).toISOString(),
+            raw_network_timestamp: conversion.network_timestamp,
+            postback_timezone: input.postback_timezone,
+            order_id: conversion.conversion_id,
+          };
+          const result = await callGoogleAds(target, ctx);
+          await persistAttempt({ ctx, connection: target, result });
+          dispatched++;
+        }
+      } else {
         await recordSkip({
           kind: 'conversion',
           source_id: conversion.conversion_id,
           conversion_id: conversion.conversion_id,
-          reason: target ? 'connection_not_active' : 'destination_missing',
+          reason: 'child_route_no_sale_action',
           identifier,
-          connection_id: route.target_connection_id,
-          conversion_action_resource: route.sale_conversion_action_resource,
         });
-      } else {
-        const money = moneyForUpload(conversion, target);
+      }
+    } else {
+      // 2) Cross-account: fire to every active MCC connection that has a sale action set.
+      const mccConns = await googleAdsConnectionRepository.listByType('mcc');
+      for (const conn of mccConns) {
+        if (conn.status !== 'active') continue;
+        if (!conn.sale_conversion_action_resource) continue;
+        const money = moneyForUpload(conversion, conn);
         const ctx: UploadContext = {
           kind: 'conversion',
           source_id: conversion.conversion_id,
           conversion_id: conversion.conversion_id,
           identifier,
-          conversion_action_resource: route.sale_conversion_action_resource,
+          conversion_action_resource: conn.sale_conversion_action_resource,
           conversion_value: money.conversion_value,
           currency_code: money.currency_code,
           conversion_date_time_iso: adjustEventDateForGads(conversion, input.postback_timezone).toISOString(),
           raw_network_timestamp: conversion.network_timestamp,
           postback_timezone: input.postback_timezone,
-          order_id: conversion.conversion_id,
+          order_id: conversion.conversion_id,    // same order_id across MCCs is fine — different customer scope
         };
-        const result = await callGoogleAds(target, ctx);
-        await persistAttempt({ ctx, connection: target, result });
+        const result = await callGoogleAds(conn, ctx);
+        await persistAttempt({ ctx, connection: conn, result });
         dispatched++;
       }
     }
@@ -488,45 +496,47 @@ export const googleAdsForwardingService = {
     const click = input.click;
     let dispatched = 0;
 
-    // 1) Cross-account: every MCC with a click action set.
-    const mccConns = await googleAdsConnectionRepository.listByType('mcc');
-    for (const conn of mccConns) {
-      if (conn.status !== 'active') continue;
-      if (!conn.click_conversion_action_resource) continue;
-      const ctx: UploadContext = {
-        kind: 'click',
-        source_id: click.click_id,
-        click_id: click.click_id,
-        identifier,
-        conversion_action_resource: conn.click_conversion_action_resource,
-        conversion_value: 0,
-        currency_code: undefined,
-        conversion_date_time_iso: click.created_at,
-        order_id: `click_${click.click_id}`,
-      };
-      const result = await callGoogleAds(conn, ctx);
-      await persistAttempt({ ctx, connection: conn, result });
-      dispatched++;
-    }
-
-    // 2) Per-offer child route — only if it has a click action.
+    // 1) Specific child route overrides MCC.
     const route = await googleAdsRouteRepository.resolveForOffer(click.offer_id);
-    if (route && route.click_conversion_action_resource) {
-      const target = await googleAdsConnectionRepository.getById(route.target_connection_id);
-      if (target && target.status === 'active') {
+    if (route) {
+      if (route.click_conversion_action_resource) {
+        const target = await googleAdsConnectionRepository.getById(route.target_connection_id);
+        if (target && target.status === 'active') {
+          const ctx: UploadContext = {
+            kind: 'click',
+            source_id: click.click_id,
+            click_id: click.click_id,
+            identifier,
+            conversion_action_resource: route.click_conversion_action_resource,
+            conversion_value: 0,
+            currency_code: undefined,
+            conversion_date_time_iso: click.created_at,
+            order_id: `click_${click.click_id}`,
+          };
+          const result = await callGoogleAds(target, ctx);
+          await persistAttempt({ ctx, connection: target, result });
+          dispatched++;
+        }
+      }
+    } else {
+      // 2) Cross-account MCC routing.
+      const mccConns = await googleAdsConnectionRepository.listByType('mcc');
+      for (const conn of mccConns) {
+        if (conn.status !== 'active') continue;
+        if (!conn.click_conversion_action_resource) continue;
         const ctx: UploadContext = {
           kind: 'click',
           source_id: click.click_id,
           click_id: click.click_id,
           identifier,
-          conversion_action_resource: route.click_conversion_action_resource,
+          conversion_action_resource: conn.click_conversion_action_resource,
           conversion_value: 0,
           currency_code: undefined,
           conversion_date_time_iso: click.created_at,
           order_id: `click_${click.click_id}`,
         };
-        const result = await callGoogleAds(target, ctx);
-        await persistAttempt({ ctx, connection: target, result });
+        const result = await callGoogleAds(conn, ctx);
+        await persistAttempt({ ctx, connection: conn, result });
         dispatched++;
       }
     }
@@ -581,24 +591,6 @@ export const googleAdsForwardingService = {
     const routeCache = new Map<string, GoogleAdsRoute | null>();
     const connCache = new Map<string, GoogleAdsConnection | null>();
 
-    async function resolveRoute(offer_id?: string, network_id?: string): Promise<{ route: GoogleAdsRoute; conn: GoogleAdsConnection } | null> {
-      const key = `${offer_id ?? ''}|${network_id ?? ''}`;
-      if (!routeCache.has(key)) {
-        const route = await googleAdsRouteRepository.resolveForConversion(offer_id, network_id ?? '');
-        routeCache.set(key, route);
-      }
-      const route = routeCache.get(key)!;
-      if (!route || !route.sale_conversion_action_resource) return null;
-
-      if (!connCache.has(route.target_connection_id)) {
-        const conn = await googleAdsConnectionRepository.getById(route.target_connection_id);
-        connCache.set(route.target_connection_id, conn && conn.status === 'active' ? conn : null);
-      }
-      const conn = connCache.get(route.target_connection_id)!;
-      if (!conn) return null;
-      return { route, conn };
-    }
-
     // 3. Build per-connection conversion payloads.
     type ConnBatch = {
       connection: GoogleAdsConnection;
@@ -618,54 +610,68 @@ export const googleAdsForwardingService = {
     for (const item of eligible) {
       const { conversion, identifier } = item;
 
-      // MCC connections
-      for (const conn of activeMcc) {
-        const money = moneyForUpload(conversion, conn);
-        const cc: Record<string, unknown> = {
-          conversion_action: conn.sale_conversion_action_resource,
-          conversion_date_time: formatGoogleAdsDateTime(
-            adjustEventDateForGads(conversion, item.postback_timezone).toISOString(),
-            conn.time_zone || 'UTC',
-            conversion.network_timestamp,
-            item.postback_timezone,
-            conn.convert_tz_to_account
-          ),
-          conversion_value: money.conversion_value,
-          currency_code: money.currency_code,
-          order_id: conversion.conversion_id,
-          [identifier.type]: identifier.value,
-        };
-        ensureBatch(conn).payloads.push({
-          cc,
-          eligible: item,
-          actionResource: conn.sale_conversion_action_resource!,
-        });
+      const key = `${conversion.offer_id ?? ''}|${conversion.network_id ?? ''}`;
+      if (!routeCache.has(key)) {
+        const route = await googleAdsRouteRepository.resolveForConversion(conversion.offer_id, conversion.network_id ?? '');
+        routeCache.set(key, route);
       }
+      const route = routeCache.get(key);
 
-      // Per-offer/network child route
-      const resolved = await resolveRoute(conversion.offer_id, conversion.network_id);
-      if (resolved) {
-        const { route, conn } = resolved;
-        const money = moneyForUpload(conversion, conn);
-        const cc: Record<string, unknown> = {
-          conversion_action: route.sale_conversion_action_resource,
-          conversion_date_time: formatGoogleAdsDateTime(
-            adjustEventDateForGads(conversion, item.postback_timezone).toISOString(),
-            conn.time_zone || 'UTC',
-            conversion.network_timestamp,
-            item.postback_timezone,
-            conn.convert_tz_to_account
-          ),
-          conversion_value: money.conversion_value,
-          currency_code: money.currency_code,
-          order_id: conversion.conversion_id,
-          [identifier.type]: identifier.value,
-        };
-        ensureBatch(conn).payloads.push({
-          cc,
-          eligible: item,
-          actionResource: route.sale_conversion_action_resource!,
-        });
+      if (route) {
+        // Child route overrides MCC
+        if (route.sale_conversion_action_resource) {
+          if (!connCache.has(route.target_connection_id)) {
+            const target = await googleAdsConnectionRepository.getById(route.target_connection_id);
+            connCache.set(route.target_connection_id, target && target.status === 'active' ? target : null);
+          }
+          const conn = connCache.get(route.target_connection_id);
+          if (conn) {
+            const money = moneyForUpload(conversion, conn);
+            const cc: Record<string, unknown> = {
+              conversion_action: route.sale_conversion_action_resource,
+              conversion_date_time: formatGoogleAdsDateTime(
+                adjustEventDateForGads(conversion, item.postback_timezone).toISOString(),
+                conn.time_zone || 'UTC',
+                conversion.network_timestamp,
+                item.postback_timezone,
+                conn.convert_tz_to_account
+              ),
+              conversion_value: money.conversion_value,
+              currency_code: money.currency_code,
+              order_id: conversion.conversion_id,
+              [identifier.type]: identifier.value,
+            };
+            ensureBatch(conn).payloads.push({
+              cc,
+              eligible: item,
+              actionResource: route.sale_conversion_action_resource,
+            });
+          }
+        }
+      } else {
+        // No specific route, fallback to MCC connections
+        for (const conn of activeMcc) {
+          const money = moneyForUpload(conversion, conn);
+          const cc: Record<string, unknown> = {
+            conversion_action: conn.sale_conversion_action_resource,
+            conversion_date_time: formatGoogleAdsDateTime(
+              adjustEventDateForGads(conversion, item.postback_timezone).toISOString(),
+              conn.time_zone || 'UTC',
+              conversion.network_timestamp,
+              item.postback_timezone,
+              conn.convert_tz_to_account
+            ),
+            conversion_value: money.conversion_value,
+            currency_code: money.currency_code,
+            order_id: conversion.conversion_id,
+            [identifier.type]: identifier.value,
+          };
+          ensureBatch(conn).payloads.push({
+            cc,
+            eligible: item,
+            actionResource: conn.sale_conversion_action_resource!,
+          });
+        }
       }
     }
 
