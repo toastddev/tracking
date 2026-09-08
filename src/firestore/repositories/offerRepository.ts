@@ -1,4 +1,4 @@
-import { FieldValue } from 'firebase-admin/firestore';
+import { FieldValue, FieldPath } from 'firebase-admin/firestore';
 import { db } from '../config';
 import { COLLECTIONS } from '../schema';
 import type { Offer } from '../../types';
@@ -10,6 +10,7 @@ export interface ListOptions {
   q?: string;
   limit?: number;
   cursor?: string;
+  offer_ids?: string[];
 }
 
 export interface ListResult<T> {
@@ -50,11 +51,14 @@ export const offerRepository = {
   // case-insensitive prefix match on `name_lower` so it benefits from a
   // single-field index that Firestore auto-creates.
   async list(opts: ListOptions = {}): Promise<ListResult<Offer>> {
-    const limit = Math.min(Math.max(opts.limit ?? 20, 1), 100);
+    const limit = Math.min(Math.max(opts.limit ?? 20, 1), 1000);
     const col = db().collection(COLLECTIONS.OFFERS);
     let query: FirebaseFirestore.Query = col;
 
-    if (opts.q) {
+    if (opts.offer_ids && opts.offer_ids.length > 0) {
+      // Limit to 30 for Firestore 'in' query constraint
+      query = query.where(FieldPath.documentId(), 'in', opts.offer_ids.slice(0, 30));
+    } else if (opts.q) {
       const q = opts.q.toLowerCase();
       query = query
         .where('name_lower', '>=', q)
@@ -65,7 +69,7 @@ export const offerRepository = {
     }
 
     const cursorVal = decodeCursor(opts.cursor);
-    if (cursorVal) {
+    if (cursorVal && !(opts.offer_ids && opts.offer_ids.length > 0)) {
       // The cursor type MUST match the orderBy field's type or Firestore can't
       // position correctly. The search branch orders by `name_lower` (a string),
       // so the raw decoded string is right. The default branch orders by
@@ -87,7 +91,7 @@ export const offerRepository = {
     }));
 
     let nextCursor: string | null = null;
-    if (hasMore && docs.length > 0) {
+    if (hasMore && docs.length > 0 && !(opts.offer_ids && opts.offer_ids.length > 0)) {
       const last = docs[docs.length - 1]!;
       const data = last.data();
       const cursorRaw = opts.q ? String(data.name_lower ?? '') : String(data.created_at?.toDate?.()?.toISOString?.() ?? '');
@@ -109,6 +113,11 @@ export const offerRepository = {
       updated_at: FieldValue.serverTimestamp(),
     };
     await ref.set(payload);
+    
+    await db().collection(COLLECTIONS.APP_STATE).doc('offers_search_index').set({
+      [offer_id]: data.name
+    }, { merge: true });
+
     cache.delete(offer_id);
     const snap = await ref.get();
     return { offer_id, ...(snap.data() as Omit<Offer, 'offer_id'>) };
@@ -126,7 +135,12 @@ export const offerRepository = {
       // whole offer record.
       update[k] = v === null ? FieldValue.delete() : v;
     }
-    if (patch.name) update.name_lower = patch.name.toLowerCase();
+    if (patch.name) {
+      update.name_lower = patch.name.toLowerCase();
+      await db().collection(COLLECTIONS.APP_STATE).doc('offers_search_index').set({
+        [offer_id]: patch.name
+      }, { merge: true });
+    }
     await ref.update(update);
     cache.delete(offer_id);
     const snap = await ref.get();
@@ -138,6 +152,11 @@ export const offerRepository = {
     const exists = (await ref.get()).exists;
     if (!exists) return false;
     await ref.delete();
+    
+    await db().collection(COLLECTIONS.APP_STATE).doc('offers_search_index').set({
+      [offer_id]: FieldValue.delete()
+    }, { merge: true });
+
     cache.delete(offer_id);
     return true;
   },
@@ -146,4 +165,14 @@ export const offerRepository = {
     if (offer_id) cache.delete(offer_id);
     else cache.clear();
   },
+
+  async getSearchIndex(): Promise<{ offer_id: string; name: string }[]> {
+    const snap = await db().collection(COLLECTIONS.APP_STATE).doc('offers_search_index').get();
+    const data = snap.data() ?? {};
+    return Object.entries(data).map(([offer_id, name]) => ({
+      offer_id,
+      name: String(name),
+    }));
+  },
 };
+

@@ -15,6 +15,7 @@ adminRoutes.get('/api/me', (c) => adminController.me(c));
 
 // Offers
 adminRoutes.get('/api/offers', (c) => adminController.listOffers(c));
+adminRoutes.get('/api/offers/search-index', (c) => adminController.getSearchIndex(c));
 adminRoutes.post('/api/offers', (c) => adminController.createOffer(c));
 adminRoutes.get('/api/offers/:id', (c) => adminController.getOffer(c));
 adminRoutes.patch('/api/offers/:id', (c) => adminController.updateOffer(c));

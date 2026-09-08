@@ -155,15 +155,32 @@ export const adminController = {
 
   // ── offers ────────────────────────────────────────────────────────
   async listOffers(c: Context) {
+    const idsRaw = c.req.query('offer_ids');
+    let offer_ids: string[] | undefined;
+    if (idsRaw) {
+      const list = idsRaw.split(',').map((s) => s.trim()).filter(Boolean);
+      for (const oid of list) {
+        if (!isValidId(oid)) return c.json({ error: 'invalid_offer_id' }, 400);
+      }
+      if (list.length > 30) return c.json({ error: 'too_many_offer_ids' }, 400);
+      offer_ids = list;
+    }
+
     const result = await offerRepository.list({
       q: c.req.query('q'),
       cursor: c.req.query('cursor'),
       limit: parseLimit(c),
+      offer_ids,
     });
     return c.json({
       items: result.items.map((o) => ({ ...o, tracking_url: trackingUrl(o.offer_id) })),
       nextCursor: result.nextCursor,
     });
+  },
+
+  async getSearchIndex(c: Context) {
+    const items = await offerRepository.getSearchIndex();
+    return c.json({ items });
   },
 
   async getOffer(c: Context) {
