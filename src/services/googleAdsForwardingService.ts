@@ -7,6 +7,7 @@ import {
 } from '../firestore';
 import { logger } from '../utils/logger';
 import { resolveUploadMoney, normalizeCurrency } from '../utils/fxRates';
+import type { Customer } from 'google-ads-api';
 import type { ClickRecord, ConversionRecord } from '../types';
 import type {
   GoogleAdsConnection,
@@ -376,6 +377,58 @@ async function recordSkip(args: {
   });
 }
 
+// A batch upload's partial_failure_error carries one aggregate `message`
+// string plus a structured `details` blob (per Google's error-details
+// convention) naming exactly which `conversions[N]` rows failed and why.
+// `uploadClickConversions` doesn't decode that blob for us, but `Customer`
+// inherits the decoder the rest of the library uses internally — reuse it
+// instead of hand-rolling protobuf parsing here.
+//
+// Returns a map of failed row index -> that row's own error message, or
+// `null` when the errors can't be confidently pinned to specific rows (e.g.
+// an account-level error with no row location). Callers must treat `null` as
+// "attribute the failure to the whole batch" — never as "nothing failed".
+function extractBatchRowErrors(
+  customer: Customer,
+  response: unknown,
+  rowCount: number
+): Map<number, string> | null {
+  type Decodable = { decodePartialFailureError?: (r: unknown) => { partial_failure_error?: unknown } };
+  const decode = (customer as unknown as Decodable).decodePartialFailureError;
+  if (typeof decode !== 'function') return null;
+
+  let decodedFailure: unknown;
+  try {
+    decodedFailure = decode.call(customer, response)?.partial_failure_error;
+  } catch {
+    return null;
+  }
+
+  const errors = (decodedFailure as { errors?: unknown[] } | undefined)?.errors;
+  if (!Array.isArray(errors) || errors.length === 0) return null;
+
+  const perRow = new Map<number, string>();
+  for (const raw of errors) {
+    const err = raw as {
+      message?: string;
+      location?: { field_path_elements?: { field_name?: string; index?: number }[] };
+    };
+    const rowElement = err.location?.field_path_elements?.find(
+      (el) => el.field_name === 'conversions' && typeof el.index === 'number'
+    );
+    const index = rowElement?.index;
+    if (typeof index !== 'number' || index < 0 || index >= rowCount) {
+      // Can't confidently pin this one to a row — bail to the whole-batch
+      // fallback rather than risk under-reporting a real failure.
+      return null;
+    }
+    const message = err.message ?? 'unknown error';
+    const existing = perRow.get(index);
+    perRow.set(index, existing ? `${existing}; ${message}` : message);
+  }
+  return perRow;
+}
+
 export const googleAdsForwardingService = {
   // ── conversions ───────────────────────────────────────────────────
   async dispatchConversion(input: DispatchConversionInput): Promise<void> {
@@ -708,16 +761,25 @@ export const googleAdsForwardingService = {
             ? response.partial_failure_error.message
             : undefined;
 
+        // Google applies every non-failing row in a partial-failure batch
+        // normally — only the rows named in partial_failure_error were
+        // rejected. rowErrors maps failed row index -> that row's own error;
+        // `null` means we couldn't attribute errors to specific rows, so
+        // every row in the batch is treated as failed (the old, conservative
+        // behavior) rather than risk marking a genuine failure as sent.
+        const rowErrors = partialMsg ? extractBatchRowErrors(customer, response, payloads.length) : null;
+
         if (partialMsg) {
-          // Partial failure — some succeeded, some failed. We count the
-          // whole batch as sent but log the partial error.
+          const failedCount = rowErrors ? rowErrors.size : payloads.length;
           stats.sent += payloads.length;
           stats.errors.push(
-            `partial[${connection.connection_id}]: ${partialMsg.slice(0, 500)}`
+            `partial[${connection.connection_id}]: ${failedCount}/${payloads.length} row(s) failed: ${partialMsg.slice(0, 500)}`
           );
           logger.warn('gads_batch_partial_failure', {
             connection_id: connection.connection_id,
             count: payloads.length,
+            failed_count: failedCount,
+            attributed_per_row: rowErrors !== null,
             error: partialMsg.slice(0, 500),
           });
         } else {
@@ -729,7 +791,8 @@ export const googleAdsForwardingService = {
         }
 
         // Persist audit docs in bulk (fire-and-forget to not block the run).
-        for (const p of payloads) {
+        payloads.forEach((p, index) => {
+          const rowError = partialMsg ? (rowErrors ? rowErrors.get(index) : partialMsg) : undefined;
           googleAdsUploadRepository
             .record({
               kind: 'conversion',
@@ -741,13 +804,13 @@ export const googleAdsForwardingService = {
               identifier_type: p.eligible.identifier.type,
               identifier_value: p.eligible.identifier.value,
               conversion_action_resource: p.actionResource,
-              status: partialMsg ? 'partial_failure' : 'sent',
+              status: rowError ? 'partial_failure' : 'sent',
               attempts: 1,
               sent_at: new Date().toISOString(),
-              last_error: partialMsg,
+              last_error: rowError,
             })
             .catch(() => {});
-        }
+        });
       } catch (err) {
         const errMsg = err instanceof Error ? err.message : String(err);
         stats.failed += payloads.length;
