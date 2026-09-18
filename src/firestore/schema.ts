@@ -153,6 +153,14 @@ export const COLLECTIONS = {
   // redirect lands the user on a route the SPA's outer auth guard refuses
   // to render, killing the in-flight OAuth params.
   FACEBOOK_OAUTH_SESSIONS: 'facebook_oauth_sessions',
+  // GA4 Measurement Protocol upload audit trail ≈ google_ads_uploads: one doc
+  // per attempt (sent / failed / skipped with reason). See ga4UploadRepository.
+  GA4_UPLOADS: 'ga4_uploads',
+  // GA4 connections made from the Connections tab (Google OAuth) and the web
+  // data streams linked for forwarding (doc id = measurement id, holds the
+  // encrypted Measurement Protocol secret). See ga4ConnectionRepository.
+  GA4_CONNECTIONS: 'ga4_connections',
+  GA4_STREAMS: 'ga4_streams',
   AFFILIATE_APIS: 'affiliate_apis',
   AFFILIATE_API_RUNS: 'affiliate_api_runs',
   // Pre-aggregated daily metrics per offer. Survives the 90-day TTL on

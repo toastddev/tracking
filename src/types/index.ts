@@ -312,6 +312,11 @@ export interface AffiliateApiRunRecord {
   fb_skipped?: number;
   fb_failed?: number;
   fb_errors?: string[];
+  // GA4 Measurement Protocol batch upload stats — parallel to gads_* / fb_*.
+  ga4_sent?: number;
+  ga4_skipped?: number;
+  ga4_failed?: number;
+  ga4_errors?: string[];
   // Dry-run only — raw HTTP request/response capture for debugging. Not
   // written to Firestore (the run-doc writes list fields explicitly).
   debug?: AffiliateApiHttpDebug[];

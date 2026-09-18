@@ -18,6 +18,7 @@ import { extractFbCampaign } from './facebookCampaignExtractor';
 import { generateConversionId } from '../utils/idGenerator';
 import { googleAdsForwardingService } from './googleAdsForwardingService';
 import { facebookForwardingService } from './facebookForwardingService';
+import { ga4ForwardingService } from './ga4ForwardingService';
 import { eventDate } from './eventTime';
 import { retry } from '../utils/retry';
 import { resolveConversionCurrency } from '../utils/fxRates';
@@ -472,6 +473,8 @@ export async function runAffiliateApi(api: AffiliateApi, opts: RunOptions): Prom
   const gadsStats = { sent: 0, skipped: 0, failed: 0, errors: [] as string[] };
   // Facebook CAPI batch upload stats — parallel to gadsStats. Never collide.
   const fbStats = { sent: 0, skipped: 0, failed: 0, errors: [] as string[] };
+  // GA4 upload stats — parallel to gadsStats / fbStats.
+  const ga4Stats = { sent: 0, skipped: 0, failed: 0, errors: [] as string[] };
 
   async function flush(): Promise<void> {
     if (buffer.length === 0) return;
@@ -654,6 +657,25 @@ export async function runAffiliateApi(api: AffiliateApi, opts: RunOptions): Prom
               error: err instanceof Error ? err.message : String(err),
             });
           }
+
+          // GA4 batch dispatch - same verified rows and same stats handling
+          // as the Google Ads / Facebook batches above; never shares state.
+          try {
+            const ga4Result = await ga4ForwardingService.dispatchConversionsBatch(
+              verifiedBatch.map((b) => ({ conversion: b.conv, click: b.click!, postback_timezone }))
+            );
+            ga4Stats.sent += ga4Result.sent;
+            ga4Stats.skipped += ga4Result.skipped;
+            ga4Stats.failed += ga4Result.failed;
+            ga4Stats.errors.push(...ga4Result.errors);
+          } catch (err) {
+            ga4Stats.failed += verifiedBatch.length;
+            ga4Stats.errors.push(err instanceof Error ? err.message : String(err));
+            logger.warn('ga4_batch_dispatch_failed', {
+              api_id: api.api_id,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
         }
       }
     } catch (err) {
@@ -817,6 +839,10 @@ export async function runAffiliateApi(api: AffiliateApi, opts: RunOptions): Prom
       fb_skipped: fbStats.skipped,
       fb_failed: fbStats.failed,
       fb_errors: fbStats.errors.length > 0 ? fbStats.errors.slice(0, 10) : undefined,
+      ga4_sent: ga4Stats.sent,
+      ga4_skipped: ga4Stats.skipped,
+      ga4_failed: ga4Stats.failed,
+      ga4_errors: ga4Stats.errors.length > 0 ? ga4Stats.errors.slice(0, 10) : undefined,
     }).catch((err) => {
       logger.warn('aff_api_run_update_failed', { api_id: api.api_id, run_id, error: String(err) });
     });

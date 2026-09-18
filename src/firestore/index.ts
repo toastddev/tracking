@@ -40,4 +40,10 @@ export {
   affiliateApiRunRepository,
 } from './repositories/affiliateApiRepository';
 export { drilldownRepository } from './repositories/drilldownRepository';
+export { ga4SettingsRepository } from './repositories/ga4SettingsRepository';
+export type { Ga4Settings } from './repositories/ga4SettingsRepository';
+export { ga4UploadRepository } from './repositories/ga4UploadRepository';
+export type { Ga4Upload, Ga4UploadKind, Ga4UploadStatus } from './repositories/ga4UploadRepository';
+export { ga4ConnectionRepository, ga4StreamRepository } from './repositories/ga4ConnectionRepository';
+export type { Ga4Connection, Ga4ConnectionStatus, Ga4Stream } from './repositories/ga4ConnectionRepository';
 export type { OfferDrilldownDoc, PostbackDrilldownDoc } from './repositories/drilldownRepository';

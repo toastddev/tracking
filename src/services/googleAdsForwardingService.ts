@@ -116,10 +116,11 @@ function formatGoogleAdsDateTime(
  * Fix: if postback_timezone is set, calculate the UTC offset for that timezone
  * at the given time and shift the date accordingly.
  *
- * This helper is ONLY used for the Google Ads upload path — it does NOT affect
- * conversion recording, report bucketing, or any other system.
+ * This helper is used by the Google Ads upload path and, so both platforms get
+ * identical conversion times, the GA4 upload path (ga4ForwardingService). It
+ * does NOT affect conversion recording, report bucketing, or any other system.
  */
-function adjustEventDateForGads(
+export function adjustEventDateForGads(
   conversion: ConversionRecord,
   postbackTimezone?: string
 ): Date {

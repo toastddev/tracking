@@ -14,6 +14,7 @@ import { extractFbCampaign } from './facebookCampaignExtractor';
 import { networkService } from './networkService';
 import { googleAdsForwardingService } from './googleAdsForwardingService';
 import { facebookForwardingService } from './facebookForwardingService';
+import { ga4ForwardingService } from './ga4ForwardingService';
 import { eventDate } from './eventTime';
 import { retry } from '../utils/retry';
 import { resolveConversionCurrency } from '../utils/fxRates';
@@ -290,6 +291,9 @@ export const postbackService = {
       // Facebook CAPI fan-out — parallel to the GAds dispatch above. Same
       // shadow guard, same fire-and-forget contract.
       facebookForwardingService.forgetConversion({ conversion: conv, click, postback_timezone: network.postback_timezone });
+      // GA4 Measurement Protocol - reports the sale against the visitor's GA
+      // session when the click carried ga_cid/ga_sid (see ga4ForwardingService).
+      ga4ForwardingService.forgetConversion({ conversion: conv, click, postback_timezone: network.postback_timezone });
     }
 
     return { ok: true, conversion_id: conv.conversion_id, verified, verification_reason };

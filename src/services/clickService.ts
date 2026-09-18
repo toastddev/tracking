@@ -12,6 +12,7 @@ import {
 } from '../firestore';
 import { googleAdsForwardingService } from './googleAdsForwardingService';
 import { facebookForwardingService } from './facebookForwardingService';
+import { ga4ForwardingService } from './ga4ForwardingService';
 import { extractFbCampaign, hasAnyUtmParam } from './facebookCampaignExtractor';
 import { retry } from '../utils/retry';
 import type { AdIds, ClickRecord, Offer } from '../types';
@@ -247,6 +248,12 @@ export const clickService = {
       googleAdsForwardingService.forgetClick({ click });
     }
 
+    // GA4 fan-out - only when the click carries the site's GA ids. Same rule
+    // as the Google Ads dispatch above: non-GA clicks short-circuit.
+    if (click.extra_params?.ga_cid && click.extra_params?.ga_mid) {
+      ga4ForwardingService.forgetClick({ click });
+    }
+
     // Facebook campaign rollup — separate `facebook_campaign_reports` table.
     // Mirrors the GAds extractCampaign block above; runs alongside, never
     // replaces it. fb_untagged synthetic campaign covers clicks with
@@ -397,6 +404,10 @@ export const clickService = {
 
         if (click.ad_ids?.gclid || click.ad_ids?.gbraid || click.ad_ids?.wbraid) {
           googleAdsForwardingService.forgetClick({ click });
+        }
+
+        if (click.extra_params?.ga_cid && click.extra_params?.ga_mid) {
+          ga4ForwardingService.forgetClick({ click });
         }
 
         // Facebook campaign rollup (skipped when offer is unmapped, same as
