@@ -167,8 +167,20 @@ export const offerRepository = {
   },
 
   async getSearchIndex(): Promise<{ offer_id: string; name: string }[]> {
-    const snap = await db().collection(COLLECTIONS.APP_STATE).doc('offers_search_index').get();
-    const data = snap.data() ?? {};
+    const indexRef = db().collection(COLLECTIONS.APP_STATE).doc('offers_search_index');
+    const snap = await indexRef.get();
+    let data: Record<string, unknown> = snap.data() ?? {};
+
+    // The index is only maintained on create/update/delete, so offers that
+    // pre-date it are missing. Self-heal: if the entry count drifts from the
+    // real offer count (a cheap aggregate), rebuild from a name-only scan.
+    const countSnap = await db().collection(COLLECTIONS.OFFERS).count().get();
+    if (countSnap.data().count !== Object.keys(data).length) {
+      const all = await db().collection(COLLECTIONS.OFFERS).select('name').get();
+      data = Object.fromEntries(all.docs.map((d) => [d.id, String(d.get('name') ?? d.id)]));
+      await indexRef.set(data);
+    }
+
     return Object.entries(data).map(([offer_id, name]) => ({
       offer_id,
       name: String(name),
